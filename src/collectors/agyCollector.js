@@ -392,6 +392,9 @@ function buildAgyQuota(slotAgg, settings, config = {}) {
   const oneHour = { input: 0, cacheRead: 0, output: 0, total: 0, effective: 0, turns: 0 };
   const sevenDay = { input: 0, cacheRead: 0, output: 0, total: 0, effective: 0, turns: 0 };
 
+  let oldestSlot5h = null;
+  let oldestSlot7d = null;
+
   for (const [slotStr, b] of Object.entries(slotAgg)) {
     const s = Number(slotStr);
     const diff = currentSlot - s;
@@ -403,6 +406,9 @@ function buildAgyQuota(slotAgg, settings, config = {}) {
       sevenDay.total += b.total;
       sevenDay.effective += b.effective;
       sevenDay.turns += b.turns;
+      if (b.total > 0 && (oldestSlot7d === null || s < oldestSlot7d)) {
+        oldestSlot7d = s;
+      }
     }
     if (diff <= slots5h) {
       fiveHour.input += b.input;
@@ -411,6 +417,9 @@ function buildAgyQuota(slotAgg, settings, config = {}) {
       fiveHour.total += b.total;
       fiveHour.effective += b.effective;
       fiveHour.turns += b.turns;
+      if (b.total > 0 && (oldestSlot5h === null || s < oldestSlot5h)) {
+        oldestSlot5h = s;
+      }
     }
     if (diff <= slots1h) {
       oneHour.input += b.input;
@@ -421,6 +430,11 @@ function buildAgyQuota(slotAgg, settings, config = {}) {
       oneHour.turns += b.turns;
     }
   }
+
+  const nextFiveHourResetAt =
+    oldestSlot5h !== null ? (oldestSlot5h + slots5h + 1) * SLOT_MS : null;
+  const nextWeeklyResetAt =
+    oldestSlot7d !== null ? (oldestSlot7d + slots7d + 1) * SLOT_MS : null;
 
   const fiveHourPct = Math.min(100, Math.round((fiveHour.effective / Math.max(1, limit5hEff)) * 100));
   const sevenDayPct = Math.min(100, Math.round((sevenDay.effective / Math.max(1, limit7dEff)) * 100));
@@ -467,6 +481,8 @@ function buildAgyQuota(slotAgg, settings, config = {}) {
     cacheHitPct,
     limit5hM: Math.round(limit5hEff / 1_000_000),
     limit7dM: Math.round(limit7dEff / 1_000_000),
+    nextFiveHourResetAt,
+    nextWeeklyResetAt,
     updatedAt: now,
     history
   };

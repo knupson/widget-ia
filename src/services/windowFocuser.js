@@ -112,11 +112,23 @@ $provider = "${safeProvider}"
 $surface = "${safeSurface}"
 $lockPath = '${escapedLockPath}'
 
-# 0. Si es una sesión de Claude Desktop App, enfocar directamente la app de escritorio de Claude
+# 0. Si es una sesión de Claude Desktop App, enfocar o restaurar desde bandeja la app de escritorio de Claude
 if ($provider -eq "claude" -and $surface -eq "app") {
     $appWin = Get-Process -Name "claude" -ErrorAction SilentlyContinue | Where-Object {
         $_.MainWindowHandle -ne 0 -and $_.Path -match "AnthropicClaude"
     } | Select-Object -First 1
+    if (-not $appWin) {
+        $appExe = (Get-Process -Name "claude" -ErrorAction SilentlyContinue | Where-Object {
+            $_.Path -match "AnthropicClaude"
+        } | Select-Object -First 1).Path
+        if ($appExe -and (Test-Path $appExe)) {
+            Start-Process -FilePath $appExe | Out-Null
+            Start-Sleep -Milliseconds 350
+            $appWin = Get-Process -Name "claude" -ErrorAction SilentlyContinue | Where-Object {
+                $_.MainWindowHandle -ne 0 -and $_.Path -match "AnthropicClaude"
+            } | Select-Object -First 1
+        }
+    }
     if ($appWin) {
         Focus-WindowHandle $appWin.MainWindowHandle $appWin.Id | Out-Null
         Write-Output "focused_claude_app:$($appWin.Id)"

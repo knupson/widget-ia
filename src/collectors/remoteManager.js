@@ -245,6 +245,14 @@ class RemoteManager {
   pollSingleSshHost(hostCfg) {
     const target = String(hostCfg.target).trim(); // ej. user@192.168.1.50
     const portArg = hostCfg.port ? ['-p', String(hostCfg.port)] : [];
+    const keyArg = [];
+    if (hostCfg.keyPath && String(hostCfg.keyPath).trim()) {
+      let kp = String(hostCfg.keyPath).trim().replace(/^["']|["']$/g, '');
+      if (kp.startsWith('~/') || kp.startsWith('~\\')) {
+        kp = path.join(os.homedir(), kp.slice(2));
+      }
+      keyArg.push('-i', kp);
+    }
     // Script bash compacto de solo lectura que inspecciona ~/.claude/sessions/*.json en el host remoto
     const remoteCmd = `
       HOST=$(hostname);
@@ -262,6 +270,7 @@ class RemoteManager {
       '-o', 'ConnectTimeout=5',
       '-o', 'StrictHostKeyChecking=accept-new',
       ...portArg,
+      ...keyArg,
       target,
       remoteCmd
     ];

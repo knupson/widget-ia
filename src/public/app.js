@@ -257,6 +257,18 @@
     }
   }
 
+  function fmtTimeShort(ts) {
+    if (!ts) return '';
+    try {
+      const d = new Date(ts);
+      const hh = String(d.getHours()).padStart(2, '0');
+      const mi = String(d.getMinutes()).padStart(2, '0');
+      return `${hh}:${mi}`;
+    } catch {
+      return '';
+    }
+  }
+
   function fmtCountdown(targetTs) {
     if (!targetTs) return '';
     const diffMs = targetTs - Date.now();
@@ -268,6 +280,19 @@
     if (days > 0) return `en ${days}d ${hours}h`;
     if (hours > 0) return `en ${hours}h ${mins}m`;
     return `en ${mins}m`;
+  }
+
+  function fmtCountdownShort(targetTs) {
+    if (!targetTs) return '--';
+    const diffMs = targetTs - Date.now();
+    if (diffMs <= 0) return 'ahora';
+    const totalHours = Math.floor(diffMs / 3_600_000);
+    const days = Math.floor(totalHours / 24);
+    const hours = totalHours % 24;
+    const mins = Math.floor((diffMs % 3_600_000) / 60_000);
+    if (days > 0) return `${days}d ${hours}h`;
+    if (hours > 0) return `${hours}h ${mins}m`;
+    return `${mins}m`;
   }
 
   // Resuelve la cuota de Claude junto con el detector de Reseteo Semanal y Reseteo Gratis (Bonus)
@@ -527,8 +552,13 @@
     document.getElementById('pill-cl-sd-txt').textContent = clQuota.sevenDayPct != null ? `${clSd}%` : '--%';
 
     const clResetBadge = document.getElementById('pill-cl-reset-badge');
+    const clResetTimer = document.getElementById('pill-cl-reset-timer');
     const pillClBox = document.getElementById('pill-claude-box');
     const bonusR = clQuota.lastBonusReset;
+    if (clResetTimer) {
+      const primaryReset = clQuota.nextFiveHourResetAt || clQuota.nextWeeklyResetAt;
+      clResetTimer.textContent = primaryReset ? `⏳${fmtCountdownShort(primaryReset)}` : '';
+    }
     if (clResetBadge) {
       if (bonusR) {
         clResetBadge.classList.remove('hidden');
@@ -538,13 +568,16 @@
       }
     }
     if (pillClBox) {
+      const next5hStr = clQuota.nextFiveHourResetAt
+        ? `\n⏳ Reset 5h: ${fmtTimeShort(clQuota.nextFiveHourResetAt)} (${fmtCountdown(clQuota.nextFiveHourResetAt)})`
+        : '';
       const nextStr = clQuota.nextWeeklyResetAt
-        ? `\nPróx. reseteo semanal: ${fmtDateTimeShort(clQuota.nextWeeklyResetAt)} (${fmtCountdown(clQuota.nextWeeklyResetAt)})`
+        ? `\n📅 Reset semanal (7d): ${fmtDateTimeShort(clQuota.nextWeeklyResetAt)} (${fmtCountdown(clQuota.nextWeeklyResetAt)})`
         : '';
       const bonusStr = bonusR
         ? `\n🎁 Último Bonus Gratis: ${fmtDateTimeShort(bonusR.timestamp)} (${bonusR.fromPct}% → ${bonusR.toPct}%)`
         : '';
-      pillClBox.title = `🟠 CLAUDE (Plan Pro/Max)\n5h: ${clFh}% | Semanal (7d): ${clSd}%${nextStr}${bonusStr}`;
+      pillClBox.title = `🟠 CLAUDE (Plan Pro/Max)\n5h: ${clFh}% | Semanal (7d): ${clSd}%${next5hStr}${nextStr}${bonusStr}`;
     }
 
     // Cuota AGY en Píldora
@@ -560,9 +593,21 @@
     document.getElementById('pill-agy-fh-txt').textContent = agyQuota.available ? `${agyFh}%` : '--%';
     document.getElementById('pill-agy-sd-txt').textContent = agyQuota.available ? `${agySd}%` : '--%';
 
+    const agyResetTimer = document.getElementById('pill-agy-reset-timer');
+    if (agyResetTimer) {
+      const agyReset = agyQuota.nextFiveHourResetAt || agyQuota.nextWeeklyResetAt;
+      agyResetTimer.textContent = agyReset ? `⏳${fmtCountdownShort(agyReset)}` : '';
+    }
+
     const pillAgyBox = document.getElementById('pill-agy-box');
     if (pillAgyBox && agyQuota.available) {
-      pillAgyBox.title = `AGY (${agyQuota.model})\n5h: ${agyFh}% (${fmtNumber(agyQuota.fiveHour?.total)} tok · ${agyQuota.fiveHour?.turns || 0} turnos)\n7d: ${agySd}% (${fmtNumber(agyQuota.sevenDay?.total)} tok · ${agyQuota.sevenDay?.turns || 0} turnos)`;
+      const agy5hStr = agyQuota.nextFiveHourResetAt
+        ? `\n⏳ Libera ventana 5h: ${fmtTimeShort(agyQuota.nextFiveHourResetAt)} (${fmtCountdown(agyQuota.nextFiveHourResetAt)})`
+        : '';
+      const agy7dStr = agyQuota.nextWeeklyResetAt
+        ? `\n📅 Libera ventana 7d: ${fmtDateTimeShort(agyQuota.nextWeeklyResetAt)} (${fmtCountdown(agyQuota.nextWeeklyResetAt)})`
+        : '';
+      pillAgyBox.title = `🟡 AGY (${agyQuota.model})\n5h: ${agyFh}% (${fmtNumber(agyQuota.fiveHour?.total)} tok · ${agyQuota.fiveHour?.turns || 0} turnos)\n7d: ${agySd}% (${fmtNumber(agyQuota.sevenDay?.total)} tok · ${agyQuota.sevenDay?.turns || 0} turnos)${agy5hStr}${agy7dStr}`;
     }
 
     // Iconos de sonido
@@ -598,7 +643,7 @@
   // =========================================================
   function renderSummaryStrip(data) {
     const sum = data.summary || {};
-    const clQuota = data.planQuota || {};
+    const clQuota = resolveClaudeQuota(data);
     const agyQuota = resolveAgyQuota(data);
     const analytics = data.analytics || {};
 
@@ -630,7 +675,22 @@
     clSdBar.classList.toggle('fill-danger', clSd >= 90);
 
     const todayClaudeTok = analytics.today?.claude?.total || 0;
-    document.getElementById('kpi-claude-sub').textContent = `Hoy: ${fmtNumber(todayClaudeTok)} tok`;
+    const kpiClaudeSub = document.getElementById('kpi-claude-sub');
+    if (kpiClaudeSub) {
+      if (clQuota.nextFiveHourResetAt || clQuota.nextWeeklyResetAt) {
+        kpiClaudeSub.textContent = `⏳5h:${fmtCountdownShort(clQuota.nextFiveHourResetAt)} · 7d:${fmtCountdownShort(clQuota.nextWeeklyResetAt)}`;
+      } else {
+        kpiClaudeSub.textContent = `Hoy: ${fmtNumber(todayClaudeTok)} tok`;
+      }
+    }
+    const kpiClaudeCard = document.getElementById('kpi-claude-card');
+    if (kpiClaudeCard) {
+      kpiClaudeCard.title = [
+        `Cuota Plan Claude · Hoy: ${fmtNumber(todayClaudeTok)} tok`,
+        clQuota.nextFiveHourResetAt ? `⏳ Reset 5h: ${fmtTimeShort(clQuota.nextFiveHourResetAt)} (${fmtCountdown(clQuota.nextFiveHourResetAt)})` : '',
+        clQuota.nextWeeklyResetAt ? `📅 Reset 7d: ${fmtDateTimeShort(clQuota.nextWeeklyResetAt)} (${fmtCountdown(clQuota.nextWeeklyResetAt)})` : ''
+      ].filter(Boolean).join('\n');
+    }
 
     // KPI 3: Cuota AGY
     const agyFh = agyQuota.fiveHourPct != null ? agyQuota.fiveHourPct : 0;
@@ -644,7 +704,22 @@
 
     const fhAgyTok = agyQuota.fiveHour?.total || 0;
     const sdAgyTok = agyQuota.sevenDay?.total || 0;
-    document.getElementById('kpi-agy-sub').textContent = `5h: ${fmtNumber(fhAgyTok)} · 7d: ${fmtNumber(sdAgyTok)}`;
+    const kpiAgySub = document.getElementById('kpi-agy-sub');
+    if (kpiAgySub) {
+      if (agyQuota.nextFiveHourResetAt || agyQuota.nextWeeklyResetAt) {
+        kpiAgySub.textContent = `⏳5h:${fmtCountdownShort(agyQuota.nextFiveHourResetAt)} · 7d:${fmtCountdownShort(agyQuota.nextWeeklyResetAt)}`;
+      } else {
+        kpiAgySub.textContent = `5h:${fmtNumber(fhAgyTok)} · 7d:${fmtNumber(sdAgyTok)}`;
+      }
+    }
+    const kpiAgyCard = document.getElementById('kpi-agy-card');
+    if (kpiAgyCard) {
+      kpiAgyCard.title = [
+        `Cuota Antigravity (AGY) · 5h: ${fmtNumber(fhAgyTok)} tok | 7d: ${fmtNumber(sdAgyTok)} tok`,
+        agyQuota.nextFiveHourResetAt ? `⏳ Libera 5h: ${fmtTimeShort(agyQuota.nextFiveHourResetAt)} (${fmtCountdown(agyQuota.nextFiveHourResetAt)})` : '',
+        agyQuota.nextWeeklyResetAt ? `📅 Libera 7d: ${fmtDateTimeShort(agyQuota.nextWeeklyResetAt)} (${fmtCountdown(agyQuota.nextWeeklyResetAt)})` : ''
+      ].filter(Boolean).join('\n');
+    }
 
     const modelShort = (agyQuota.model || 'Argon').includes('Argon')
       ? 'ARGON'
@@ -872,6 +947,20 @@
       clFhFoot.textContent = `Hoy: ${fmtNumber(analytics.today?.claude?.total)} tok (${analytics.today?.claude?.turns || 0} turnos)`;
     }
 
+    const clFhResetEl = document.getElementById('tokens-cl-fh-reset');
+    if (clFhResetEl) {
+      clFhResetEl.textContent = clQuota.nextFiveHourResetAt
+        ? `⏳ Resetea: ${fmtTimeShort(clQuota.nextFiveHourResetAt)} (${fmtCountdown(clQuota.nextFiveHourResetAt)})`
+        : '⏳ Ventana móvil 5h activa';
+    }
+
+    const clSdResetEl = document.getElementById('tokens-cl-sd-reset');
+    if (clSdResetEl) {
+      clSdResetEl.textContent = clQuota.nextWeeklyResetAt
+        ? `⏳ Resetea: ${fmtDateTimeShort(clQuota.nextWeeklyResetAt)} (${fmtCountdown(clQuota.nextWeeklyResetAt)})`
+        : '⏳ Ventana semanal (7d)';
+    }
+
     if (clQuota.updatedAt) {
       document.getElementById('quota-updated-at').textContent = `Sincronizado hace ${fmtRelativeTime(clQuota.updatedAt)}`;
     }
@@ -884,10 +973,17 @@
     );
 
     // 1.B Detector de Reseteo Semanal y Reseteo Gratis (Bonus) de Claude
+    const next5hEl = document.getElementById('claude-next-5h-txt');
+    if (next5hEl) {
+      next5hEl.textContent = clQuota.nextFiveHourResetAt
+        ? `${fmtTimeShort(clQuota.nextFiveHourResetAt)} (${fmtCountdownShort(clQuota.nextFiveHourResetAt)})`
+        : 'En ventana';
+    }
+
     const nextResetEl = document.getElementById('claude-next-reset-txt');
     if (nextResetEl) {
       if (clQuota.nextWeeklyResetAt) {
-        nextResetEl.textContent = `${fmtDateTimeShort(clQuota.nextWeeklyResetAt)} (${fmtCountdown(clQuota.nextWeeklyResetAt)})`;
+        nextResetEl.textContent = `${fmtDateTimeShort(clQuota.nextWeeklyResetAt)} (${fmtCountdownShort(clQuota.nextWeeklyResetAt)})`;
       } else {
         nextResetEl.textContent = 'Viernes 07:00 hs';
       }
@@ -960,6 +1056,20 @@
     const agySdDetail = document.getElementById('agy-sd-detail');
     if (agySdDetail && agyQuota.sevenDay) {
       agySdDetail.textContent = `${fmtNumber(agyQuota.sevenDay.total)} tok (${fmtNumber(agyQuota.sevenDay.effective)} ef.) · ${agyQuota.sevenDay.turns} turnos`;
+    }
+
+    const agyFhResetEl = document.getElementById('tokens-agy-fh-reset');
+    if (agyFhResetEl) {
+      agyFhResetEl.textContent = agyQuota.nextFiveHourResetAt
+        ? `⏳ Libera: ${fmtTimeShort(agyQuota.nextFiveHourResetAt)} (${fmtCountdown(agyQuota.nextFiveHourResetAt)})`
+        : '⏳ Ventana móvil continua (5h)';
+    }
+
+    const agySdResetEl = document.getElementById('tokens-agy-sd-reset');
+    if (agySdResetEl) {
+      agySdResetEl.textContent = agyQuota.nextWeeklyResetAt
+        ? `⏳ Libera: ${fmtDateTimeShort(agyQuota.nextWeeklyResetAt)} (${fmtCountdown(agyQuota.nextWeeklyResetAt)})`
+        : '⏳ Ventana móvil continua (7d)';
     }
 
     const gcpEl = document.getElementById('agy-gcp-proj');
@@ -1117,20 +1227,27 @@
         sshList.innerHTML = `<div class="muted-xs">No hay hosts SSH agregados. Usá el Modo 1 (arriba) si no tenés SSH.</div>`;
       } else {
         sshList.innerHTML = hosts
-          .map(
-            (h, idx) => `
+          .map((h, idx) => {
+            const keyName = h.keyPath
+              ? String(h.keyPath).split(/[\\/]/).filter(Boolean).pop() || h.keyPath
+              : '';
+            const keyBadge = keyName
+              ? `<span class="ssh-key-badge" title="Llave privada: ${escapeHtml(h.keyPath)}">🔑 ${escapeHtml(keyName)}</span>`
+              : '';
+            return `
           <div class="ssh-item">
-            <div>
+            <div style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
               <strong>${escapeHtml(h.label || h.target)}</strong>
               <span class="muted-xs"> (${escapeHtml(h.target)}:${h.port || 22})</span>
+              ${keyBadge}
               <span class="badge-pill ${h.lastStatus === 'ok' ? 'badge-ok' : ''}">
                 ${h.lastStatus === 'ok' ? 'Conectado' : h.lastStatus === 'error' ? 'Error SSH' : 'Pendiente'}
               </span>
             </div>
             <button class="btn-row-icon" data-action="remove-ssh" data-index="${idx}" title="Eliminar host">✕</button>
           </div>
-        `
-          )
+        `;
+          })
           .join('');
       }
     }
@@ -1378,14 +1495,16 @@
       const label = document.getElementById('ssh-label')?.value.trim();
       const target = document.getElementById('ssh-target')?.value.trim();
       const port = Number(document.getElementById('ssh-port')?.value) || 22;
+      const keyPath = document.getElementById('ssh-key')?.value.trim() || '';
       if (!target) return;
 
       const hosts = [...(currentState?.config?.sshHosts || [])];
-      hosts.push({ label: label || target, target, port, enabled: true });
+      hosts.push({ label: label || target, target, port, keyPath, enabled: true });
       await apiPost('/api/config', { sshHosts: hosts });
       document.getElementById('ssh-label').value = '';
       document.getElementById('ssh-target').value = '';
-      showToast('Servidor SSH agregado');
+      if (document.getElementById('ssh-key')) document.getElementById('ssh-key').value = '';
+      showToast(keyPath ? 'Servidor SSH + Llave agregados' : 'Servidor SSH agregado');
     });
 
     document.getElementById('ssh-hosts-list')?.addEventListener('click', async (ev) => {

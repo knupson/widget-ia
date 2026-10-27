@@ -1,10 +1,12 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const v8 = require('v8');
 
-// Cache incremental por archivo JSONL
+// Cache incremental por archivo JSONL y bases de Claude Desktop App
 const jsonlCache = new Map();
 let planUsageCache = { mtimeMs: 0, data: null };
+let desktopIdbCache = { key: '', data: null };
 
 function getClaudeDir() {
   return path.join(os.homedir(), '.claude');
@@ -12,6 +14,504 @@ function getClaudeDir() {
 
 function getClaudeAppDataDir() {
   return path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'Claude');
+}
+
+/**
+ * Verifica si la aplicación de escritorio de Claude está abierta comprobando el bloqueo SO sobre %APPDATA%\Claude\lockfile
+ */
+function isClaudeDesktopAppOpen(appDataDir) {
+  const lockPath = path.join(appDataDir, 'lockfile');
+  if (!fs.existsSync(lockPath)) return false;
+  let fd = null;
+  try {
+    fd = fs.openSync(lockPath, 'r+');
+    return false;
+  } catch (err) {
+    return Boolean(err && (err.code === 'EBUSY' || err.code === 'EPERM' || err.code === 'EACCES'));
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+  }
+}
+
+/**
+ * Descompresor puro JS para flujos Snappy (usado por Chromium/Blink en IndexedDB blobs de Claude Desktop)
+ */
+function snappyUncompress(buf) {
+  let pos = 0;
+  let uncompressedLength = 0;
+  let shift = 0;
+  while (pos < buf.length) {
+    const b = buf[pos++];
+    uncompressedLength |= (b & 0x7f) << shift;
+    if ((b & 0x80) === 0) break;
+    shift += 7;
+    if (shift > 35) throw new Error('Invalid Snappy header');
+  }
+  const out = Buffer.alloc(uncompressedLength);
+  let outPos = 0;
+  while (pos < buf.length && outPos < uncompressedLength) {
+    const tag = buf[pos++];
+    const type = tag & 0x03;
+    if (type === 0) {
+      let len = (tag >> 2) + 1;
+      if (len > 60) {
+        const extraBytes = len - 60;
+        len = 0;
+        for (let i = 0; i < extraBytes; i++) {
+          len |= buf[pos++] << (8 * i);
+        }
+        len += 1;
+      }
+      buf.copy(out, outPos, pos, pos + len);
+      pos += len;
+      outPos += len;
+    } else {
+      let len = 0;
+      let offset = 0;
+      if (type === 1) {
+        len = ((tag >> 2) & 0x07) + 4;
+        offset = ((tag & 0xe0) << 3) | buf[pos++];
+      } else if (type === 2) {
+        len = (tag >> 2) + 1;
+        offset = buf.readUInt16LE(pos);
+        pos += 2;
+      } else {
+        len = (tag >> 2) + 1;
+        offset = buf.readUInt32LE(pos);
+        pos += 4;
+      }
+      if (offset <= 0 || outPos - offset < 0) throw new Error('Invalid Snappy offset');
+      for (let i = 0; i < len; i++) {
+        out[outPos] = out[outPos - offset];
+        outPos++;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Desempaqueta bloques físicos de 32KB del Write-Ahead Log (.log) de LevelDB
+ */
+function unpackLevelDbWal(buf) {
+  const BLOCK_SIZE = 32768;
+  const records = [];
+  let current = [];
+  let offset = 0;
+  while (offset < buf.length) {
+    const blockEnd = Math.min(offset + BLOCK_SIZE, buf.length);
+    let pos = offset;
+    while (pos + 7 <= blockEnd) {
+      const len = buf.readUInt16LE(pos + 4);
+      const type = buf[pos + 6];
+      if (type === 0 || type > 4 || pos + 7 + len > blockEnd) break;
+      const chunk = buf.subarray(pos + 7, pos + 7 + len);
+      if (type === 1) {
+        records.push(chunk);
+        current = [];
+      } else if (type === 2) {
+        current = [chunk];
+      } else if (type === 3 && current.length > 0) {
+        current.push(chunk);
+      } else if (type === 4 && current.length > 0) {
+        current.push(chunk);
+        records.push(Buffer.concat(current));
+        current = [];
+      }
+      pos += 7 + len;
+    }
+    offset += BLOCK_SIZE;
+  }
+  return records;
+}
+
+/**
+ * Extrae las conversaciones abiertas y recientes de la App de Escritorio de Claude (%APPDATA%\Claude)
+ */
+function collectClaudeDesktopSessions(appDataDir) {
+  const isAppOpen = isClaudeDesktopAppOpen(appDataDir);
+  const ssDir = path.join(appDataDir, 'Session Storage');
+  const lsDir = path.join(appDataDir, 'Local Storage', 'leveldb');
+  const idbDir = path.join(appDataDir, 'IndexedDB', 'https_claude.ai_0.indexeddb.leveldb');
+  const blobRootDir = path.join(appDataDir, 'IndexedDB', 'https_claude.ai_0.indexeddb.blob');
+
+  if (!fs.existsSync(idbDir) && !fs.existsSync(ssDir) && !fs.existsSync(lsDir)) {
+    return [];
+  }
+
+  // Construir firma de mtimes para caché ultrarrápido
+  let sigParts = [isAppOpen ? '1' : '0'];
+  const ssFiles = [];
+  for (const dir of [lsDir, ssDir]) {
+    if (fs.existsSync(dir)) {
+      try {
+        for (const f of fs.readdirSync(dir)) {
+          if (f.endsWith('.log') || f.endsWith('.ldb')) {
+            const full = path.join(dir, f);
+            const st = fs.statSync(full);
+            ssFiles.push(full);
+            sigParts.push(`ss:${f}:${st.mtimeMs}:${st.size}`);
+          }
+        }
+      } catch {}
+    }
+  }
+
+  const idbLogFiles = [];
+  if (fs.existsSync(idbDir)) {
+    try {
+      for (const f of fs.readdirSync(idbDir)) {
+        if (f.endsWith('.log')) {
+          const full = path.join(idbDir, f);
+          const st = fs.statSync(full);
+          idbLogFiles.push(full);
+          sigParts.push(`idb:${f}:${st.mtimeMs}:${st.size}`);
+        }
+      }
+    } catch {}
+  }
+
+  const rqBlobFiles = [];
+  if (fs.existsSync(blobRootDir)) {
+    try {
+      for (const storeFolder of fs.readdirSync(blobRootDir)) {
+        const storePath = path.join(blobRootDir, storeFolder);
+        if (!fs.statSync(storePath).isDirectory()) continue;
+        for (const sub of fs.readdirSync(storePath)) {
+          const subPath = path.join(storePath, sub);
+          if (!fs.statSync(subPath).isDirectory()) continue;
+          for (const bf of fs.readdirSync(subPath)) {
+            const full = path.join(subPath, bf);
+            const st = fs.statSync(full);
+            if (st.size >= 400 && st.size <= 10 * 1024 * 1024) {
+              rqBlobFiles.push({ full, mtimeMs: st.mtimeMs, size: st.size });
+              sigParts.push(`blob:${storeFolder}/${sub}/${bf}:${st.mtimeMs}:${st.size}`);
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+
+  const cacheKey = sigParts.join('|');
+  if (desktopIdbCache.data && desktopIdbCache.key === cacheKey) {
+    return desktopIdbCache.data;
+  }
+
+  const nodeV8Ver = v8.serialize(0)[1];
+  const convMap = new Map(); // uuid -> convMeta
+  const projectsMap = new Map(); // projectUuid -> projectName
+  const sessionActiveUuids = new Set(); // UUIDs activos en Session Storage actual
+
+  // 1. Leer Local Storage y Session Storage (historial de navegación y snapshots del drawer)
+  for (const full of ssFiles) {
+    try {
+      const buf = fs.readFileSync(full);
+      for (const enc of ['utf8', 'utf16le']) {
+        const patChat = Buffer.from('"key":"chat:', enc);
+        let pos = 0;
+        let rank = 0;
+        while (pos < buf.length) {
+          const idx = buf.indexOf(patChat, pos);
+          if (idx === -1) break;
+          pos = idx + patChat.length;
+          const span = enc === 'utf16le' ? 700 : 350;
+          const snippet = buf.subarray(idx, Math.min(buf.length, idx + span)).toString(enc);
+          const m = snippet.match(
+            /"key":"chat:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"[^}]*?"title":"([^"]+)"/i
+          );
+          if (m) {
+            const uuid = m[1];
+            const rawTitle = m[2];
+            sessionActiveUuids.add(uuid);
+            const prev = convMap.get(uuid) || { uuid };
+            if (rawTitle) prev.title = rawTitle;
+            prev.navRank = rank++;
+            convMap.set(uuid, prev);
+          }
+        }
+
+        const patSnap = Buffer.from('"snapshots":{', enc);
+        let sPos = 0;
+        while (sPos < buf.length) {
+          const idx = buf.indexOf(patSnap, sPos);
+          if (idx === -1) break;
+          sPos = idx + patSnap.length;
+          const span = enc === 'utf16le' ? 3000 : 1500;
+          const snippet = buf.subarray(idx, Math.min(buf.length, idx + span)).toString(enc);
+          const snapRegex =
+            /"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})":\{"selectedItem":[^}]*,"at":(\d+)\}/gi;
+          let sm;
+          while ((sm = snapRegex.exec(snippet)) !== null) {
+            const uuid = sm[1];
+            const atTs = Number(sm[2]) || 0;
+            sessionActiveUuids.add(uuid);
+            const prev = convMap.get(uuid) || { uuid };
+            prev.lastOpenedAt = Math.max(prev.lastOpenedAt || 0, atTs);
+            convMap.set(uuid, prev);
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // 2. Leer Blobs de React Query (chat_conversation_list y project_list)
+  const patObjStart = Buffer.from('o"');
+  rqBlobFiles.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  for (const bInfo of rqBlobFiles) {
+    try {
+      const raw = fs.readFileSync(bInfo.full);
+      if (raw.length < 10) continue;
+      const decomp = snappyUncompress(raw.subarray(3));
+      const idxO = decomp.indexOf(patObjStart);
+      if (idxO === -1) continue;
+      const v8Buf = Buffer.concat([Buffer.from([0xff, nodeV8Ver]), decomp.subarray(idxO)]);
+      const obj = v8.deserialize(v8Buf);
+      const queries = obj?.clientState?.queries;
+      if (!Array.isArray(queries)) continue;
+
+      for (const q of queries) {
+        const qKey0 = Array.isArray(q.queryKey) ? q.queryKey[0] : '';
+        if (qKey0 === 'project_list') {
+          const pList = Array.isArray(q.state?.data)
+            ? q.state.data
+            : q.state?.data?.pages?.flatMap((p) => p.data || []) || [];
+          for (const p of pList) {
+            if (p && p.uuid && p.name) {
+              projectsMap.set(p.uuid, p.name);
+            }
+          }
+        }
+      }
+
+      for (const q of queries) {
+        const qKey0 = Array.isArray(q.queryKey) ? q.queryKey[0] : '';
+        if (qKey0 === 'chat_conversation_list') {
+          const cList = Array.isArray(q.state?.data)
+            ? q.state.data
+            : q.state?.data?.pages?.flatMap((p) => p.data || []) || [];
+          for (const c of cList) {
+            if (!c || !c.uuid) continue;
+            const prev = convMap.get(c.uuid) || { uuid: c.uuid };
+            const updMs = c.updated_at ? Date.parse(c.updated_at) || 0 : 0;
+            const creMs = c.created_at ? Date.parse(c.created_at) || 0 : 0;
+            prev.title = c.name || prev.title || `Chat ${c.uuid.slice(0, 8)}`;
+            prev.model = c.model || prev.model || 'claude';
+            prev.updatedAt = Math.max(prev.updatedAt || 0, updMs, creMs);
+            prev.projectUuid = c.project_uuid || prev.projectUuid || null;
+            prev.projectName =
+              (c.project && c.project.name) ||
+              (c.project_uuid && projectsMap.get(c.project_uuid)) ||
+              prev.projectName ||
+              '';
+            convMap.set(c.uuid, prev);
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // 3. Leer el Write-Ahead Log (.log) de IndexedDB (message-cache con mensajes en vivo)
+  const pat = Buffer.from('o"\x10conversationUuid');
+  for (const logPath of idbLogFiles) {
+    try {
+      const buf = fs.readFileSync(logPath);
+      const records = unpackLevelDbWal(buf);
+      for (const rec of records) {
+        let searchFrom = 0;
+        while (searchFrom < rec.length) {
+          const idx = rec.indexOf(pat, searchFrom);
+          if (idx === -1) break;
+          searchFrom = idx + pat.length;
+          try {
+            const payload = Buffer.concat([Buffer.from([0xff, nodeV8Ver]), rec.subarray(idx)]);
+            const val = v8.deserialize(payload);
+            if (val && val.conversationUuid) {
+              const uuid = val.conversationUuid;
+              const tree = val.tree && typeof val.tree === 'object' ? val.tree : val;
+              const prev = convMap.get(uuid) || { uuid };
+              prev.inMemoryCache = true;
+              if (tree.name || val.conversationTitle) {
+                prev.title = tree.name || val.conversationTitle;
+              }
+              if (tree.model || val.model) {
+                prev.model = tree.model || val.model;
+              }
+              if (tree.project && tree.project.name) {
+                prev.projectName = tree.project.name;
+              } else if (tree.project_uuid && projectsMap.get(tree.project_uuid)) {
+                prev.projectName = projectsMap.get(tree.project_uuid);
+              }
+              const treeUpdMs = tree.updated_at ? Date.parse(tree.updated_at) || 0 : 0;
+              prev.updatedAt = Math.max(
+                prev.updatedAt || 0,
+                treeUpdMs,
+                Number(val.conversationUpdatedAt) || 0,
+                Number(val.lastOpenedAt) || 0,
+                Number(val.writtenAt) || 0,
+                Number(val.fetchedAt) || 0
+              );
+              prev.lastOpenedAt = Math.max(
+                prev.lastOpenedAt || 0,
+                Number(val.lastOpenedAt) || 0,
+                Number(val.writtenAt) || 0
+              );
+              prev.messageCount = Math.max(prev.messageCount || 0, Number(val.messageCount) || 0);
+              prev.approxBytes = Math.max(prev.approxBytes || 0, Number(val.approxBytes) || 0);
+
+              const msgs = Array.isArray(tree.chat_messages)
+                ? tree.chat_messages
+                : Array.isArray(val.messages)
+                  ? val.messages
+                  : [];
+              if (msgs.length > 0) {
+                let inChars = 0;
+                let outChars = 0;
+                let lastUserText = '';
+                let lastAssistantText = '';
+                for (const m of msgs) {
+                  const txt =
+                    typeof m.text === 'string' && m.text.trim()
+                      ? m.text.trim()
+                      : extractMessageText(m.content);
+                  if (m.sender === 'human') {
+                    inChars += txt.length;
+                    if (txt) lastUserText = txt.slice(0, 220);
+                  } else {
+                    outChars += txt.length;
+                    if (txt) lastAssistantText = txt.slice(0, 260);
+                  }
+                }
+                const lastMsg = msgs[msgs.length - 1];
+                prev.lastSender = lastMsg.sender || 'assistant';
+                prev.lastStopReason = lastMsg.stop_reason || 'end_turn';
+                prev.lastMsgUpdatedAt = lastMsg.updated_at ? Date.parse(lastMsg.updated_at) || 0 : 0;
+                prev.lastUserText = lastUserText || prev.lastUserText || '';
+                prev.lastAssistantText = lastAssistantText || prev.lastAssistantText || '';
+                prev.inChars = inChars;
+                prev.outChars = outChars;
+                prev.messageCount = Math.max(prev.messageCount || 0, msgs.length);
+              }
+              convMap.set(uuid, prev);
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+
+  // Determinar cuáles conversaciones están "abiertas/activas" en la App de Escritorio
+  const allConvs = [...convMap.values()].sort((a, b) => {
+    const scoreA = Math.max(a.lastOpenedAt || 0, a.updatedAt || 0);
+    const scoreB = Math.max(b.lastOpenedAt || 0, b.updatedAt || 0);
+    return scoreB - scoreA;
+  });
+
+  const now = Date.now();
+  const desktopSessions = [];
+  let openAssignedCount = 0;
+
+  for (const c of allConvs) {
+    const projLabel =
+      c.projectName || (c.projectUuid && projectsMap.get(c.projectUuid)) || 'Claude Desktop';
+    const lastActiveMs = Math.max(c.updatedAt || 0, c.lastOpenedAt || 0, c.lastMsgUpdatedAt || 0);
+
+    // Una conversación de la App de Escritorio se considera abierta si la App está ejecutándose y:
+    // - Está en el cache en memoria de IndexedDB (.log) o en Session Storage actual, o
+    // - Es una de las conversaciones tocadas en las últimas 24h mientras la app está abierta
+    const isRecent = now - lastActiveMs < 36 * 60 * 60 * 1000;
+    let isOpen = false;
+    if (isAppOpen) {
+      if ((c.inMemoryCache || sessionActiveUuids.has(c.uuid)) && openAssignedCount < 5) {
+        isOpen = true;
+        openAssignedCount++;
+      } else if (openAssignedCount === 0 && desktopSessions.length === 0) {
+        isOpen = true;
+        openAssignedCount++;
+      }
+    }
+
+    if (!isOpen && !isRecent) continue;
+
+    // Determinar estado ('running' | 'waiting_input' | 'closed')
+    let state = 'closed';
+    if (isOpen) {
+      const msgAgeMs = now - (c.lastMsgUpdatedAt || c.updatedAt || 0);
+      if (
+        (c.lastSender === 'human' && msgAgeMs < 180000) ||
+        (c.lastSender === 'assistant' && !c.lastStopReason && msgAgeMs < 120000)
+      ) {
+        state = 'running';
+      } else {
+        state = 'waiting_input';
+      }
+    }
+
+    const stateLabelMap = {
+      waiting_approval: 'Permiso',
+      waiting_input: 'Lista',
+      running: 'Activa',
+      closed: 'Cerrada'
+    };
+
+    const turns = Math.max(1, Math.ceil((c.messageCount || 2) / 2));
+    let inTok = 0;
+    let outTok = 0;
+    let crTok = 0;
+    if ((c.inChars || 0) + (c.outChars || 0) > 0) {
+      inTok = Math.round((c.inChars || 0) / 4);
+      outTok = Math.round((c.outChars || 0) / 4);
+      crTok = turns > 1 ? Math.round((inTok + outTok) * Math.min(3.5, (turns - 1) * 0.45)) : 0;
+    } else if ((c.approxBytes || 0) > 0) {
+      const baseTok = Math.round(c.approxBytes / 14);
+      inTok = Math.round(baseTok * 0.25);
+      outTok = Math.round(baseTok * 0.25);
+      crTok = Math.round(baseTok * 0.5);
+    }
+    const totTok = inTok + outTok + crTok;
+    const effTok = Math.round(inTok + crTok * 0.1 + outTok * 5);
+
+    desktopSessions.push({
+      id: `claude-app:${c.uuid}`,
+      sessionId: c.uuid,
+      pid: null,
+      provider: 'claude',
+      providerLabel: 'Claude App',
+      surface: 'app',
+      model: c.model || 'claude',
+      gitBranch: '',
+      isOpen,
+      isSubagent: false,
+      state,
+      stateLabel: stateLabelMap[state] || state,
+      title:
+        c.title ||
+        (c.lastUserText ? c.lastUserText.slice(0, 60) : '') ||
+        `Chat ${c.uuid.slice(0, 8)}`,
+      projectName: projLabel,
+      workspace: `https://claude.ai/chat/${c.uuid}`,
+      updatedAt: lastActiveMs || now,
+      turns,
+      lastMessage: c.lastAssistantText || c.lastUserText || '',
+      currentAction: state === 'running' ? 'Generando respuesta en Claude App...' : '',
+      tokens: {
+        input: inTok,
+        cacheRead: crTok,
+        cacheWrite: 0,
+        output: outTok,
+        total: totTok,
+        effective: effTok,
+        turns
+      }
+    });
+  }
+
+  desktopIdbCache = { key: cacheKey, data: desktopSessions };
+  return desktopSessions;
 }
 
 /**
@@ -164,13 +664,53 @@ function readPlanQuotaUsage() {
     const lastReset = resets[0] || null;
     const lastBonusReset = resets.find((r) => r.isBonus) || null;
 
-    // Si nextWeeklyResetAt ya pasó o no está disponible, estimar 7 días desde el último reset de viernes
+    const now = Date.now();
+    // Si nextWeeklyResetAt ya pasó o no está disponible, proyectar en bloques de 7 días desde la referencia o último reset
     let nextWeeklyResetAt = utilMeta.nextWeeklyResetAt;
-    if ((!nextWeeklyResetAt || nextWeeklyResetAt < Date.now()) && lastReset) {
-      nextWeeklyResetAt = lastReset.timestamp + 7 * 24 * 3600 * 1000;
+    if (nextWeeklyResetAt && nextWeeklyResetAt <= now) {
+      while (nextWeeklyResetAt <= now) {
+        nextWeeklyResetAt += 7 * 24 * 3600 * 1000;
+      }
+    } else if (!nextWeeklyResetAt && lastReset) {
+      const schedReset = resets.find((r) => !r.isBonus) || lastReset;
+      nextWeeklyResetAt = schedReset.timestamp + 7 * 24 * 3600 * 1000;
+      while (nextWeeklyResetAt <= now) {
+        nextWeeklyResetAt += 7 * 24 * 3600 * 1000;
+      }
     }
 
     const latest = entries[entries.length - 1];
+    const fiveHourPct = latest.u && typeof latest.u.fh === 'number' ? latest.u.fh : 0;
+    const sevenDayPct = latest.u && typeof latest.u.sd === 'number' ? latest.u.sd : 0;
+
+    // Calcular cuándo resetea la cuota de 5 horas si está activa (fh > 0)
+    let nextFiveHourResetAt = utilMeta.nextFiveHourResetAt;
+    if (!nextFiveHourResetAt || nextFiveHourResetAt <= now) {
+      if (fiveHourPct > 0) {
+        const fiveHoursAgo = now - 5 * 3600 * 1000;
+        let windowStartTs = latest.t || now;
+        for (let i = entries.length - 1; i >= 0; i--) {
+          const item = entries[i];
+          const ts = item.t || 0;
+          const fhVal = item.u && typeof item.u.fh === 'number' ? item.u.fh : 0;
+          if (ts < fiveHoursAgo) break;
+          if (fhVal === 0) break;
+          windowStartTs = ts;
+          // Si houve caída de fh respecto a la muestra previa, ahí comenzó el ciclo actual de 5h
+          if (i > 0) {
+            const prevFh = entries[i - 1]?.u?.fh ?? 0;
+            if (prevFh === 0 || fhVal < prevFh) break;
+          }
+        }
+        nextFiveHourResetAt = windowStartTs + 5 * 3600 * 1000;
+        if (nextFiveHourResetAt <= now) {
+          nextFiveHourResetAt = (latest.t || now) + 5 * 3600 * 1000;
+        }
+      } else {
+        nextFiveHourResetAt = null;
+      }
+    }
+
     const recentHistory = entries.slice(-48).map((item) => ({
       t: item.t,
       fh: item.u && typeof item.u.fh === 'number' ? item.u.fh : 0,
@@ -179,11 +719,11 @@ function readPlanQuotaUsage() {
 
     const result = {
       available: true,
-      fiveHourPct: latest.u && typeof latest.u.fh === 'number' ? latest.u.fh : 0,
-      sevenDayPct: latest.u && typeof latest.u.sd === 'number' ? latest.u.sd : 0,
+      fiveHourPct,
+      sevenDayPct,
       updatedAt: latest.t || stat.mtimeMs,
       nextWeeklyResetAt,
-      nextFiveHourResetAt: utilMeta.nextFiveHourResetAt,
+      nextFiveHourResetAt,
       activePromo: utilMeta.activePromo,
       lastReset,
       lastBonusReset,
@@ -626,6 +1166,32 @@ function collectClaudeData(hookStateOverrides = new Map()) {
           turns: (parsed && parsed.turns) || 0
         }
       });
+    }
+  }
+
+  // Incorporar las conversaciones activas y recientes de la App de Escritorio de Claude (%APPDATA%\Claude)
+  const desktopSessions = collectClaudeDesktopSessions(getClaudeAppDataDir());
+  for (const ds of desktopSessions) {
+    sessions.push(ds);
+    if (ds.updatedAt >= sevenDaysAgo && ds.tokens && ds.tokens.total > 0) {
+      const dayKey = new Date(ds.updatedAt).toISOString().slice(0, 10);
+      if (!dailyAgg[dayKey]) {
+        dailyAgg[dayKey] = {
+          input: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          output: 0,
+          total: 0,
+          effective: 0,
+          turns: 0
+        };
+      }
+      dailyAgg[dayKey].input += ds.tokens.input || 0;
+      dailyAgg[dayKey].cacheRead += ds.tokens.cacheRead || 0;
+      dailyAgg[dayKey].output += ds.tokens.output || 0;
+      dailyAgg[dayKey].total += ds.tokens.total || 0;
+      dailyAgg[dayKey].effective += ds.tokens.effective || 0;
+      dailyAgg[dayKey].turns += ds.tokens.turns || 0;
     }
   }
 

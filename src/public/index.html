@@ -43,7 +43,10 @@
         <div class="pill-q-col" id="pill-claude-box" title="Cuota Oficial Plan Claude (5h / 7d)">
           <div class="pq-header">
             <span class="pq-brand brand-cl">🟠 CLAUDE</span>
-            <span id="pill-cl-reset-badge" class="pq-reset-tag hidden" title="¡Claude aplicó un Reseteo Gratis / Bonus!">🎁</span>
+            <span class="pq-meta-right">
+              <span id="pill-cl-reset-timer" class="pq-reset-timer" title="Tiempo para el próximo reseteo de cuota">--</span>
+              <span id="pill-cl-reset-badge" class="pq-reset-tag hidden" title="¡Claude aplicó un Reseteo Gratis / Bonus!">🎁</span>
+            </span>
           </div>
           <div class="pq-bars-stack">
             <div class="pq-line">
@@ -62,6 +65,7 @@
         <div class="pill-q-col" id="pill-agy-box" title="Pulso & Cuota Antigravity AGY (5h / 7d)">
           <div class="pq-header">
             <span class="pq-brand brand-agy">🟡 AGY</span>
+            <span id="pill-agy-reset-timer" class="pq-reset-timer" title="Próxima liberación de ventana AGY">--</span>
           </div>
           <div class="pq-bars-stack">
             <div class="pq-line">
@@ -231,7 +235,8 @@
                 <strong id="tokens-fh-pct" class="qb-pct text-orange">--%</strong>
               </div>
               <div class="qb-bar"><div id="tokens-fh-bar" class="qb-fill fill-orange" style="width:0%"></div></div>
-              <div class="qb-foot" id="tokens-cl-fh-foot">Reinicio continuo cada 5h</div>
+              <div class="qb-foot" id="tokens-cl-fh-foot">Hoy: 0 tok</div>
+              <div class="qb-reset" id="tokens-cl-fh-reset">⏳ Reset 5h: calculando...</div>
             </div>
             <div class="quota-box">
               <div class="qb-top">
@@ -239,7 +244,8 @@
                 <strong id="tokens-sd-pct" class="qb-pct text-ochre">--%</strong>
               </div>
               <div class="qb-bar"><div id="tokens-sd-bar" class="qb-fill fill-ochre" style="width:0%"></div></div>
-              <div class="qb-foot" id="tokens-sd-warning">Ventana móvil de 7 días</div>
+              <div class="qb-foot" id="tokens-sd-warning">7d: 0 tok</div>
+              <div class="qb-reset" id="tokens-cl-sd-reset">⏳ Reset 7d: calculando...</div>
             </div>
           </div>
           <div class="sparkline-wrap">
@@ -252,13 +258,16 @@
             <div class="crp-header">
               <div class="crp-title-wrap">
                 <span class="crp-icon">🎁</span>
-                <span class="crp-title">Monitor de Reseteos de Cuota (Gratis & Semanales)</span>
+                <span class="crp-title">Reseteos de Cuota (Gratis &amp; Semanales)</span>
               </div>
-              <button id="btn-test-reset-alert" class="btn-xs" title="Simular notificación y sonido de reseteo gratis">🔔 Probar aviso</button>
+              <div class="crp-actions">
+                <span id="claude-last-bonus-badge" class="badge-pill badge-ochre">🎁 Bonus</span>
+                <button id="btn-test-reset-alert" class="btn-secondary btn-xs" title="Simular notificación y sonido de reseteo gratis">🔔 Probar</button>
+              </div>
             </div>
             <div class="crp-next-row">
-              <span>⏳ Próximo reset oficial: <strong id="claude-next-reset-txt">Calculando...</strong></span>
-              <span id="claude-last-bonus-badge" class="badge-pill badge-ochre">🎁 Bonus detectado</span>
+              <span>⏳ Reset 5h: <strong id="claude-next-5h-txt">--</strong></span>
+              <span>📅 Semanal: <strong id="claude-next-reset-txt">--</strong></span>
             </div>
             <div id="claude-resets-list" class="crp-list"></div>
           </div>
@@ -269,7 +278,7 @@
           <div class="section-header">
             <div class="sh-left">
               <span class="provider-pill prov-agy">AGY</span>
-              <h3>Cuota & Telemetría Antigravity</h3>
+              <h3>Cuota &amp; Telemetría Antigravity</h3>
             </div>
             <span id="agy-meta-badge" class="badge-pill badge-ochre">Gemini 4 Argon</span>
           </div>
@@ -281,6 +290,7 @@
               </div>
               <div class="qb-bar"><div id="agy-fh-bar" class="qb-fill fill-gold" style="width:0%"></div></div>
               <div class="qb-foot" id="agy-fh-detail">0 tok · 0 turnos (últ. 5h)</div>
+              <div class="qb-reset" id="tokens-agy-fh-reset">⏳ Libera 5h: ventana móvil</div>
             </div>
             <div class="quota-box">
               <div class="qb-top">
@@ -289,6 +299,7 @@
               </div>
               <div class="qb-bar"><div id="agy-sd-bar" class="qb-fill fill-amber" style="width:0%"></div></div>
               <div class="qb-foot" id="agy-sd-detail">0 tok · 0 turnos (últ. 7d)</div>
+              <div class="qb-reset" id="tokens-agy-sd-reset">⏳ Libera 7d: ventana móvil</div>
             </div>
           </div>
           <div class="agy-telemetry-strip" id="agy-telemetry-strip">
@@ -412,13 +423,18 @@
         <div class="section-card">
           <div class="section-header">
             <h3>🔑 Modo 2: Monitoreo por SSH Directo</h3>
-            <span class="muted-xs">Para servidores con acceso SSH por clave</span>
+            <span class="muted-xs">Soporta llave privada (`-i`)</span>
           </div>
-          <div class="ssh-add-row">
-            <input type="text" id="ssh-label" class="text-input" placeholder="Alias (ej. VPS Prod)" style="flex:1" />
-            <input type="text" id="ssh-target" class="text-input" placeholder="usuario@host" style="flex:1.4" />
-            <input type="number" id="ssh-port" class="text-input" placeholder="22" style="width:64px" />
-            <button id="btn-add-ssh" class="btn-primary">+ Agregar</button>
+          <div class="ssh-add-form">
+            <div class="ssh-add-row">
+              <input type="text" id="ssh-label" class="text-input" placeholder="Alias (ej. VPS Prod)" style="flex:1" />
+              <input type="text" id="ssh-target" class="text-input" placeholder="usuario@host" style="flex:1.4" />
+              <input type="number" id="ssh-port" class="text-input" placeholder="22" style="width:58px; flex:none" />
+            </div>
+            <div class="ssh-add-row">
+              <input type="text" id="ssh-key" class="text-input" placeholder="🔑 Ruta a llave privada opcional (ej. ~/.ssh/id_ed25519 o C:\llaves\prod.pem)" style="flex:1" />
+              <button id="btn-add-ssh" class="btn-primary">+ Agregar Host</button>
+            </div>
           </div>
           <div id="ssh-hosts-list" class="ssh-hosts-list"></div>
         </div>

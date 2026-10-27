@@ -21,10 +21,10 @@ let widgetServer = null;
 let currentMode = 'pill'; // Arranca como píldora compacta flotante
 let pillPosition = null; // { x, y }
 
-const PILL_WIDTH = 445;
-const PILL_HEIGHT = 52;
-const EXPANDED_WIDTH = 455;
-const EXPANDED_HEIGHT = 595;
+const PILL_WIDTH = 500;
+const PILL_HEIGHT = 54;
+const EXPANDED_WIDTH = 480;
+const EXPANDED_HEIGHT = 640;
 
 /**
  * Genera un ícono circular 16x16 en memoria para el System Tray según el color de estado
@@ -112,6 +112,7 @@ function setWindowMode(mode) {
     });
   }
 
+  mainWindow.setSkipTaskbar(true);
   mainWindow.webContents.send('widget:modeChanged', currentMode);
 }
 
@@ -217,7 +218,9 @@ async function initApp() {
   }
 
   app.on('second-instance', () => {
-    if (mainWindow) {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.setSkipTaskbar(true);
+      setWindowMode(currentMode);
       mainWindow.show();
       mainWindow.focus();
       mainWindow.webContents.reloadIgnoringCache();
@@ -283,7 +286,7 @@ async function initApp() {
     resizable: false,
     show: false,
     alwaysOnTop: config.alwaysOnTop !== false,
-    skipTaskbar: false,
+    skipTaskbar: true,
     hasShadow: true,
     backgroundColor: '#090705',
     icon: fs.existsSync(customIconPath) ? customIconPath : undefined,
@@ -295,6 +298,7 @@ async function initApp() {
     }
   });
 
+  mainWindow.setSkipTaskbar(true);
   mainWindow.setAlwaysOnTop(config.alwaysOnTop !== false, 'floating');
   if (typeof config.opacity === 'number') {
     mainWindow.setOpacity(Math.max(0.4, Math.min(1, config.opacity)));
@@ -302,14 +306,28 @@ async function initApp() {
 
   mainWindow.once('ready-to-show', () => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.setSkipTaskbar(true);
     mainWindow.show();
     mainWindow.focus();
   });
 
   mainWindow.webContents.on('did-finish-load', () => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.setSkipTaskbar(true);
     mainWindow.show();
     mainWindow.webContents.send('widget:modeChanged', currentMode);
+  });
+
+  mainWindow.on('show', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.setSkipTaskbar(true);
+    }
+  });
+
+  mainWindow.on('restore', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.setSkipTaskbar(true);
+    }
   });
 
   mainWindow.on('moved', () => {
