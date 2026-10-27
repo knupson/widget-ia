@@ -21,10 +21,24 @@ let widgetServer = null;
 let currentMode = 'pill'; // Arranca como píldora compacta flotante
 let pillPosition = null; // { x, y }
 
-const PILL_WIDTH = 516;
+const WIDGET_WIDTH = 516;
+const PILL_WIDTH = WIDGET_WIDTH;
 const PILL_HEIGHT = 54;
-const EXPANDED_WIDTH = 480;
+const EXPANDED_WIDTH = WIDGET_WIDTH;
 const EXPANDED_HEIGHT = 640;
+
+function enforceAlwaysOnTop() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const cfg = widgetServer ? widgetServer.getConfig() : { alwaysOnTop: true };
+  if (cfg.alwaysOnTop !== false) {
+    // En Windows, SwitchToThisWindow puede quitar WS_EX_TOPMOST de la ventana previa;
+    // alternar false -> true con nivel 'screen-saver' fuerza a Chromium/Win32 a reaplicar HWND_TOPMOST sin robar foco.
+    mainWindow.setAlwaysOnTop(false);
+    mainWindow.setAlwaysOnTop(true, 'screen-saver');
+  } else {
+    mainWindow.setAlwaysOnTop(false);
+  }
+}
 
 /**
  * Genera un ícono circular 16x16 en memoria para el System Tray según el color de estado
@@ -78,41 +92,44 @@ function setWindowMode(mode) {
   if (mode === 'pill') {
     const targetX = pillPosition
       ? pillPosition.x
-      : workArea.x + workArea.width - PILL_WIDTH - 20;
+      : workArea.x + workArea.width - WIDGET_WIDTH - 20;
     const targetY = pillPosition ? pillPosition.y : workArea.y + 16;
 
     mainWindow.setResizable(false);
-    mainWindow.setMinimumSize(PILL_WIDTH, PILL_HEIGHT);
+    mainWindow.setMinimumSize(WIDGET_WIDTH, PILL_HEIGHT);
+    mainWindow.setMaximumSize(WIDGET_WIDTH, PILL_HEIGHT);
     mainWindow.setBounds({
-      x: Math.max(workArea.x, Math.min(targetX, workArea.x + workArea.width - PILL_WIDTH)),
+      x: Math.max(workArea.x, Math.min(targetX, workArea.x + workArea.width - WIDGET_WIDTH)),
       y: Math.max(workArea.y, Math.min(targetY, workArea.y + workArea.height - PILL_HEIGHT)),
-      width: PILL_WIDTH,
+      width: WIDGET_WIDTH,
       height: PILL_HEIGHT
     });
   } else {
     const currentBounds = mainWindow.getBounds();
-    let targetX = currentBounds.x - (EXPANDED_WIDTH - currentBounds.width);
+    let targetX = currentBounds.x;
     let targetY = currentBounds.y;
 
     if (targetX < workArea.x + 8) targetX = workArea.x + 8;
-    if (targetX + EXPANDED_WIDTH > workArea.x + workArea.width - 8) {
-      targetX = workArea.x + workArea.width - EXPANDED_WIDTH - 8;
+    if (targetX + WIDGET_WIDTH > workArea.x + workArea.width - 8) {
+      targetX = workArea.x + workArea.width - WIDGET_WIDTH - 8;
     }
     if (targetY + EXPANDED_HEIGHT > workArea.y + workArea.height - 8) {
       targetY = Math.max(workArea.y + 8, workArea.y + workArea.height - EXPANDED_HEIGHT - 8);
     }
 
-    mainWindow.setMinimumSize(360, 380);
+    mainWindow.setMinimumSize(WIDGET_WIDTH, 380);
+    mainWindow.setMaximumSize(WIDGET_WIDTH, 1200);
     mainWindow.setResizable(true);
     mainWindow.setBounds({
       x: targetX,
       y: targetY,
-      width: EXPANDED_WIDTH,
+      width: WIDGET_WIDTH,
       height: EXPANDED_HEIGHT
     });
   }
 
   mainWindow.setSkipTaskbar(true);
+  enforceAlwaysOnTop();
   mainWindow.webContents.send('widget:modeChanged', currentMode);
 }
 
@@ -239,7 +256,7 @@ async function initApp() {
     },
     onConfigChange: (cfg) => {
       if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.setAlwaysOnTop(cfg.alwaysOnTop !== false, 'floating');
+        enforceAlwaysOnTop();
         if (typeof cfg.opacity === 'number') {
           mainWindow.setOpacity(Math.max(0.4, Math.min(1, cfg.opacity)));
         }
@@ -250,7 +267,11 @@ async function initApp() {
       if (body.mode === 'pill' || body.mode === 'expanded') {
         setWindowMode(body.mode);
       }
-      if (body.action === 'hide') {
+      if (body.action === 'ensureTopmost') {
+        enforceAlwaysOnTop();
+        setTimeout(() => enforceAlwaysOnTop(), 80);
+        setTimeout(() => enforceAlwaysOnTop(), 300);
+      } else if (body.action === 'hide') {
         mainWindow.hide();
       } else if (body.action === 'quit') {
         app.isQuitting = true;
@@ -299,7 +320,7 @@ async function initApp() {
   });
 
   mainWindow.setSkipTaskbar(true);
-  mainWindow.setAlwaysOnTop(config.alwaysOnTop !== false, 'floating');
+  enforceAlwaysOnTop();
   if (typeof config.opacity === 'number') {
     mainWindow.setOpacity(Math.max(0.4, Math.min(1, config.opacity)));
   }
@@ -307,6 +328,7 @@ async function initApp() {
   mainWindow.once('ready-to-show', () => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
     mainWindow.setSkipTaskbar(true);
+    enforceAlwaysOnTop();
     mainWindow.show();
     mainWindow.focus();
   });
@@ -314,6 +336,7 @@ async function initApp() {
   mainWindow.webContents.on('did-finish-load', () => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
     mainWindow.setSkipTaskbar(true);
+    enforceAlwaysOnTop();
     mainWindow.show();
     mainWindow.webContents.send('widget:modeChanged', currentMode);
   });
@@ -321,19 +344,32 @@ async function initApp() {
   mainWindow.on('show', () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.setSkipTaskbar(true);
+      enforceAlwaysOnTop();
     }
   });
 
   mainWindow.on('restore', () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.setSkipTaskbar(true);
+      enforceAlwaysOnTop();
+    }
+  });
+
+  mainWindow.on('blur', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      enforceAlwaysOnTop();
+      setTimeout(() => enforceAlwaysOnTop(), 100);
     }
   });
 
   mainWindow.on('moved', () => {
-    if (currentMode === 'pill' && mainWindow && !mainWindow.isDestroyed()) {
+    if (mainWindow && !mainWindow.isDestroyed()) {
       const b = mainWindow.getBounds();
-      pillPosition = { x: b.x, y: b.y };
+      if (currentMode === 'pill') {
+        pillPosition = { x: b.x, y: b.y };
+      } else if (pillPosition) {
+        pillPosition.x = b.x;
+      }
     }
   });
 
@@ -349,7 +385,12 @@ async function initApp() {
 
   ipcMain.handle('widget:setAlwaysOnTop', (_e, flag) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.setAlwaysOnTop(Boolean(flag), 'floating');
+      if (Boolean(flag)) {
+        mainWindow.setAlwaysOnTop(false);
+        mainWindow.setAlwaysOnTop(true, 'screen-saver');
+      } else {
+        mainWindow.setAlwaysOnTop(false);
+      }
     }
     return true;
   });

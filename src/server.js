@@ -511,6 +511,9 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
         workspace: body.workspace,
         title: body.title
       });
+      if (typeof onWindowControl === 'function') {
+        onWindowControl({ action: 'ensureTopmost' });
+      }
       refreshSnapshot();
       sendJson(res, 200, result);
       return;

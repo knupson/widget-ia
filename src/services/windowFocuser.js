@@ -37,6 +37,14 @@ public class Win32Focus {
     public static extern bool IsIconic(IntPtr hWnd);
     [DllImport("user32.dll")]
     public static extern void SwitchToThisWindow(IntPtr hWnd, bool fAltTab);
+    [DllImport("user32.dll")]
+    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+    public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+    public const uint SWP_NOSIZE = 0x0001;
+    public const uint SWP_NOMOVE = 0x0002;
+    public const uint SWP_NOACTIVATE = 0x0010;
+    public const uint SWP_SHOWWINDOW = 0x0040;
 
     [StructLayout(LayoutKind.Sequential)]
     struct RM_UNIQUE_PROCESS {
@@ -91,6 +99,20 @@ public class Win32Focus {
 }
 "@
 
+function Restore-WidgetTopMost() {
+    try {
+        $wProcs = Get-Process -Name "electron" -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }
+        foreach ($wp in $wProcs) {
+            [Win32Focus]::SetWindowPos(
+                $wp.MainWindowHandle,
+                [Win32Focus]::HWND_TOPMOST,
+                0, 0, 0, 0,
+                ([Win32Focus]::SWP_NOMOVE -bor [Win32Focus]::SWP_NOSIZE -bor [Win32Focus]::SWP_NOACTIVATE)
+            ) | Out-Null
+        }
+    } catch {}
+}
+
 function Focus-WindowHandle([IntPtr]$h, [int]$procId = 0) {
     if ($h -eq [IntPtr]::Zero) { return $false }
     if ([Win32Focus]::IsIconic($h)) {
@@ -104,6 +126,7 @@ function Focus-WindowHandle([IntPtr]$h, [int]$procId = 0) {
             $wshell.AppActivate($procId) | Out-Null
         } catch {}
     }
+    Restore-WidgetTopMost
     return $true
 }
 
@@ -226,6 +249,7 @@ if ($targetPid -gt 0 -and $allProcs) {
                 }
             } catch {}
 
+            Restore-WidgetTopMost
             Write-Output "focused_wt_tab:\${wtPid}:tab=\${tabIndex}:shell=\${shellPid}:pid=\${targetPid}"
             exit 0
         }
