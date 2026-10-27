@@ -21,7 +21,7 @@ let widgetServer = null;
 let currentMode = 'pill'; // Arranca como píldora compacta flotante
 let pillPosition = null; // { x, y }
 
-const PILL_WIDTH = 500;
+const PILL_WIDTH = 516;
 const PILL_HEIGHT = 54;
 const EXPANDED_WIDTH = 480;
 const EXPANDED_HEIGHT = 640;

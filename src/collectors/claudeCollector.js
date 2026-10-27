@@ -143,8 +143,8 @@ function collectClaudeDesktopSessions(appDataDir) {
     return [];
   }
 
-  // Construir firma de mtimes para caché ultrarrápido
-  let sigParts = [isAppOpen ? '1' : '0'];
+  // Construir firma de mtimes + ventana de 15s para refrescar estados por tiempo
+  let sigParts = [isAppOpen ? '1' : '0', String(Math.floor(Date.now() / 15000))];
   const ssFiles = [];
   for (const dir of [lsDir, ssDir]) {
     if (fs.existsSync(dir)) {
@@ -253,6 +253,41 @@ function collectClaudeDesktopSessions(appDataDir) {
             const prev = convMap.get(uuid) || { uuid };
             prev.lastOpenedAt = Math.max(prev.lastOpenedAt || 0, atTs);
             convMap.set(uuid, prev);
+          }
+        }
+
+        // Detectar eventos en vivo de telemetría (antalytics_queue_v1) en Local Storage:
+        // claudeai.message.(sent | perceived_ttft | first_text | perceived_ttlt)
+        const patMsgEvt = Buffer.from('claudeai.message.', enc);
+        let ePos = 0;
+        while (ePos < buf.length) {
+          const idx = buf.indexOf(patMsgEvt, ePos);
+          if (idx === -1) break;
+          ePos = idx + patMsgEvt.length;
+          const start = Math.max(0, idx - (enc === 'utf16le' ? 800 : 400));
+          const end = Math.min(buf.length, idx + (enc === 'utf16le' ? 1400 : 700));
+          const win = buf.subarray(start, end).toString(enc);
+          const mEvt = win.match(
+            /claudeai\.message\.(sent|perceived_ttft|first_text|perceived_ttlt)/
+          );
+          const mUuid = win.match(
+            /"conversation_uuid"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"/i
+          );
+          const mTs = win.match(/"eventTimestamp"\s*:\s*"([^"]+)"/);
+          if (mEvt && mUuid) {
+            const evtType = mEvt[1];
+            const uuid = mUuid[1];
+            const ts = mTs ? Date.parse(mTs[1]) || 0 : 0;
+            if (ts > 0) {
+              const prev = convMap.get(uuid) || { uuid };
+              if (evtType === 'perceived_ttlt') {
+                prev.lastEndTs = Math.max(prev.lastEndTs || 0, ts);
+              } else {
+                prev.lastStartTs = Math.max(prev.lastStartTs || 0, ts);
+              }
+              prev.updatedAt = Math.max(prev.updatedAt || 0, ts);
+              convMap.set(uuid, prev);
+            }
           }
         }
       }
@@ -413,43 +448,44 @@ function collectClaudeDesktopSessions(appDataDir) {
 
   const now = Date.now();
   const desktopSessions = [];
-  let openAssignedCount = 0;
 
   for (const c of allConvs) {
     const projLabel =
       c.projectName || (c.projectUuid && projectsMap.get(c.projectUuid)) || 'Claude Desktop';
-    const lastActiveMs = Math.max(c.updatedAt || 0, c.lastOpenedAt || 0, c.lastMsgUpdatedAt || 0);
+    const lastActiveMs = Math.max(
+      c.updatedAt || 0,
+      c.lastOpenedAt || 0,
+      c.lastMsgUpdatedAt || 0,
+      c.lastStartTs || 0,
+      c.lastEndTs || 0
+    );
 
-    // Una conversación de la App de Escritorio se considera abierta si la App está ejecutándose y:
-    // - Está en el cache en memoria de IndexedDB (.log) o en Session Storage actual, o
-    // - Es una de las conversaciones tocadas en las últimas 24h mientras la app está abierta
     const isRecent = now - lastActiveMs < 36 * 60 * 60 * 1000;
-    let isOpen = false;
-    if (isAppOpen) {
-      if ((c.inMemoryCache || sessionActiveUuids.has(c.uuid)) && openAssignedCount < 5) {
-        isOpen = true;
-        openAssignedCount++;
-      } else if (openAssignedCount === 0 && desktopSessions.length === 0) {
-        isOpen = true;
-        openAssignedCount++;
-      }
-    }
 
+    // Determinar si Claude está pensando/respondiendo en vivo AHORA MISMO en la App de Escritorio:
+    // 1) Evento sent/perceived_ttft/first_text más reciente que perceived_ttlt y dentro de los últimos 3 min
+    // 2) O último mensaje en cache de IndexedDB es del usuario (sin respuesta aún) o del asistente sin stop_reason
+    const hasActiveStream =
+      (c.lastStartTs || 0) > (c.lastEndTs || 0) && now - (c.lastStartTs || 0) < 180_000;
+    const msgTs = c.lastMsgUpdatedAt || 0;
+    const hasUnfinishedMsg =
+      msgTs > (c.lastEndTs || 0) &&
+      ((c.lastSender === 'human' && now - msgTs < 180_000) ||
+        (c.lastSender === 'assistant' && !c.lastStopReason && now - msgTs < 120_000));
+
+    const isThinking = isAppOpen && (hasActiveStream || hasUnfinishedMsg);
+
+    // Si recién terminó de pensar (hace menos de 5 minutos), mantenerla visible como "Lista"
+    // para que el widget avise y permita saltar con 🎯; pasado ese tiempo pasa a "Cerrada"
+    // para no ensuciar la pestaña de Abiertas con chats viejos del historial web.
+    const lastFinishMs = Math.max(c.lastEndTs || 0, c.lastMsgUpdatedAt || 0);
+    const justFinished =
+      !isThinking && isAppOpen && lastFinishMs > 0 && now - lastFinishMs < 5 * 60 * 1000;
+
+    const isOpen = isThinking || justFinished;
     if (!isOpen && !isRecent) continue;
 
-    // Determinar estado ('running' | 'waiting_input' | 'closed')
-    let state = 'closed';
-    if (isOpen) {
-      const msgAgeMs = now - (c.lastMsgUpdatedAt || c.updatedAt || 0);
-      if (
-        (c.lastSender === 'human' && msgAgeMs < 180000) ||
-        (c.lastSender === 'assistant' && !c.lastStopReason && msgAgeMs < 120000)
-      ) {
-        state = 'running';
-      } else {
-        state = 'waiting_input';
-      }
-    }
+    const state = isThinking ? 'running' : isOpen ? 'waiting_input' : 'closed';
 
     const stateLabelMap = {
       waiting_approval: 'Permiso',
@@ -596,7 +632,8 @@ function readPlanQuotaUsage() {
 
   try {
     const stat = fs.statSync(planPath);
-    if (planUsageCache.data && planUsageCache.mtimeMs === stat.mtimeMs) {
+    const cacheBucket = `${stat.mtimeMs}:${Math.floor(Date.now() / 60000)}`;
+    if (planUsageCache.data && planUsageCache.mtimeMs === cacheBucket) {
       return planUsageCache.data;
     }
 
@@ -628,7 +665,7 @@ function readPlanQuotaUsage() {
     }
 
     // Detectar caídas de cuota semanal (sd) que indican un reseteo de cuota
-    const resets = [];
+    const allResets = [];
     let prevResetTs = 0;
     for (let i = 1; i < entries.length; i++) {
       const prevSd = entries[i - 1]?.u?.sd;
@@ -646,7 +683,7 @@ function readPlanQuotaUsage() {
             (dayOfWeek !== 5 && prevSd >= 40) ||
             (prevResetTs > 0 && daysSincePrevReset < 5.8 && prevSd >= 40);
 
-          resets.push({
+          allResets.push({
             id: `reset:${currTs}`,
             timestamp: currTs,
             fromPct: prevSd,
@@ -660,9 +697,8 @@ function readPlanQuotaUsage() {
       }
     }
 
-    resets.reverse(); // Más recientes primero
-    const lastReset = resets[0] || null;
-    const lastBonusReset = resets.find((r) => r.isBonus) || null;
+    allResets.reverse(); // Más recientes primero
+    const latestHistoricalReset = allResets[0] || null;
 
     const now = Date.now();
     // Si nextWeeklyResetAt ya pasó o no está disponible, proyectar en bloques de 7 días desde la referencia o último reset
@@ -671,8 +707,8 @@ function readPlanQuotaUsage() {
       while (nextWeeklyResetAt <= now) {
         nextWeeklyResetAt += 7 * 24 * 3600 * 1000;
       }
-    } else if (!nextWeeklyResetAt && lastReset) {
-      const schedReset = resets.find((r) => !r.isBonus) || lastReset;
+    } else if (!nextWeeklyResetAt && latestHistoricalReset) {
+      const schedReset = allResets.find((r) => !r.isBonus) || latestHistoricalReset;
       nextWeeklyResetAt = schedReset.timestamp + 7 * 24 * 3600 * 1000;
       while (nextWeeklyResetAt <= now) {
         nextWeeklyResetAt += 7 * 24 * 3600 * 1000;
@@ -682,6 +718,17 @@ function readPlanQuotaUsage() {
     const latest = entries[entries.length - 1];
     const fiveHourPct = latest.u && typeof latest.u.fh === 'number' ? latest.u.fh : 0;
     const sevenDayPct = latest.u && typeof latest.u.sd === 'number' ? latest.u.sd : 0;
+
+    // Filtrar solo reseteos recientes (últimas 24h y cuyo ahorro no haya sido ya superado)
+    // para no mostrar regalos ni cortes semanales del pasado como actuales
+    const recentResets = allResets.filter(
+      (r) => now - r.timestamp < 24 * 3600 * 1000 && sevenDayPct < r.fromPct
+    );
+    const lastReset = recentResets[0] || null;
+    const lastBonusReset =
+      recentResets.find(
+        (r) => r.isBonus && now - r.timestamp < 12 * 3600 * 1000 && sevenDayPct < 50
+      ) || null;
 
     // Calcular cuándo resetea la cuota de 5 horas si está activa (fh > 0)
     let nextFiveHourResetAt = utilMeta.nextFiveHourResetAt;
@@ -727,11 +774,11 @@ function readPlanQuotaUsage() {
       activePromo: utilMeta.activePromo,
       lastReset,
       lastBonusReset,
-      resets: resets.slice(0, 6),
+      resets: recentResets.slice(0, 6),
       history: recentHistory
     };
 
-    planUsageCache = { mtimeMs: stat.mtimeMs, data: result };
+    planUsageCache = { mtimeMs: cacheBucket, data: result };
     return result;
   } catch {
     return {

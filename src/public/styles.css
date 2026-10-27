@@ -76,7 +76,8 @@ body.mode-web #pill-view {
 .pill-container {
   width: 100vw;
   height: 100vh;
-  padding: 3px 6px;
+  padding: 3px 8px;
+  gap: 8px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -118,6 +119,7 @@ body.mode-web #pill-view {
   gap: 6px;
   flex: 1;
   padding-left: 5px;
+  padding-right: 4px;
   height: 100%;
   overflow: hidden;
 }
@@ -332,8 +334,11 @@ body.mode-web #pill-view {
   -webkit-app-region: no-drag;
   display: flex;
   align-items: center;
-  gap: 3px;
+  gap: 4px;
+  margin-left: 2px;
+  padding-left: 8px;
   padding-right: 2px;
+  border-left: 1px solid rgba(217, 155, 38, 0.2);
   flex-shrink: 0;
 }
 

@@ -298,81 +298,27 @@
   // Resuelve la cuota de Claude junto con el detector de Reseteo Semanal y Reseteo Gratis (Bonus)
   function resolveClaudeQuota(data) {
     const pq = (data && data.planQuota) || {};
-    if (Array.isArray(pq.resets) && pq.resets.length > 0) {
-      return pq;
-    }
+    const now = Date.now();
+    const currSd = typeof pq.sevenDayPct === 'number' ? pq.sevenDayPct : 0;
 
-    // Fallback inteligente si el servidor aún tiene el snapshot anterior en memoria
-    const detectedResets = [];
-    const hist = Array.isArray(pq.history) ? pq.history : [];
-    for (let i = 1; i < hist.length; i++) {
-      const prevSd = Math.round(Number(hist[i - 1].sd ?? 0));
-      const currSd = Math.round(Number(hist[i].sd ?? 0));
-      const ts = Number(hist[i].t) || 0;
-      const drop = prevSd - currSd;
-      if (prevSd >= 6 && drop >= 5 && currSd <= 15) {
-        const dt = new Date(ts);
-        const isScheduledDay =
-          (dt.getDay() === 5 && dt.getHours() <= 14) ||
-          (dt.getDay() === 4 && dt.getHours() >= 19);
-        const isBonus = !isScheduledDay || (prevSd >= 50 && dt.getDay() !== 5);
-        detectedResets.push({
-          id: `claude-reset-${ts}`,
-          timestamp: ts,
-          fromPct: prevSd,
-          toPct: currSd,
-          savedPct: drop,
-          isBonus,
-          kindLabel: isBonus ? '🎁 Reseteo Gratis (Bonus)' : '🔄 Reseteo Semanal'
-        });
-      }
-    }
+    // Filtrar únicamente reseteos recientes (últimas 24h y cuyo ahorro siga vigente)
+    // para evitar mostrar regalos de semanas/días pasados ya consumidos
+    const rawResets = Array.isArray(pq.resets) ? pq.resets : [];
+    const recentResets = rawResets.filter(
+      (r) => r && r.timestamp && now - r.timestamp < 24 * 3600 * 1000 && currSd < (r.fromPct || 100)
+    );
 
-    // Si history está recortado a 36 muestras, incluir los últimos resets detectados en plan-usage-history.json
-    if (detectedResets.length === 0) {
-      detectedResets.push(
-        {
-          id: 'claude-reset-1792791907693',
-          timestamp: 1792791907693,
-          fromPct: 93,
-          toPct: 6,
-          savedPct: 87,
-          isBonus: true,
-          kindLabel: '🎁 Reseteo Gratis (Bonus)'
-        },
-        {
-          id: 'claude-reset-1792502418987',
-          timestamp: 1792502418987,
-          fromPct: 97,
-          toPct: 7,
-          savedPct: 90,
-          isBonus: true,
-          kindLabel: '🎁 Reseteo Gratis (Bonus)'
-        },
-        {
-          id: 'claude-reset-1792158478137',
-          timestamp: 1792158478137,
-          fromPct: 7,
-          toPct: 1,
-          savedPct: 6,
-          isBonus: false,
-          kindLabel: '🔄 Reseteo Semanal'
-        }
-      );
-    } else {
-      detectedResets.reverse();
-    }
-
-    const lastReset = detectedResets[0] || null;
-    const lastBonusReset = detectedResets.find((r) => r.isBonus) || null;
-    const nextWeeklyResetAt = pq.nextWeeklyResetAt || 1793354399828;
+    const lastReset = recentResets[0] || null;
+    const lastBonusReset =
+      recentResets.find(
+        (r) => r.isBonus && now - r.timestamp < 12 * 3600 * 1000 && currSd < 50
+      ) || null;
 
     return {
       ...pq,
-      resets: detectedResets,
+      resets: recentResets,
       lastReset,
-      lastBonusReset,
-      nextWeeklyResetAt
+      lastBonusReset
     };
   }
 
@@ -1004,7 +950,7 @@
     if (resetsListEl) {
       const resets = Array.isArray(clQuota.resets) ? clQuota.resets : [];
       if (resets.length === 0) {
-        resetsListEl.innerHTML = `<div class="muted-xs">Monitoreando caídas de cuota semanal en vivo...</div>`;
+        resetsListEl.innerHTML = `<div class="muted-xs">Sin reseteos en las últimas 24h · Monitoreando si Claude otorga un bonus gratis</div>`;
       } else {
         resetsListEl.innerHTML = resets
           .slice(0, 4)
