@@ -1,0 +1,11 @@
+# Dependencies
+node_modules/
+
+# User local configuration (contains personal ntfyTopic / SSH hosts)
+config.json
+
+# Logs & OS files
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db

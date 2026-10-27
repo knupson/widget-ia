@@ -1,0 +1,11 @@
+{
+  "port": 19876,
+  "soundEnabled": true,
+  "soundTone": "chime",
+  "desktopNotifications": true,
+  "alwaysOnTop": true,
+  "opacity": 0.9,
+  "ntfyEnabled": true,
+  "ntfyTopic": "ai-pulse-tu-topico-secreto",
+  "sshHosts": []
+}

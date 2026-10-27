@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Pulse Widget · Claude & AGY Monitor</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body class="mode-pill">
+  <!-- =========================================================
+       MODO 1: PÍLDORA COMPACTA FLOTANTE (HUD / DYNAMIC ISLAND)
+       ========================================================= -->
+  <div id="pill-view" class="pill-container">
+    <div class="pill-drag-zone" id="pill-click-area" title="Arrastra para mover · Doble clic para expandir panel">
+      <div class="pill-orb-wrap">
+        <span id="pill-orb" class="pill-orb state-idle"></span>
+      </div>
+
+      <div class="pill-counters">
+        <div class="pill-badge badge-waiting" id="pill-waiting-wrap" title="Consolas listas esperando tu respuesta (Clic en 🎯 para saltar)">
+          <span class="dot dot-ready"></span>
+          <span id="pill-waiting-count">0</span>
+          <span class="pill-badge-label">Listas</span>
+        </div>
+
+        <div class="pill-badge badge-approval hidden" id="pill-approval-wrap" title="Consolas pidiendo permiso o confirmación">
+          <span class="dot dot-amber"></span>
+          <span id="pill-approval-count">0</span>
+          <span class="pill-badge-label">Permiso</span>
+        </div>
+
+        <div class="pill-badge badge-running" id="pill-running-wrap" title="Consolas trabajando activamente">
+          <span class="dot dot-orange"></span>
+          <span id="pill-running-count">0</span>
+          <span class="pill-badge-label">Activas</span>
+        </div>
+      </div>
+
+      <div class="pill-divider"></div>
+
+      <!-- Cuotas Duales en Píldora: Identificación clara de CLAUDE y AGY -->
+      <div class="pill-dual-quotas">
+        <div class="pill-q-col" id="pill-claude-box" title="Cuota Oficial Plan Claude (5h / 7d)">
+          <div class="pq-header">
+            <span class="pq-brand brand-cl">🟠 CLAUDE</span>
+            <span id="pill-cl-reset-badge" class="pq-reset-tag hidden" title="¡Claude aplicó un Reseteo Gratis / Bonus!">🎁</span>
+          </div>
+          <div class="pq-bars-stack">
+            <div class="pq-line">
+              <span class="pq-sub">5h</span>
+              <div class="pq-bar"><div id="pill-cl-fh" class="pq-fill fill-orange" style="width: 0%"></div></div>
+              <span id="pill-cl-fh-txt" class="pq-val">--%</span>
+            </div>
+            <div class="pq-line">
+              <span class="pq-sub">7d</span>
+              <div class="pq-bar"><div id="pill-cl-sd" class="pq-fill fill-ochre" style="width: 0%"></div></div>
+              <span id="pill-cl-sd-txt" class="pq-val">--%</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="pill-q-col" id="pill-agy-box" title="Pulso & Cuota Antigravity AGY (5h / 7d)">
+          <div class="pq-header">
+            <span class="pq-brand brand-agy">🟡 AGY</span>
+          </div>
+          <div class="pq-bars-stack">
+            <div class="pq-line">
+              <span class="pq-sub">5h</span>
+              <div class="pq-bar"><div id="pill-agy-fh" class="pq-fill fill-gold" style="width: 0%"></div></div>
+              <span id="pill-agy-fh-txt" class="pq-val">--%</span>
+            </div>
+            <div class="pq-line">
+              <span class="pq-sub">7d</span>
+              <div class="pq-bar"><div id="pill-agy-sd" class="pq-fill fill-amber" style="width: 0%"></div></div>
+              <span id="pill-agy-sd-txt" class="pq-val">--%</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="pill-actions">
+      <button id="pill-btn-jump" class="icon-btn-sm hidden" title="⚡ Saltar directo a la consola que espera tu respuesta">🎯</button>
+      <button id="pill-btn-sound" class="icon-btn-sm" title="Activar/Silenciar sonido de alertas">🔊</button>
+      <button id="pill-btn-expand" class="icon-btn-expand" title="Expandir panel completo">▾</button>
+    </div>
+  </div>
+
+  <!-- =========================================================
+       MODO 2: PANEL EXPANDIDO COMPLETO (DASHBOARD)
+       ========================================================= -->
+  <div id="panel-view" class="panel-container">
+    <!-- Barra Superior -->
+    <header class="panel-header">
+      <div class="header-drag">
+        <span id="header-orb" class="header-orb"></span>
+        <div>
+          <div class="header-title-row">
+            <span class="header-title">AI PULSE</span>
+            <span class="header-chip" id="header-burn-chip" title="Velocidad de consumo combinada y eficiencia de caché">🔥 -- tok/h</span>
+          </div>
+          <div class="header-subtitle">
+            <span id="header-live-status">Claude + AGY + Remotos</span>
+          </div>
+        </div>
+      </div>
+      <div class="header-controls">
+        <button id="btn-jump-ready" class="hdr-btn hdr-btn-magic hidden" title="Enfocar la siguiente consola lista para responder">🎯 Ir a Lista</button>
+        <button id="btn-ack-all" class="hdr-btn hidden" title="Marcar todas las alertas como vistas">✓ Visto</button>
+        <button id="btn-toggle-sound" class="hdr-btn" title="Sonido de alerta">🔊</button>
+        <button id="btn-open-web" class="hdr-btn" title="Abrir en navegador completo">🌐</button>
+        <button id="btn-collapse-pill" class="hdr-btn hdr-btn-pill" title="Reducir a Píldora Flotante (Esc)">— Píldora</button>
+        <button id="btn-hide-tray" class="hdr-btn" title="Minimizar a la bandeja del sistema">✕</button>
+      </div>
+    </header>
+
+    <!-- Resumen Rápido (4 KPIs: Consolas | Cuota Claude | Cuota AGY | Tokens 7d) -->
+    <section class="summary-strip">
+      <!-- KPI 1: Estado de Consolas -->
+      <div class="kpi-card kpi-status" id="kpi-waiting-card" title="Clic para filtrar consolas esperando respuesta">
+        <div class="kpi-top">
+          <span class="kpi-label">Consolas</span>
+          <span class="dot dot-ready"></span>
+        </div>
+        <div class="kpi-dual-nums">
+          <div>
+            <span class="kpi-value" id="kpi-waiting-val">0</span>
+            <span class="kpi-unit">listas</span>
+          </div>
+          <div class="kpi-running-mini">
+            <span id="kpi-running-val">0</span>
+            <span>activas</span>
+          </div>
+        </div>
+        <div class="kpi-sub" id="kpi-approval-sub">0 abiertas ahora</div>
+      </div>
+
+      <!-- KPI 2: Cuota Plan Claude -->
+      <div class="kpi-card kpi-claude" id="kpi-claude-card" title="Cuota oficial de tu Plan Claude (5h y 7 días)">
+        <div class="kpi-top">
+          <span class="kpi-label">Cuota Claude</span>
+          <span class="kpi-tag tag-cl">PLAN</span>
+        </div>
+        <div class="kpi-quota-row">
+          <span>5h <strong id="kpi-fh-val">--%</strong></span>
+          <span>7d <strong id="kpi-sd-val">--%</strong></span>
+        </div>
+        <div class="dual-mini-bars">
+          <div class="dmb-track"><div id="kpi-fh-bar" class="dmb-fill fill-orange" style="width:0%"></div></div>
+          <div class="dmb-track"><div id="kpi-sd-bar" class="dmb-fill fill-ochre" style="width:0%"></div></div>
+        </div>
+        <div class="kpi-sub" id="kpi-claude-sub">Hoy: 0 tok</div>
+      </div>
+
+      <!-- KPI 3: Cuota & Pulso AGY -->
+      <div class="kpi-card kpi-agy" id="kpi-agy-card" title="Uso y cuota de referencia de Antigravity (5h y 7 días)">
+        <div class="kpi-top">
+          <span class="kpi-label">Cuota AGY</span>
+          <span class="kpi-tag tag-agy" id="kpi-agy-model-tag">ARGON</span>
+        </div>
+        <div class="kpi-quota-row">
+          <span>5h <strong id="kpi-agy-fh-val">--%</strong></span>
+          <span>7d <strong id="kpi-agy-sd-val">--%</strong></span>
+        </div>
+        <div class="dual-mini-bars">
+          <div class="dmb-track"><div id="kpi-agy-fh-bar" class="dmb-fill fill-gold" style="width:0%"></div></div>
+          <div class="dmb-track"><div id="kpi-agy-sd-bar" class="dmb-fill fill-amber" style="width:0%"></div></div>
+        </div>
+        <div class="kpi-sub" id="kpi-agy-sub">5h: 0 · 7d: 0</div>
+      </div>
+
+      <!-- KPI 4: Tokens Combinados & Eficiencia -->
+      <div class="kpi-card kpi-tokens">
+        <div class="kpi-top">
+          <span class="kpi-label">Total 7 Días</span>
+          <span class="kpi-tag tag-cache" id="kpi-cache-tag">--% caché</span>
+        </div>
+        <div class="kpi-value kpi-value-sm" id="kpi-week-tokens">0</div>
+        <div class="kpi-sub" id="kpi-today-tokens">Hoy: 0</div>
+      </div>
+    </section>
+
+    <!-- Navegación de Pestañas -->
+    <nav class="tabs-nav">
+      <button class="tab-btn active" data-tab="sessions">
+        Consolas <span id="tab-badge-sessions" class="tab-badge">0</span>
+      </button>
+      <button class="tab-btn" data-tab="tokens">Cuotas y Tokens</button>
+      <button class="tab-btn" data-tab="remotes">
+        Remotos / Hooks <span id="tab-badge-remotes" class="tab-badge hidden">0</span>
+      </button>
+      <button class="tab-btn" data-tab="settings">Ajustes</button>
+    </nav>
+
+    <!-- CONTENIDO DE PESTAÑAS -->
+    <main class="tab-content-area">
+      <!-- PESTAÑA 1: CONSOLAS EN VIVO (FILAS COMPACTAS SIN PREVIEW DE CONVERSACIÓN) -->
+      <section id="tab-sessions" class="tab-pane active">
+        <div class="sessions-toolbar">
+          <div class="filter-bar">
+            <button class="filter-chip active" data-filter="open">Abiertas</button>
+            <button class="filter-chip" data-filter="waiting">Listas</button>
+            <button class="filter-chip" data-filter="claude">Claude</button>
+            <button class="filter-chip" data-filter="agy">AGY</button>
+            <button class="filter-chip" data-filter="remote">Remotas</button>
+            <button class="filter-chip" data-filter="all">24h</button>
+          </div>
+          <div class="search-mini-wrap">
+            <input type="text" id="session-search" class="search-mini-input" placeholder="🔍 Filtrar..." title="Filtrar por proyecto, título o herramienta (Atajo: /)" />
+          </div>
+        </div>
+
+        <div id="sessions-list" class="sessions-list"></div>
+      </section>
+
+      <!-- PESTAÑA 2: TOKENS Y CUOTAS -->
+      <section id="tab-tokens" class="tab-pane">
+        <!-- Tarjeta 1: Cuota Oficial Plan Claude -->
+        <div class="section-card card-accent-orange">
+          <div class="section-header">
+            <div class="sh-left">
+              <span class="provider-pill prov-claude">CLAUDE</span>
+              <h3>Cuota Oficial Plan Claude</h3>
+            </div>
+            <span id="quota-updated-at" class="muted-xs">Sincronizado con Claude App</span>
+          </div>
+          <div class="quota-gauges-grid">
+            <div class="quota-box">
+              <div class="qb-top">
+                <span>Ventana 5 Horas</span>
+                <strong id="tokens-fh-pct" class="qb-pct text-orange">--%</strong>
+              </div>
+              <div class="qb-bar"><div id="tokens-fh-bar" class="qb-fill fill-orange" style="width:0%"></div></div>
+              <div class="qb-foot" id="tokens-cl-fh-foot">Reinicio continuo cada 5h</div>
+            </div>
+            <div class="quota-box">
+              <div class="qb-top">
+                <span>Semanal (7 Días)</span>
+                <strong id="tokens-sd-pct" class="qb-pct text-ochre">--%</strong>
+              </div>
+              <div class="qb-bar"><div id="tokens-sd-bar" class="qb-fill fill-ochre" style="width:0%"></div></div>
+              <div class="qb-foot" id="tokens-sd-warning">Ventana móvil de 7 días</div>
+            </div>
+          </div>
+          <div class="sparkline-wrap">
+            <div class="muted-xs" style="margin-bottom:3px">Curva de uso Plan Claude (5h naranja · 7d ocre):</div>
+            <svg id="quota-sparkline" viewBox="0 0 400 46" preserveAspectRatio="none"></svg>
+          </div>
+
+          <!-- Detector de Reseteos Semanales & Bonus Gratis de Claude -->
+          <div class="claude-reset-panel" id="claude-reset-panel">
+            <div class="crp-header">
+              <div class="crp-title-wrap">
+                <span class="crp-icon">🎁</span>
+                <span class="crp-title">Monitor de Reseteos de Cuota (Gratis & Semanales)</span>
+              </div>
+              <button id="btn-test-reset-alert" class="btn-xs" title="Simular notificación y sonido de reseteo gratis">🔔 Probar aviso</button>
+            </div>
+            <div class="crp-next-row">
+              <span>⏳ Próximo reset oficial: <strong id="claude-next-reset-txt">Calculando...</strong></span>
+              <span id="claude-last-bonus-badge" class="badge-pill badge-ochre">🎁 Bonus detectado</span>
+            </div>
+            <div id="claude-resets-list" class="crp-list"></div>
+          </div>
+        </div>
+
+        <!-- Tarjeta 2: Cuota y Telemetría Antigravity (AGY) -->
+        <div class="section-card card-accent-ochre">
+          <div class="section-header">
+            <div class="sh-left">
+              <span class="provider-pill prov-agy">AGY</span>
+              <h3>Cuota & Telemetría Antigravity</h3>
+            </div>
+            <span id="agy-meta-badge" class="badge-pill badge-ochre">Gemini 4 Argon</span>
+          </div>
+          <div class="quota-gauges-grid">
+            <div class="quota-box">
+              <div class="qb-top">
+                <span>Ventana 5 Horas</span>
+                <strong id="agy-fh-pct" class="qb-pct text-gold">--%</strong>
+              </div>
+              <div class="qb-bar"><div id="agy-fh-bar" class="qb-fill fill-gold" style="width:0%"></div></div>
+              <div class="qb-foot" id="agy-fh-detail">0 tok · 0 turnos (últ. 5h)</div>
+            </div>
+            <div class="quota-box">
+              <div class="qb-top">
+                <span>Semanal (7 Días)</span>
+                <strong id="agy-sd-pct" class="qb-pct text-amber">--%</strong>
+              </div>
+              <div class="qb-bar"><div id="agy-sd-bar" class="qb-fill fill-amber" style="width:0%"></div></div>
+              <div class="qb-foot" id="agy-sd-detail">0 tok · 0 turnos (últ. 7d)</div>
+            </div>
+          </div>
+          <div class="agy-telemetry-strip" id="agy-telemetry-strip">
+            <span>Proyecto GCP: <strong id="agy-gcp-proj">--</strong></span>
+            <span>Ritmo: <strong id="agy-burn-rate">-- tok/h</strong></span>
+            <span>Caché Hit: <strong id="agy-cache-hit">--%</strong></span>
+          </div>
+          <div class="sparkline-wrap">
+            <div class="muted-xs" style="margin-bottom:3px">Curva de carga AGY últimas 24h (5h oro · 7d ámbar):</div>
+            <svg id="agy-sparkline" viewBox="0 0 400 46" preserveAspectRatio="none"></svg>
+          </div>
+        </div>
+
+        <!-- Comparativa Hoy vs Semanal (Claude vs AGY) -->
+        <div class="section-card">
+          <div class="section-header">
+            <h3>Consumo de Tokens: Hoy vs Últimos 7 Días</h3>
+            <span class="muted-xs" title="Tokens Efectivos = Input×1 + CacheRead×0.1 + CacheWrite×2 + Output×5">Pondera caché y output</span>
+          </div>
+          <div id="token-comparison-table" class="token-table-wrap"></div>
+        </div>
+
+        <!-- Gráfico 7 días -->
+        <div class="section-card">
+          <div class="section-header">
+            <h3>Actividad Diaria (7 Días)</h3>
+            <div class="legend-inline">
+              <span><i class="leg-dot leg-claude"></i>Claude</span>
+              <span><i class="leg-dot leg-agy"></i>AGY</span>
+            </div>
+          </div>
+          <div id="weekly-chart" class="weekly-chart"></div>
+        </div>
+
+        <!-- Ranking de Proyectos -->
+        <div class="section-card">
+          <div class="section-header">
+            <h3>Top Proyectos por Consumo</h3>
+          </div>
+          <div id="top-projects-list" class="top-projects-list"></div>
+        </div>
+      </section>
+
+      <!-- PESTAÑA 3: CLIS REMOTOS Y HOOKS -->
+      <section id="tab-remotes" class="tab-pane">
+        <!-- Hooks Locales -->
+        <div class="section-card">
+          <div class="section-header">
+            <h3>⚡ Hooks Instantáneos Locales</h3>
+            <span class="badge-pill badge-ok">Opcional · &lt;50ms</span>
+          </div>
+          <p class="card-desc">
+            El widget ya monitorea tus archivos y bases de datos automáticamente. Si activás los hooks, Claude y AGY enviarán además un pulso inmediato al milisegundo en que pidan permiso o terminen.
+          </p>
+          <div class="toggle-list">
+            <div class="toggle-row">
+              <div>
+                <div class="toggle-title">Hook en Claude Code (`~/.claude/settings.json`)</div>
+                <div class="muted-xs">Preserva tu `write-guard.mjs` actual sin modificarlo</div>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="chk-hook-claude" />
+                <span class="slider"></span>
+              </label>
+            </div>
+            <div class="toggle-row">
+              <div>
+                <div class="toggle-title">Hook en Antigravity (`~/.gemini/config/hooks.json`)</div>
+                <div class="muted-xs">Notifica eventos `Stop` inmediatamente</div>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="chk-hook-agy" />
+                <span class="slider"></span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <!-- Modo 1: Relay en la Nube sin SSH -->
+        <div class="section-card">
+          <div class="section-header">
+            <h3>🌐 Modo 1: CLIs Remotos SIN SSH (Cloud Relay)</h3>
+            <span id="ntfy-status-badge" class="badge-pill">Conectando...</span>
+          </div>
+          <p class="card-desc">
+            Ideal cuando estás en servidores corporativos, contenedores, VMs o RDP donde <strong>no tenés SSH entrante ni puertos abiertos</strong>. Usa el canal encriptado HTTPS de `ntfy.sh`.
+          </p>
+
+          <div class="input-group-row">
+            <input type="text" id="input-ntfy-topic" class="text-input" placeholder="Canal secreto ntfy" />
+            <button id="btn-save-topic" class="btn-secondary">Guardar</button>
+            <button id="btn-test-remote" class="btn-primary">Probar Alerta</button>
+          </div>
+
+          <div class="snippet-block">
+            <div class="snippet-head">
+              <span><strong>Linux / macOS / WSL / Docker</strong> (Monitor en 2do plano):</span>
+              <button class="btn-copy" data-copy-target="snippet-bash">📋 Copiar Comando</button>
+            </div>
+            <pre id="snippet-bash" class="code-box"></pre>
+          </div>
+
+          <div class="snippet-block">
+            <div class="snippet-head">
+              <span><strong>Windows Remoto / RDP</strong> (PowerShell en 2do plano):</span>
+              <button class="btn-copy" data-copy-target="snippet-ps">📋 Copiar PowerShell</button>
+            </div>
+            <pre id="snippet-ps" class="code-box"></pre>
+          </div>
+
+          <div class="snippet-block">
+            <div class="snippet-head">
+              <span><strong>Hook para `~/.claude/settings.json` remoto</strong>:</span>
+              <button class="btn-copy" data-copy-target="snippet-hook">📋 Copiar JSON</button>
+            </div>
+            <pre id="snippet-hook" class="code-box"></pre>
+          </div>
+        </div>
+
+        <!-- Modo 2: Sondeo por SSH -->
+        <div class="section-card">
+          <div class="section-header">
+            <h3>🔑 Modo 2: Monitoreo por SSH Directo</h3>
+            <span class="muted-xs">Para servidores con acceso SSH por clave</span>
+          </div>
+          <div class="ssh-add-row">
+            <input type="text" id="ssh-label" class="text-input" placeholder="Alias (ej. VPS Prod)" style="flex:1" />
+            <input type="text" id="ssh-target" class="text-input" placeholder="usuario@host" style="flex:1.4" />
+            <input type="number" id="ssh-port" class="text-input" placeholder="22" style="width:64px" />
+            <button id="btn-add-ssh" class="btn-primary">+ Agregar</button>
+          </div>
+          <div id="ssh-hosts-list" class="ssh-hosts-list"></div>
+        </div>
+      </section>
+
+      <!-- PESTAÑA 4: AJUSTES -->
+      <section id="tab-settings" class="tab-pane">
+        <div class="section-card">
+          <h3>Preferencias de Alertas y Sonido</h3>
+          <div class="toggle-list">
+            <div class="toggle-row">
+              <div>
+                <div class="toggle-title">Sonido al terminar una consola o pedir permiso</div>
+                <div class="muted-xs">Avisa cuando una sesión pasa de trabajando a lista para tu respuesta</div>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="cfg-sound-enabled" />
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="toggle-row">
+              <div>
+                <div class="toggle-title">Tono de Alerta</div>
+              </div>
+              <div style="display:flex; gap:6px; align-items:center">
+                <select id="cfg-sound-tone" class="select-input">
+                  <option value="chime">Acorde Cristal</option>
+                  <option value="bell">Campana Bronce</option>
+                  <option value="radar">Pulso Radar</option>
+                  <option value="double">Doble Beep</option>
+                </select>
+                <button id="btn-test-sound" class="btn-secondary">🔔 Probar</button>
+              </div>
+            </div>
+
+            <div class="toggle-row">
+              <div>
+                <div class="toggle-title">Notificaciones Nativas de Windows</div>
+                <div class="muted-xs">Muestra un banner de Windows con clic directo a la consola</div>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="cfg-desktop-notif" />
+                <span class="slider"></span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <div class="section-card">
+          <h3>Calibración de Cuota AGY (Referencia)</h3>
+          <p class="card-desc">
+            Ajustá el presupuesto de referencia (en millones de tokens efectivos ponderados) para las barras de porcentaje 5h y 7d de Antigravity.
+          </p>
+          <div class="input-group-row">
+            <label class="muted-xs" style="flex:1">Límite 5h (M tok efect.):
+              <input type="number" id="cfg-agy-5h" class="text-input" min="1" max="500" value="25" style="margin-top:3px; width:100%" />
+            </label>
+            <label class="muted-xs" style="flex:1">Límite 7d (M tok efect.):
+              <input type="number" id="cfg-agy-7d" class="text-input" min="5" max="2000" value="100" style="margin-top:3px; width:100%" />
+            </label>
+            <button id="btn-save-agy-limits" class="btn-primary" style="margin-top:15px">Guardar</button>
+          </div>
+        </div>
+
+        <div class="section-card">
+          <h3>Ventana y Apariencia</h3>
+          <div class="toggle-list">
+            <div class="toggle-row">
+              <div>
+                <div class="toggle-title">Siempre Visible (Always on Top)</div>
+                <div class="muted-xs">Mantiene la píldora flotante por encima de tus ventanas</div>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="cfg-always-top" />
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="toggle-row">
+              <div>
+                <div class="toggle-title">Opacidad del Widget (<span id="lbl-opacity">96%</span>)</div>
+              </div>
+              <input type="range" id="cfg-opacity" min="0.5" max="1" step="0.02" value="0.96" />
+            </div>
+          </div>
+        </div>
+
+        <div class="section-card">
+          <h3>Historial de Alertas Recientes</h3>
+          <div id="recent-alerts-list" class="recent-alerts-list"></div>
+        </div>
+
+        <div style="display:flex; justify-content:space-between; padding: 6px 4px;">
+          <span class="muted-xs">Puerto Local API/Web: <strong id="lbl-local-port">19876</strong></span>
+          <button id="btn-quit-app" class="btn-danger-sm">Cerrar Aplicación</button>
+        </div>
+      </section>
+    </main>
+
+    <!-- Toast interno de confirmación -->
+    <div id="toast" class="toast hidden">Copiado al portapapeles</div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,25 @@
+{
+  "name": "ai-pulse-widget",
+  "version": "1.0.0",
+  "description": "Widget flotante Always-on-Top y monitor en tiempo real para Claude (CLI/App), Google Antigravity (AGY CLI/App) y CLIs remotos",
+  "main": "main.js",
+  "scripts": {
+    "start": "node start-electron.js",
+    "electron": "electron .",
+    "web": "node src/server.js",
+    "build:launcher": "node scripts/build-launcher.js"
+  },
+  "keywords": [
+    "claude-code",
+    "antigravity",
+    "agy",
+    "ai-widget",
+    "token-monitor",
+    "hud"
+  ],
+  "author": "knupson",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^35.0.0"
+  }
+}
