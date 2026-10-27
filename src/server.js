@@ -601,7 +601,8 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
         'ntfyTopic',
         'agyFiveHourLimitM',
         'agySevenDayLimitM',
-        'sshHosts'
+        'sshHosts',
+        'windowPosition'
       ];
       for (const k of allowedKeys) {
         if (Object.prototype.hasOwnProperty.call(body, k)) {
@@ -736,7 +737,14 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
     start,
     stop,
     getSnapshot: () => latestSnapshot || refreshSnapshot(),
-    getConfig: () => config
+    getConfig: () => config,
+    updateConfig: (partial) => {
+      if (partial && typeof partial === 'object') {
+        Object.assign(config, partial);
+        saveConfig(config);
+      }
+      return config;
+    }
   };
 }
 

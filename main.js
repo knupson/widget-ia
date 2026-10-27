@@ -20,12 +20,34 @@ let tray = null;
 let widgetServer = null;
 let currentMode = 'pill'; // Arranca como píldora compacta flotante
 let pillPosition = null; // { x, y }
+let isProgrammaticMove = false;
+let savePosTimer = null;
 
 const WIDGET_WIDTH = 516;
 const PILL_WIDTH = WIDGET_WIDTH;
 const PILL_HEIGHT = 54;
 const EXPANDED_WIDTH = WIDGET_WIDTH;
 const EXPANDED_HEIGHT = 640;
+
+function persistWindowPosition(immediate = false) {
+  if (!widgetServer || !pillPosition) return;
+  if (savePosTimer) {
+    clearTimeout(savePosTimer);
+    savePosTimer = null;
+  }
+  const writeNow = () => {
+    if (widgetServer && pillPosition) {
+      widgetServer.updateConfig({
+        windowPosition: { x: Math.round(pillPosition.x), y: Math.round(pillPosition.y) }
+      });
+    }
+  };
+  if (immediate) {
+    writeNow();
+  } else {
+    savePosTimer = setTimeout(writeNow, 250);
+  }
+}
 
 function enforceAlwaysOnTop() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -85,9 +107,11 @@ function setWindowMode(mode) {
   if (currentMode === 'pill' && mode === 'expanded') {
     const b = mainWindow.getBounds();
     pillPosition = { x: b.x, y: b.y };
+    persistWindowPosition(true);
   }
 
   currentMode = mode;
+  isProgrammaticMove = true;
 
   if (mode === 'pill') {
     const targetX = pillPosition
@@ -127,6 +151,10 @@ function setWindowMode(mode) {
       height: EXPANDED_HEIGHT
     });
   }
+
+  setTimeout(() => {
+    isProgrammaticMove = false;
+  }, 80);
 
   mainWindow.setSkipTaskbar(true);
   enforceAlwaysOnTop();
@@ -274,11 +302,13 @@ async function initApp() {
       } else if (body.action === 'hide') {
         mainWindow.hide();
       } else if (body.action === 'quit') {
+        persistWindowPosition(true);
         app.isQuitting = true;
         app.quit();
       } else if (body.action === 'reload') {
         mainWindow.webContents.reloadIgnoringCache();
       } else if (body.action === 'relaunch') {
+        persistWindowPosition(true);
         app.isQuitting = true;
         app.relaunch();
         app.exit(0);
@@ -290,9 +320,27 @@ async function initApp() {
   const { port, config } = await widgetServer.start();
 
   const primaryDisplay = screen.getPrimaryDisplay();
-  const workArea = primaryDisplay.workArea;
-  const startX = workArea.x + workArea.width - PILL_WIDTH - 20;
-  const startY = workArea.y + 16;
+  const defaultWorkArea = primaryDisplay.workArea;
+  let startX = defaultWorkArea.x + defaultWorkArea.width - PILL_WIDTH - 20;
+  let startY = defaultWorkArea.y + 16;
+
+  if (
+    config.windowPosition &&
+    typeof config.windowPosition.x === 'number' &&
+    typeof config.windowPosition.y === 'number'
+  ) {
+    const savedX = Math.round(config.windowPosition.x);
+    const savedY = Math.round(config.windowPosition.y);
+    const targetDisplay = screen.getDisplayMatching({
+      x: savedX,
+      y: savedY,
+      width: PILL_WIDTH,
+      height: PILL_HEIGHT
+    });
+    const wa = (targetDisplay && targetDisplay.workArea) || defaultWorkArea;
+    startX = Math.max(wa.x, Math.min(savedX, wa.x + wa.width - PILL_WIDTH));
+    startY = Math.max(wa.y, Math.min(savedY, wa.y + wa.height - PILL_HEIGHT));
+  }
   pillPosition = { x: startX, y: startY };
 
   const customIconPath = path.join(__dirname, 'assets', 'icon.ico');
@@ -363,14 +411,19 @@ async function initApp() {
   });
 
   mainWindow.on('moved', () => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
+    if (mainWindow && !mainWindow.isDestroyed() && !isProgrammaticMove) {
       const b = mainWindow.getBounds();
-      if (currentMode === 'pill') {
-        pillPosition = { x: b.x, y: b.y };
-      } else if (pillPosition) {
-        pillPosition.x = b.x;
-      }
+      pillPosition = { x: b.x, y: b.y };
+      persistWindowPosition(false);
     }
+  });
+
+  mainWindow.on('close', () => {
+    if (mainWindow && !mainWindow.isDestroyed() && currentMode === 'pill') {
+      const b = mainWindow.getBounds();
+      pillPosition = { x: b.x, y: b.y };
+    }
+    persistWindowPosition(true);
   });
 
   mainWindow.loadURL(`http://127.0.0.1:${port}/`);
@@ -430,6 +483,7 @@ async function initApp() {
 app.whenReady().then(initApp);
 
 app.on('before-quit', () => {
+  persistWindowPosition(true);
   if (widgetServer) widgetServer.stop();
 });
 
