@@ -390,34 +390,67 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
     });
   }
 
-  function sendJson(res, statusCode, obj) {
+  function isAllowedLocalOrigin(originHeader) {
+    if (!originHeader) return true; // Peticiones directas de proceso local / CLI sin header Origin
+    try {
+      const u = new URL(originHeader);
+      return (
+        (u.protocol === 'http:' || u.protocol === 'https:') &&
+        (u.hostname === '127.0.0.1' || u.hostname === 'localhost')
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  function isAllowedHostHeader(hostHeader) {
+    if (!hostHeader) return true;
+    const hostname = String(hostHeader).split(':')[0].trim().toLowerCase();
+    return hostname === '127.0.0.1' || hostname === 'localhost';
+  }
+
+  function getCorsHeaders(req) {
+    const origin = req.headers.origin;
+    const headers = {
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type'
+    };
+    if (origin && isAllowedLocalOrigin(origin)) {
+      headers['Access-Control-Allow-Origin'] = origin;
+      headers['Vary'] = 'Origin';
+    }
+    return headers;
+  }
+
+  function sendJson(res, statusCode, obj, req = { headers: {} }) {
     const payload = JSON.stringify(obj);
     res.writeHead(statusCode, {
       'Content-Type': 'application/json; charset=utf-8',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type'
+      ...getCorsHeaders(req)
     });
     res.end(payload);
   }
 
   const server = http.createServer(async (req, res) => {
+    // Protección contra DNS Rebinding y Cross-Origin CSRF desde sitios web externos
+    if (!isAllowedHostHeader(req.headers.host) || !isAllowedLocalOrigin(req.headers.origin)) {
+      res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: false, error: 'Forbidden origin or host' }));
+      return;
+    }
+
     if (req.method === 'OPTIONS') {
-      res.writeHead(204, {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type'
-      });
+      res.writeHead(204, getCorsHeaders(req));
       res.end();
       return;
     }
 
-    const urlObj = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    const urlObj = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`);
     const pathname = urlObj.pathname;
 
     if (req.method === 'GET' && pathname === '/api/state') {
       if (!latestSnapshot) refreshSnapshot();
-      sendJson(res, 200, latestSnapshot);
+      sendJson(res, 200, latestSnapshot, req);
       return;
     }
 
@@ -426,7 +459,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
         'Content-Type': 'text/event-stream; charset=utf-8',
         'Cache-Control': 'no-cache, no-transform',
         Connection: 'keep-alive',
-        'Access-Control-Allow-Origin': '*'
+        ...getCorsHeaders(req)
       });
       res.write(`event: state\ndata: ${JSON.stringify(latestSnapshot || refreshSnapshot())}\n\n`);
       sseClients.add(res);
@@ -558,7 +591,23 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
       const prevTopic = config.ntfyTopic;
       const prevNtfyEnabled = config.ntfyEnabled;
 
-      Object.assign(config, body);
+      const allowedKeys = [
+        'soundEnabled',
+        'soundTone',
+        'desktopNotifications',
+        'alwaysOnTop',
+        'opacity',
+        'ntfyEnabled',
+        'ntfyTopic',
+        'agyFiveHourLimitM',
+        'agySevenDayLimitM',
+        'sshHosts'
+      ];
+      for (const k of allowedKeys) {
+        if (Object.prototype.hasOwnProperty.call(body, k)) {
+          config[k] = body[k];
+        }
+      }
       saveConfig(config);
 
       if (config.ntfyTopic !== prevTopic || config.ntfyEnabled !== prevNtfyEnabled) {
@@ -572,7 +621,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
       }
 
       refreshSnapshot();
-      sendJson(res, 200, { ok: true, config });
+      sendJson(res, 200, { ok: true, config }, req);
       return;
     }
 
@@ -582,12 +631,12 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
       if (typeof onWindowControl === 'function') {
         result = (await onWindowControl(body)) || { ok: true };
       }
-      sendJson(res, 200, result);
+      sendJson(res, 200, result, req);
       return;
     }
 
     if (req.method === 'POST' && pathname === '/api/admin/handover') {
-      sendJson(res, 200, { ok: true, standalone: require.main === module });
+      sendJson(res, 200, { ok: true, standalone: require.main === module }, req);
       if (require.main === module) {
         setTimeout(() => {
           stop();
@@ -597,9 +646,11 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
       return;
     }
 
-    // Servir archivos estáticos del frontend
-    let filePath = pathname === '/' ? path.join(PUBLIC_DIR, 'index.html') : path.join(PUBLIC_DIR, pathname);
-    if (!filePath.startsWith(PUBLIC_DIR)) {
+    // Servir archivos estáticos del frontend con protección de Path Traversal
+    const safeRelPath = pathname === '/' ? 'index.html' : pathname.replace(/^[/\\]+/, '');
+    const filePath = path.resolve(PUBLIC_DIR, safeRelPath);
+    const publicRootWithSep = PUBLIC_DIR.endsWith(path.sep) ? PUBLIC_DIR : PUBLIC_DIR + path.sep;
+    if (filePath !== PUBLIC_DIR && !filePath.startsWith(publicRootWithSep)) {
       res.writeHead(403);
       res.end('Forbidden');
       return;
@@ -623,6 +674,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
   });
 
   let pollTimer = null;
+  const bindHost = config.bindHost || '127.0.0.1';
 
   function start() {
     return new Promise((resolve, reject) => {
@@ -648,7 +700,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
             () => {
               setTimeout(() => {
                 try {
-                  server.listen(config.port, '0.0.0.0', () => {
+                  server.listen(config.port, bindHost, () => {
                     resolve({ port: config.port, alreadyRunning: false, config });
                   });
                 } catch {
@@ -666,7 +718,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
         }
       });
 
-      server.listen(config.port, '0.0.0.0', () => {
+      server.listen(config.port, bindHost, () => {
         resolve({ port: config.port, alreadyRunning: false, config });
       });
     });

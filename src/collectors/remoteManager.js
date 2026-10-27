@@ -1,5 +1,6 @@
 const https = require('https');
 const os = require('os');
+const path = require('path');
 const { execFile } = require('child_process');
 
 class RemoteManager {
@@ -243,15 +244,25 @@ class RemoteManager {
   }
 
   pollSingleSshHost(hostCfg) {
-    const target = String(hostCfg.target).trim(); // ej. user@192.168.1.50
-    const portArg = hostCfg.port ? ['-p', String(hostCfg.port)] : [];
+    const target = String(hostCfg.target || '').trim(); // ej. user@192.168.1.50
+    // Prevenir inyección de opciones en OpenSSH (ej. targets que inicien con '-')
+    if (!target || target.startsWith('-') || !/^[a-zA-Z0-9._-]+(@[a-zA-Z0-9._-]+)?$/.test(target)) {
+      hostCfg.lastStatus = 'error';
+      hostCfg.lastError = 'Formato de host/usuario SSH inválido';
+      return;
+    }
+
+    const portNum = Number(hostCfg.port);
+    const portArg = Number.isInteger(portNum) && portNum > 0 && portNum <= 65535 ? ['-p', String(portNum)] : [];
     const keyArg = [];
     if (hostCfg.keyPath && String(hostCfg.keyPath).trim()) {
       let kp = String(hostCfg.keyPath).trim().replace(/^["']|["']$/g, '');
       if (kp.startsWith('~/') || kp.startsWith('~\\')) {
         kp = path.join(os.homedir(), kp.slice(2));
       }
-      keyArg.push('-i', kp);
+      if (!kp.startsWith('-')) {
+        keyArg.push('-i', kp);
+      }
     }
     // Script bash compacto de solo lectura que inspecciona ~/.claude/sessions/*.json en el host remoto
     const remoteCmd = `
@@ -271,6 +282,7 @@ class RemoteManager {
       '-o', 'StrictHostKeyChecking=accept-new',
       ...portArg,
       ...keyArg,
+      '--',
       target,
       remoteCmd
     ];

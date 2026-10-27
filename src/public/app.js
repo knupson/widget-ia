@@ -421,7 +421,7 @@
       burnRatePerHour: Math.round(fhTotal / 5),
       cacheHitPct,
       model: 'Gemini 4 Argon (High)',
-      gcpProject: 'GCP-Workspace',
+      gcpProject: 'GCP Workspace',
       history
     };
   }

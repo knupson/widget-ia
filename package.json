@@ -19,6 +19,14 @@
   ],
   "author": "knupson",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/knupson/widget-ia.git"
+  },
+  "homepage": "https://github.com/knupson/widget-ia#readme",
+  "bugs": {
+    "url": "https://github.com/knupson/widget-ia/issues"
+  },
   "devDependencies": {
     "electron": "^35.0.0"
   }

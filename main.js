@@ -403,8 +403,12 @@ async function initApp() {
   });
 
   ipcMain.handle('widget:openExternal', (_e, url) => {
-    shell.openExternal(url);
-    return true;
+    const raw = String(url || '').trim();
+    if (/^https?:\/\//i.test(raw)) {
+      shell.openExternal(raw);
+      return true;
+    }
+    return false;
   });
 
   ipcMain.handle('widget:copyText', (_e, text) => {

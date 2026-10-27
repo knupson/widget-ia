@@ -1,80 +1,97 @@
-# ⚡ AI Pulse Widget · HUD & Monitor para Claude y Google Antigravity (AGY)
+# ⚡ AI Pulse Widget — Claude & Google Antigravity (AGY) HUD
 
-Widget de escritorio nativo para Windows (**Electron + Node.js + .NET Win32 Launcher**) con estética **Obsidian, Molten Orange & Ochre**, diseñado para monitorear en tiempo real todas tus sesiones locales y remotas de **Claude (CLI & Desktop App)** y **Google Antigravity (`AGY` CLI & IDE)**.
+![License: MIT](https://img.shields.io/badge/License-MIT-e09f3e.svg)
+![Platform: Windows](https://img.shields.io/badge/Platform-Windows%2010%2F11-f59e0b.svg)
+![Electron](https://img.shields.io/badge/Electron-35+-14100c.svg)
+![Security: Local-First](https://img.shields.io/badge/Security-127.0.0.1%20Loopback-10b981.svg)
 
----
-
-## 🚀 Cómo iniciarlo
-
-1. **Ejecutable Nativo con Splash HUD (sin consola ni `.bat`)**:
-   - Haz doble clic en **`AI Pulse Widget.exe`** (o desde el acceso directo creado en tu **Escritorio** y **Menú Inicio**).
-   - Si deseas recompilar el ejecutable nativo `.exe`, su ícono `.ico` y actualizar los accesos directos:
-     ```powershell
-     npm run build:launcher
-     ```
-2. **Desde terminal (modo desarrollo)**:
-   ```powershell
-   npm start
-   ```
-3. **Solo servidor/dashboard web local**:
-   ```powershell
-   npm run web
-   # Abre http://127.0.0.1:19876/?mode=web
-   ```
+**AI Pulse Widget** es un HUD flotante *Always-on-Top* y centro de telemetría en tiempo real para Windows, diseñado con estética **Obsidian, Ochre & Amber** para desarrolladores que trabajan en simultáneo con **Claude (Code CLI & Desktop App)**, **Google Antigravity (`AGY` CLI & IDE)** y agentes en **servidores remotos (SSH / Webhooks / ntfy.sh)**.
 
 ---
 
-## ✨ Funcionalidades Principales
+## ✨ Características Principales
 
-### 1. Píldora HUD Always-on-Top + Panel Expandible + System Tray
-- **Modo Píldora Compacta (`445×52`)**:
-  - Contadores en vivo con micro-animaciones:
-    - 🟢 **Listas (Esperando tu respuesta)**
-    - 🟠 **Pidiendo Permiso / Confirmación de herramienta**
-    - 🟡 **Trabajando activamente**
-  - **Doble bloque de cuotas identificadas**:
-    - **`🟠 CLAUDE`** (`5h` y `7d` oficiales de tu plan + insignia `🎁` cuando recibes un reseteo gratis).
-    - **`🟡 AGY`** (`5h` y `7d` estimados sobre tus turnos y consumo local).
-- **Modo Panel Expandido (`455×595`)**:
-  - Filas ultra-compactas de una sola línea por sesión (`Proveedor` · `Proyecto` · `Estado` · `Modelo` · `Tokens` · `Tiempo` · `🎯 Ir a pestaña`).
-- **System Tray Dinámico**:
-  - Icono en la bandeja del sistema con menú rápido y cambio de estado.
+### 💊 1. Doble Modo con Ancho Unificado (`516px`) y Always-on-Top Real
+- **Modo Píldora Compacta (`516 × 52 px`)**:
+  - Se acopla discretamente en la esquina superior derecha de tu pantalla.
+  - Muestra en vivo el estado de actividad global, alertas pendientes y dos bloques dedicados con separación visual clara:
+    - **CLAUDE**: Porcentaje de cuota de sesión (`5h`) y semanal (`7d`), indicador de regalo/reseteo de cuota semanal vigente (`🎁`) y tokens efectivos del día.
+    - **AGY**: Porcentaje de cuota de ventana de `5h` y semanal (`7d`) más tokens efectivos del día.
+  - **Botón Diana (`🎯`)**: Enfoca con un clic la ventana exacta que requiere tu atención (diferenciando consolas de Windows Terminal / PowerShell mediante coincidencia del árbol de procesos padre-hijo y título de pestaña) **sin perder jamás el nivel `screen-saver` Always-on-Top** sobre Chrome u otras aplicaciones.
+- **Modo Panel Expandido (`516 × 670 px`)**:
+  - Se despliega conservando exactamente el mismo ancho (`516px`) que la píldora contraída.
+  - **Sin icono en la barra de tareas** (`skipTaskbar: true`), operando limpiamente desde el área de notificaciones (System Tray) con menú contextual completo.
 
-### 2. 🎁 Detector de Reseteos Semanales y Bonus Gratis de Claude
-- Analiza automáticamente el historial de telemetría de cuota en `%APPDATA%\Claude\plan-usage-history.json` y los metadatos de `~/.claude.json` (`cachedUsageUtilization.utilization.seven_day.resets_at`).
-- Distingue entre:
-  - **🔄 Reseteo Semanal Programado**: caída de cuota en el corte habitual de tu ciclo de 7 días.
-  - **🎁 Reseteo Gratis / Bonus de Anthropic**: caída abrupta de consumo semanal (`sd`) fuera del horario de corte semanal (por ejemplo, de `97% → 7%` un martes).
-- Dispara una **fanfarria sonora especial**, **notificación nativa de Windows** y muestra el historial detallado y cuenta regresiva en la pestaña **Cuotas & Tokens**.
+### 🧠 2. Detección en Tiempo Real (Claude CLI + Claude Desktop App + AGY)
+- **Claude Desktop App (Windows)**:
+  - Decodifica en tiempo real los bloques comprimidos con Snappy y los registros en vivo `antalytics_queue_v1` de LevelDB (`%APPDATA%\Claude\Local Storage\leveldb`) junto con `%APPDATA%\Claude\logs\main.log`.
+  - Detecta al instante cuando Claude Desktop está **pensando / generando respuesta (`⚡ Activa`)** y cuando acaba de responder y queda **esperando tu respuesta (`💬 Lista`)**, evitando falsos positivos de conversaciones inactivas.
+- **Claude Code CLI & Google Antigravity (`AGY`)**:
+  - Monitoreo híbrido por inspección de transcripts JSONL, sesiones activas por PID y **Hooks instantáneos** (`Stop`, `Notification`, `PreToolUse`).
 
-### 3. 🎯 "Ir a Consola" con Cambio Exacto de Pestaña en Windows Terminal
-- Cuando tienes múltiples sesiones de `claude.exe` y varias instancias de `agy.exe` corriendo dentro de distintas pestañas de una misma ventana de **Windows Terminal (`WindowsTerminal.exe`)**:
-  - Identifica el PID exacto de cada sesión (incluyendo desambiguación de múltiples instancias de `agy.exe` mediante la API nativa Win32 **Restart Manager `rstrtmgr.dll`** sobre el archivo `.lock` de cada conversación).
-  - Rastréa el shell padre (`pwsh.exe` / `powershell.exe` / `cmd.exe`) dentro del árbol de procesos de `WindowsTerminal.exe`, calcula el índice exacto de pestaña y cambia automáticamente a esa pestaña mediante `wt.exe -w 0 focus-tab -t <tabIndex>` + **UIAutomation (`SelectionItemPattern`)**.
+### 📊 3. Telemetría de Cuotas (`5h` / `7d`), Cuenta Regresiva de Resets y Detección de Bonus (`🎁`)
+- Barras duales de consumo para la ventana rotativa de **5 horas** y el límite **semanal de 7 días**, tanto para **Claude** como para **AGY**.
+- **Cuenta regresiva exacta de reseteo** (`⏱ 3h 42m` / `⏱ 4d 11h`) visible directamente en los encabezados de cuota.
+- **Detector de Regalos / Resets Semanales de Claude (`🎁`)**:
+  - Detecta caídas abruptas en el consumo semanal (`7d`) fuera de la fecha programada de renovación.
+  - Muestra el badge `🎁` **únicamente mientras el beneficio corresponde al ciclo semanal vigente**, ocultando automáticamente reseteos históricos de semanas pasadas.
 
-### 4. Detección Local Zero-Config + Hooks Instantáneos (`<50ms`)
-- **Antigravity (`AGY`)**:
-  - Detecta consolas abiertas verificando bloqueos a nivel OS en `~/.gemini/antigravity-cli/presence/<conversationId>.lock`.
-  - Lee resúmenes desde `~/.gemini/antigravity-cli/conversation_summaries.db` (`node:sqlite`) y estados en vivo desde `~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl`.
-- **Claude (CLI y App)**:
-  - Detecta procesos vivos desde `~/.claude/sessions/<pid>.json`.
-  - Analiza el consumo de tokens de entrada, salida y caché por sesión, proyecto y modelo desde `~/.claude/projects/<project>/<sessionId>.jsonl`.
-- **Hooks Instantáneos**:
-  - Instalación con 1 clic en `~/.claude/settings.json` (preservando hooks previos del usuario) y `~/.gemini/config/hooks.json`.
-
-### 5. Monitoreo de CLIs Remotos (Con y Sin SSH)
-- **Cloud Relay vía `ntfy.sh` (Sin SSH entrante)**:
-  - Recibe eventos en tiempo real desde servidores detrás de NAT, contenedores o VMs con un comando `curl` o `Invoke-RestMethod` de 1 línea.
-- **Sondeo directo por SSH**:
-  - Monitoreo automático sin agentes adicionales consultando `~/.claude/sessions` y `~/.gemini/antigravity-cli/presence` vía clave pública SSH.
+### 🌐 4. Monitoreo de CLIs Remotos (SSH con Llave Privada, `ntfy.sh` y Webhook)
+- **Sondeo SSH con soporte de llave privada (`-i`)**: Configurá servidores remotos (`usuario@ip`, puerto y ruta a tu clave privada como `~/.ssh/id_ed25519` o `C:\Keys\server.pem`) para monitorear sesiones remotas sin instalar agentes adicionales.
+- **Relay `ntfy.sh` sin abrir puertos**: Recibí notificaciones instantáneas cuando un agente remoto en un contenedor o VPS termina su tarea o solicita permisos.
 
 ---
 
-## 🛠️ Estructura del Proyecto
+## 🚀 Instalación y Uso Rápido
 
-- [`main.js`](./main.js) — Proceso principal de Electron, ventana transparente sin bordes, bandeja del sistema y notificaciones nativas.
-- [`src/launcher/Launcher.cs`](./src/launcher/Launcher.cs) & [`scripts/build-launcher.js`](./scripts/build-launcher.js) — Generador de ícono `.ico` multi-resolución y compilador del ejecutable nativo `AI Pulse Widget.exe` con splash HUD.
-- [`src/collectors/claudeCollector.js`](./src/collectors/claudeCollector.js) — Colector de sesiones, tokens, cuota oficial `5h`/`7d` y detector de reseteos semanales/bonus gratis de Claude.
-- [`src/collectors/agyCollector.js`](./src/collectors/agyCollector.js) — Colector de sesiones activas, base SQLite y transcripciones de Google Antigravity (`AGY`).
-- [`src/services/windowFocuser.js`](./src/services/windowFocuser.js) — Motor Win32 + Restart Manager (`rstrtmgr.dll`) + UIAutomation para enfocar ventanas y cambiar a la pestaña exacta de Windows Terminal.
-- [`src/public/`](./src/public/) — Interfaz HUD con tema Obsidian + Molten Orange & Ochre (`index.html`, `styles.css`, `app.js`).
+### Requisitos Previos
+- **Windows 10 / 11** (64-bit)
+- **Node.js 18+**
+
+### 1. Clonar e instalar dependencias
+```powershell
+git clone https://github.com/knupson/widget-ia.git
+cd widget-ia
+npm install
+```
+
+### 2. Iniciar el Widget
+Podés ejecutar el lanzador nativo sin ventana de consola (`AI Pulse Widget.exe`) o mediante npm:
+```powershell
+# Iniciar mediante el ejecutable nativo Win32 (sin ventana CMD/BAT)
+.\AI Pulse Widget.exe
+
+# O desde terminal de desarrollo
+npm start
+```
+
+### 3. Recompilar el ejecutable nativo y crear acceso directo (Opcional)
+```powershell
+npm run build:launcher
+```
+Esto compila `AI Pulse Widget.exe` (subsistema `winexe` con icono personalizado `assets/icon.ico`) y actualiza el acceso directo en tu Escritorio.
+
+---
+
+## 🗂️ Estructura del Proyecto
+
+| Archivo / Directorio | Descripción |
+| :--- | :--- |
+| [`main.js`](main.js) | Proceso principal de Electron: gestión de ventana `516px`, `Always-on-Top` (`screen-saver`), bandeja del sistema (`Tray`) e IPC. |
+| [`preload.js`](preload.js) | Puente seguro (`contextBridge`) entre el proceso principal y la interfaz. |
+| [`src/server.js`](src/server.js) | Servidor local (`127.0.0.1:19876`), stream SSE (`/api/stream`), agregador de cuotas y protección de origen. |
+| [`src/collectors/claudeCollector.js`](src/collectors/claudeCollector.js) | Recolector de Claude Code CLI y decodificador LevelDB/Snappy + `antalytics_queue_v1` de Claude Desktop App. |
+| [`src/collectors/agyCollector.js`](src/collectors/agyCollector.js) | Recolector de sesiones, subagentes, modelos y cuotas de Google Antigravity (`AGY`). |
+| [`src/collectors/remoteManager.js`](src/collectors/remoteManager.js) | Gestor de sesiones remotas por stream `ntfy.sh`, Webhook HTTP y sondeo SSH seguro con soporte `-i`. |
+| [`src/services/windowFocuser.js`](src/services/windowFocuser.js) | Motor Win32 (`user32.dll` + árbol de procesos CIM) para enfocar la consola o ventana exacta de cada sesión. |
+| [`src/services/hooksManager.js`](src/services/hooksManager.js) | Instalador en 1 clic de hooks locales para `~/.claude/settings.json` y `~/.gemini/antigravity-cli/hooks.json`. |
+| [`src/public/`](src/public/) | Interfaz de usuario (HTML5, CSS3 con tema *Obsidian & Ochre*, gráficas SVG y audio WebAudio sintetizado). |
+| [`scripts/build-launcher.js`](scripts/build-launcher.js) | Generador de iconos `.ico` multi-resolución y compilador C# para `AI Pulse Widget.exe`. |
+
+---
+
+## 🔒 Seguridad, Privacidad y Licencia
+
+- **Seguridad ([`SECURITY.md`](SECURITY.md))**: Servidor restringido a `127.0.0.1`, validación de cabeceras `Host`/`Origin` contra DNS Rebinding y CSRF, sanitización de argumentos SSH y aislamiento de Electron (`contextIsolation: true`).
+- **Privacidad ([`PRIVACY.md`](PRIVACY.md))**: Procesamiento 100% local y de solo lectura. Sin telemetría hacia terceros. Tu archivo `config.json` está excluido del control de versiones.
+- **Licencia ([`LICENSE`](LICENSE))**: Distribuido bajo la licencia **MIT**.
