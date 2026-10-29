@@ -2,11 +2,100 @@
 <html lang="es">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#070504" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <title>AI Pulse Widget · Claude & AGY Monitor</title>
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="icon" href="/icon.svg" type="image/svg+xml" />
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body class="mode-pill">
+  <!-- =========================================================
+       MODO 0: VISTA MÍNIMA PARA WIDGET EN PANTALLA DE ANDROID (?mode=widget)
+       ========================================================= -->
+  <div id="android-widget-view" class="aw-container hidden">
+    <div class="aw-top-row">
+      <div class="aw-brand-status" id="aw-open-app-area">
+        <span id="aw-orb" class="pill-orb state-idle"></span>
+        <span class="aw-brand-txt">AI PULSE</span>
+      </div>
+      <div class="aw-counters">
+        <div class="aw-badge aw-badge-ready" id="aw-ready-wrap">
+          <span class="dot dot-ready"></span>
+          <strong id="aw-ready-count">0</strong>
+          <span>Listas</span>
+        </div>
+        <div class="aw-badge aw-badge-approval hidden" id="aw-approval-wrap">
+          <span class="dot dot-amber"></span>
+          <strong id="aw-approval-count">0</strong>
+          <span>Permiso</span>
+        </div>
+        <div class="aw-badge aw-badge-running" id="aw-running-wrap">
+          <span class="dot dot-orange"></span>
+          <strong id="aw-running-count">0</strong>
+          <span>Activas</span>
+        </div>
+      </div>
+      <button id="aw-btn-open-app" class="aw-btn-open" title="Abrir App Completa y Conversaciones">↗ App</button>
+    </div>
+
+    <div class="aw-quotas-row">
+      <div class="aw-q-card">
+        <div class="aw-q-head">
+          <span class="brand-cl">🟠 CLAUDE</span>
+          <span class="aw-q-meta">
+            <span id="aw-cl-timer">--</span>
+            <span id="aw-cl-bonus" class="hidden">🎁</span>
+          </span>
+        </div>
+        <div class="aw-q-bars">
+          <div class="aw-q-line">
+            <span>5h</span>
+            <div class="pq-bar"><div id="aw-cl-fh" class="pq-fill fill-orange" style="width:0%"></div></div>
+            <strong id="aw-cl-fh-txt">--%</strong>
+          </div>
+          <div class="aw-q-line">
+            <span>7d</span>
+            <div class="pq-bar"><div id="aw-cl-sd" class="pq-fill fill-ochre" style="width:0%"></div></div>
+            <strong id="aw-cl-sd-txt">--%</strong>
+          </div>
+        </div>
+      </div>
+
+      <div class="aw-q-card">
+        <div class="aw-q-head">
+          <span class="brand-agy">🟡 AGY</span>
+          <span class="aw-q-meta" id="aw-agy-timer">--</span>
+        </div>
+        <div class="aw-q-bars">
+          <div class="aw-q-line">
+            <span>5h</span>
+            <div class="pq-bar"><div id="aw-agy-fh" class="pq-fill fill-gold" style="width:0%"></div></div>
+            <strong id="aw-agy-fh-txt">--%</strong>
+          </div>
+          <div class="aw-q-line">
+            <span>7d</span>
+            <div class="pq-bar"><div id="aw-agy-sd" class="pq-fill fill-amber" style="width:0%"></div></div>
+            <strong id="aw-agy-sd-txt">--%</strong>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="aw-urgent-strip" id="aw-urgent-strip">
+      <div class="aw-urgent-info" id="aw-urgent-info">
+        <span class="aw-urgent-dot dot dot-ready" id="aw-urgent-dot"></span>
+        <span class="aw-urgent-text" id="aw-urgent-text">Sin consolas pendientes ahora</span>
+      </div>
+      <div class="aw-urgent-actions" id="aw-urgent-actions">
+        <button id="aw-btn-quick-approve" class="aw-btn-approve hidden">✅ Aprobar</button>
+        <button id="aw-btn-quick-chat" class="aw-btn-chat hidden">💬 Ver</button>
+      </div>
+    </div>
+  </div>
   <!-- =========================================================
        MODO 1: PÍLDORA COMPACTA FLOTANTE (HUD / DYNAMIC ISLAND)
        ========================================================= -->
@@ -42,7 +131,7 @@
       <div class="pill-dual-quotas">
         <div class="pill-q-col" id="pill-claude-box" title="Cuota Oficial Plan Claude (5h / 7d)">
           <div class="pq-header">
-            <span class="pq-brand brand-cl">🟠 CLAUDE</span>
+            <span class="pq-brand brand-cl"><i class="pq-dot dot-cl"></i>CLAUDE</span>
             <span class="pq-meta-right">
               <span id="pill-cl-reset-timer" class="pq-reset-timer" title="Tiempo para el próximo reseteo de cuota">--</span>
               <span id="pill-cl-reset-badge" class="pq-reset-tag hidden" title="¡Claude aplicó un Reseteo Gratis / Bonus!">🎁</span>
@@ -64,7 +153,7 @@
 
         <div class="pill-q-col" id="pill-agy-box" title="Pulso & Cuota Antigravity AGY (5h / 7d)">
           <div class="pq-header">
-            <span class="pq-brand brand-agy">🟡 AGY</span>
+            <span class="pq-brand brand-agy"><i class="pq-dot dot-agy"></i>AGY</span>
             <span id="pill-agy-reset-timer" class="pq-reset-timer" title="Próxima liberación de ventana AGY">--</span>
           </div>
           <div class="pq-bars-stack">
@@ -85,6 +174,7 @@
 
     <div class="pill-actions">
       <button id="pill-btn-jump" class="icon-btn-sm hidden" title="⚡ Saltar directo a la consola que espera tu respuesta">🎯</button>
+      <button id="pill-btn-pin" class="icon-btn-sm pin-on" title="Siempre encima (Always on Top: ACTIVO) · Clic para desactivar">📌</button>
       <button id="pill-btn-sound" class="icon-btn-sm" title="Activar/Silenciar sonido de alertas">🔊</button>
       <button id="pill-btn-expand" class="icon-btn-expand" title="Expandir panel completo">▾</button>
     </div>
@@ -109,8 +199,9 @@
         </div>
       </div>
       <div class="header-controls">
-        <button id="btn-jump-ready" class="hdr-btn hdr-btn-magic hidden" title="Enfocar la siguiente consola lista para responder">🎯 Ir a Lista</button>
+        <button id="btn-jump-ready" class="hdr-btn hdr-btn-magic hidden" title="Enfocar la siguiente consola lista para responder">🎯 Lista</button>
         <button id="btn-ack-all" class="hdr-btn hidden" title="Marcar todas las alertas como vistas">✓ Visto</button>
+        <button id="btn-toggle-pin" class="hdr-btn pin-on" title="Siempre encima (Always on Top: ACTIVO) · Clic para desactivar">📌</button>
         <button id="btn-toggle-sound" class="hdr-btn" title="Sonido de alerta">🔊</button>
         <button id="btn-open-web" class="hdr-btn" title="Abrir en navegador completo">🌐</button>
         <button id="btn-collapse-pill" class="hdr-btn hdr-btn-pill" title="Reducir a Píldora Flotante (Esc)">— Píldora</button>
@@ -142,7 +233,7 @@
       <!-- KPI 2: Cuota Plan Claude -->
       <div class="kpi-card kpi-claude" id="kpi-claude-card" title="Cuota oficial de tu Plan Claude (5h y 7 días)">
         <div class="kpi-top">
-          <span class="kpi-label">Cuota Claude</span>
+          <span class="kpi-label">Claude</span>
           <span class="kpi-tag tag-cl">PLAN</span>
         </div>
         <div class="kpi-quota-row">
@@ -159,7 +250,7 @@
       <!-- KPI 3: Cuota & Pulso AGY -->
       <div class="kpi-card kpi-agy" id="kpi-agy-card" title="Uso y cuota de referencia de Antigravity (5h y 7 días)">
         <div class="kpi-top">
-          <span class="kpi-label">Cuota AGY</span>
+          <span class="kpi-label">AGY</span>
           <span class="kpi-tag tag-agy" id="kpi-agy-model-tag">ARGON</span>
         </div>
         <div class="kpi-quota-row">
@@ -176,7 +267,7 @@
       <!-- KPI 4: Tokens Combinados & Eficiencia -->
       <div class="kpi-card kpi-tokens">
         <div class="kpi-top">
-          <span class="kpi-label">Total 7 Días</span>
+          <span class="kpi-label">7 Días</span>
           <span class="kpi-tag tag-cache" id="kpi-cache-tag">--% caché</span>
         </div>
         <div class="kpi-value kpi-value-sm" id="kpi-week-tokens">0</div>
@@ -346,6 +437,84 @@
       <!-- PESTAÑA 3: CLIS REMOTOS Y HOOKS -->
       <section id="tab-remotes" class="tab-pane">
         <!-- Hooks Locales -->
+        <!-- Acceso Celular Android (4G sin VPN / Wi-Fi / Widget + Respuesta Remota) -->
+        <div class="section-card" id="mobile-access-card">
+          <div class="section-header">
+            <h3>📱 Celular Android: Widget + Conversaciones + Responder</h3>
+            <span id="tunnel-status-badge" class="badge-pill">LAN Wi-Fi</span>
+          </div>
+          <p class="card-desc">
+            Accedé desde tu Android por <strong>Wi-Fi</strong> o <strong>4G/5G sin levantar VPN en el celular</strong> (túnel HTTPS saliente Cloudflare). Te permite poner el mini-widget en tu pantalla de inicio, leer las conversaciones en vivo y <strong>aprobar permisos o responder</strong> remotamente.
+          </p>
+
+          <div class="toggle-list" style="margin-bottom:10px">
+            <div class="toggle-row">
+              <div>
+                <div class="toggle-title">🌐 Túnel 4G/5G sin VPN (Cloudflare Quick Tunnel HTTPS)</div>
+                <div class="muted-xs" id="tunnel-status-sub">Permite entrar desde 4G sin instalar VPN en el celular y envía el link a tu canal ntfy</div>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="chk-tunnel-4g" />
+                <span class="slider"></span>
+              </label>
+            </div>
+            <div class="toggle-row">
+              <div>
+                <div class="toggle-title">📲 Enviar alertas Push al celular (`ntfy.sh`)</div>
+                <div class="muted-xs">Notifica en tu Android cuando una sesión local termina o pide permiso (con botón para abrir el chat)</div>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="chk-ntfy-push-local" />
+                <span class="slider"></span>
+              </label>
+            </div>
+          </div>
+
+          <div class="mobile-links-box">
+            <div class="snippet-block" style="margin-top:4px; border:1px solid rgba(255,107,26,0.45); padding:8px; border-radius:8px; background:rgba(255,107,26,0.07)">
+              <div class="snippet-head">
+                <span class="snippet-title"><strong>📦 App + Widget Nativo Android (`AI-Pulse.apk`):</strong></span>
+                <div class="snippet-actions">
+                  <button class="btn-copy" id="btn-qr-apk" type="button">📷 QR Descarga</button>
+                  <a class="btn-copy" id="btn-dl-apk" href="/ai-pulse.apk" download="AI-Pulse.apk" style="text-decoration:none">⬇️ Bajar APK</a>
+                </div>
+              </div>
+              <pre id="mobile-apk-url" class="code-box">Cargando URL del APK...</pre>
+            </div>
+
+            <div class="snippet-block" style="margin-top:6px">
+              <div class="snippet-head">
+                <span class="snippet-title"><strong>1. App Web Directa (PWA + Chat + Responder):</strong></span>
+                <div class="snippet-actions">
+                  <button class="btn-copy" id="btn-qr-app" type="button">📷 Ver QR</button>
+                  <button class="btn-copy" id="btn-copy-mobile-app" type="button">📋 Copiar Link</button>
+                </div>
+              </div>
+              <pre id="mobile-app-url" class="code-box">Cargando URL...</pre>
+            </div>
+
+            <div class="snippet-block">
+              <div class="snippet-head">
+                <span class="snippet-title"><strong>2. Vista Mini-Widget Web (`?mode=widget`):</strong></span>
+                <div class="snippet-actions">
+                  <button class="btn-copy" id="btn-qr-widget" type="button">📷 Ver QR</button>
+                  <button class="btn-copy" id="btn-copy-mobile-widget" type="button">📋 Copiar Link</button>
+                </div>
+              </div>
+              <pre id="mobile-widget-url" class="code-box">Cargando URL...</pre>
+            </div>
+
+            <div id="mobile-qr-container" class="mobile-qr-container hidden">
+              <div class="mobile-qr-header">
+                <span id="mobile-qr-title" class="toggle-title">Escaneá con la cámara de tu Android</span>
+                <button id="btn-close-qr" class="btn-icon-sm" type="button">✕</button>
+              </div>
+              <img id="mobile-qr-img" class="mobile-qr-img" alt="QR Android" />
+              <div class="muted-xs" id="mobile-qr-caption">Incluye tu token de acceso seguro</div>
+            </div>
+          </div>
+        </div>
+
         <div class="section-card">
           <div class="section-header">
             <h3>⚡ Hooks Instantáneos Locales</h3>
@@ -423,9 +592,9 @@
         <div class="section-card">
           <div class="section-header">
             <h3>🔑 Modo 2: Monitoreo por SSH Directo</h3>
-            <span class="muted-xs">Soporta llave privada (`-i`)</span>
+            <span class="muted-xs" id="ssh-form-hint">Soporta llave privada (`-i`) · Clic en ✎ para editar</span>
           </div>
-          <div class="ssh-add-form">
+          <div class="ssh-add-form" id="ssh-add-form">
             <div class="ssh-add-row">
               <input type="text" id="ssh-label" class="text-input" placeholder="Alias (ej. VPS Prod)" style="flex:1" />
               <input type="text" id="ssh-target" class="text-input" placeholder="usuario@host" style="flex:1.4" />
@@ -434,6 +603,7 @@
             <div class="ssh-add-row">
               <input type="text" id="ssh-key" class="text-input" placeholder="🔑 Ruta a llave privada opcional (ej. ~/.ssh/id_ed25519 o C:\llaves\prod.pem)" style="flex:1" />
               <button id="btn-add-ssh" class="btn-primary">+ Agregar Host</button>
+              <button id="btn-cancel-ssh" class="btn-secondary hidden" title="Cancelar edición (Esc)">Cancelar</button>
             </div>
           </div>
           <div id="ssh-hosts-list" class="ssh-hosts-list"></div>
@@ -516,9 +686,31 @@
 
             <div class="toggle-row">
               <div>
-                <div class="toggle-title">Opacidad del Widget (<span id="lbl-opacity">96%</span>)</div>
+                <div class="toggle-title">Modo Juego (Auto-ocultar en Fullscreen)</div>
+                <div class="muted-xs">Oculta el HUD automáticamente cuando un juego cubre este monitor (libera DirectFlip / 165 Hz)</div>
               </div>
-              <input type="range" id="cfg-opacity" min="0.5" max="1" step="0.02" value="0.96" />
+              <label class="switch">
+                <input type="checkbox" id="cfg-auto-hide-fullscreen" />
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="toggle-row">
+              <div>
+                <div class="toggle-title">Iniciar automáticamente con Windows</div>
+                <div class="muted-xs">Arranca AI Pulse al iniciar sesión en tu PC para tener el servidor y widget listos</div>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="cfg-launch-startup" />
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="toggle-row">
+              <div>
+                <div class="toggle-title">Opacidad del Widget (<span id="lbl-opacity">100%</span>)</div>
+              </div>
+              <input type="range" id="cfg-opacity" min="0.5" max="1" step="0.02" value="1" />
             </div>
           </div>
         </div>
@@ -534,10 +726,65 @@
         </div>
       </section>
     </main>
-
-    <!-- Toast interno de confirmación -->
-    <div id="toast" class="toast hidden">Copiado al portapapeles</div>
   </div>
+
+  <!-- MODAL / DRAWER DE CONVERSACIÓN EN VIVO Y RESPUESTA REMOTA -->
+  <div id="chat-modal" class="chat-modal-backdrop hidden">
+    <div class="chat-modal">
+      <div class="chat-modal-header">
+        <div class="chat-modal-title-group">
+          <div class="chat-modal-top-line">
+            <span id="chat-provider-pill" class="provider-pill prov-claude">CLAUDE</span>
+            <span id="chat-project-name" class="chat-project-name">proyecto</span>
+            <span id="chat-state-tag" class="sr-state-tag st-waiting_input">LISTA</span>
+          </div>
+          <div id="chat-session-title" class="chat-session-title">Cargando conversación...</div>
+        </div>
+        <div class="chat-modal-header-actions">
+          <button id="btn-chat-focus-pc" class="btn-icon-sm" title="Enfocar ventana en la PC">↗</button>
+          <button id="btn-chat-refresh" class="btn-icon-sm" title="Recargar mensajes">↻</button>
+          <button id="btn-chat-close" class="btn-icon-sm" title="Cerrar (Esc)">✕</button>
+        </div>
+      </div>
+
+      <!-- Mensajes de la conversación -->
+      <div id="chat-messages-list" class="chat-messages-list">
+        <div class="empty-state">Cargando historial...</div>
+      </div>
+
+      <!-- Barra de Acciones Rápidas (Aprobar permiso / Opciones 1-2-3 / Enter / Esc) -->
+      <div class="chat-quick-bar" id="chat-quick-bar">
+        <button class="btn-quick btn-quick-approve" data-quick="approve" title="Enviar 'y' + Enter">✅ Aprobar (y)</button>
+        <button class="btn-quick btn-quick-enter" data-quick="enter" title="Enviar Enter">↵ Enter</button>
+        <button class="btn-quick" data-quick="option1" title="Opción 1">1️⃣ Opción 1</button>
+        <button class="btn-quick" data-quick="option2" title="Opción 2">2️⃣ Opción 2</button>
+        <button class="btn-quick" data-quick="option3" title="Opción 3">3️⃣ Opción 3</button>
+        <button class="btn-quick btn-quick-reject" data-quick="reject" title="Enviar 'n' + Enter">❌ Rechazar (n)</button>
+        <button class="btn-quick btn-quick-esc" data-quick="escape" title="Enviar tecla Escape">⏹ Esc</button>
+      </div>
+
+      <!-- Barra para escribir y enviar un prompt o respuesta remota -->
+      <form id="chat-reply-form" class="chat-reply-bar">
+        <textarea id="chat-reply-input" class="chat-reply-input" rows="2" placeholder="Escribí tu respuesta o instrucción para enviar a la sesión..."></textarea>
+        <button type="submit" id="btn-chat-send" class="btn-chat-send">Enviar ➤</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- MODAL DE TOKEN DE ACCESO REMOTO (Solo si entra sin ?token= desde afuera) -->
+  <div id="auth-modal" class="chat-modal-backdrop hidden">
+    <div class="auth-modal-card">
+      <h3>🔒 Acceso Remoto AI Pulse</h3>
+      <p class="card-desc">Ingresá el Token de Acceso Remoto (o abrí el enlace con QR desde la pestaña Remotos en tu PC).</p>
+      <form id="auth-token-form" class="input-group-row" style="margin-top:8px">
+        <input type="password" id="auth-token-input" class="text-input" placeholder="Token de acceso..." autocomplete="off" />
+        <button type="submit" class="btn-primary">Conectar</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Toast interno de confirmación -->
+  <div id="toast" class="toast hidden">Copiado al portapapeles</div>
 
   <script src="/app.js"></script>
 </body>

@@ -1,0 +1,18 @@
+{
+  "name": "AI Pulse — Claude & Antigravity Remote",
+  "short_name": "AI Pulse",
+  "description": "Monitor en vivo, widget compacto y respuesta remota para consolas Claude Code y Antigravity (AGY)",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#070504",
+  "theme_color": "#ff6b1a",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

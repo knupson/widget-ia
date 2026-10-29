@@ -14,18 +14,25 @@ const fs = require('fs');
 const path = require('path');
 const { createWidgetServer } = require('./src/server');
 const { focusSessionWindow } = require('./src/services/windowFocuser');
+const { startFullscreenWatcher } = require('./src/services/fullscreenWatcher');
 
 let mainWindow = null;
 let tray = null;
 let widgetServer = null;
+let fullscreenWatcher = null;
 let currentMode = 'pill'; // Arranca como píldora compacta flotante
 let pillPosition = null; // { x, y }
 let isProgrammaticMove = false;
 let savePosTimer = null;
+let hiddenByFullscreen = false;
+let manualGamingHide = false;
+let lastAppliedOpacity = 1;
+let lastForegroundHwnd = null;
+let updateTrayMenuFn = null;
 
-const WIDGET_WIDTH = 516;
+const WIDGET_WIDTH = 586;
 const PILL_WIDTH = WIDGET_WIDTH;
-const PILL_HEIGHT = 54;
+const PILL_HEIGHT = 56;
 const EXPANDED_WIDTH = WIDGET_WIDTH;
 const EXPANDED_HEIGHT = 640;
 
@@ -49,16 +56,119 @@ function persistWindowPosition(immediate = false) {
   }
 }
 
+function applyLoginItemSetting(enabled) {
+  try {
+    const openAtLogin = enabled !== false;
+    const packedExe = path.join(__dirname, 'dist', 'win-unpacked', 'AI Pulse Widget.exe');
+    if (fs.existsSync(packedExe)) {
+      app.setLoginItemSettings({
+        openAtLogin,
+        path: packedExe,
+        args: []
+      });
+    } else {
+      app.setLoginItemSettings({
+        openAtLogin,
+        path: process.execPath,
+        args: [path.resolve(__dirname)]
+      });
+    }
+  } catch {}
+}
+
+function applyWindowOpacity(val) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const clamped = Math.max(0.4, Math.min(1, typeof val === 'number' && !Number.isNaN(val) ? val : 1));
+  // Cuando opacity == 1, evitamos forzar LWA_ALPHA (WS_EX_LAYERED) innecesario en DWM
+  if (clamped >= 0.999) {
+    if (lastAppliedOpacity < 0.999) {
+      mainWindow.setOpacity(1);
+    }
+    lastAppliedOpacity = 1;
+  } else if (Math.abs(clamped - lastAppliedOpacity) > 0.005) {
+    mainWindow.setOpacity(clamped);
+    lastAppliedOpacity = clamped;
+  }
+}
+
 function enforceAlwaysOnTop() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (hiddenByFullscreen || manualGamingHide) return;
   const cfg = widgetServer ? widgetServer.getConfig() : { alwaysOnTop: true };
   if (cfg.alwaysOnTop !== false) {
-    // En Windows, SwitchToThisWindow puede quitar WS_EX_TOPMOST de la ventana previa;
-    // alternar false -> true con nivel 'screen-saver' fuerza a Chromium/Win32 a reaplicar HWND_TOPMOST sin robar foco.
+    // En Windows, setSkipTaskbar, setResizable, SwitchToThisWindow o cambios de foco pueden
+    // quitar WS_EX_TOPMOST en Win32 aunque Electron siga reportando isAlwaysOnTop() === true.
+    // Alternar false -> true con nivel 'screen-saver' fuerza a Win32 a reaplicar HWND_TOPMOST sin robar foco.
     mainWindow.setAlwaysOnTop(false);
     mainWindow.setAlwaysOnTop(true, 'screen-saver');
+    if (mainWindow.isVisible()) {
+      mainWindow.moveTop();
+    }
   } else {
     mainWindow.setAlwaysOnTop(false);
+  }
+}
+
+function evaluateFullscreenState(fgInfo) {
+  if (!mainWindow || mainWindow.isDestroyed() || !widgetServer) return;
+  const cfg = widgetServer.getConfig();
+  const fgHwnd = fgInfo ? fgInfo.hwnd : null;
+  const fgChanged = Boolean(fgHwnd && fgHwnd !== lastForegroundHwnd);
+  lastForegroundHwnd = fgHwnd;
+
+  if (cfg.autoHideFullscreen === false) {
+    if (hiddenByFullscreen) {
+      hiddenByFullscreen = false;
+      if (!manualGamingHide) {
+        mainWindow.showInactive();
+        enforceAlwaysOnTop();
+        widgetServer.forceBroadcast();
+      }
+      if (updateTrayMenuFn) updateTrayMenuFn();
+    } else if (fgChanged && !manualGamingHide && (!fgInfo || fgInfo.pid !== process.pid)) {
+      enforceAlwaysOnTop();
+    }
+    return;
+  }
+
+  let shouldHide = false;
+  if (fgInfo && fgInfo.isFullscreen && fgInfo.pid !== process.pid) {
+    const refBounds = pillPosition
+      ? { x: pillPosition.x, y: pillPosition.y, width: PILL_WIDTH, height: PILL_HEIGHT }
+      : mainWindow.getBounds();
+    const widgetDisplay = screen.getDisplayMatching(refBounds);
+    const monBounds = widgetDisplay ? widgetDisplay.bounds : null;
+    if (monBounds) {
+      const fgCenterX = fgInfo.monX + fgInfo.monWidth / 2;
+      const fgCenterY = fgInfo.monY + fgInfo.monHeight / 2;
+      const sameMonitor =
+        fgCenterX >= monBounds.x &&
+        fgCenterX <= monBounds.x + monBounds.width &&
+        fgCenterY >= monBounds.y &&
+        fgCenterY <= monBounds.y + monBounds.height;
+      if (sameMonitor) {
+        shouldHide = true;
+      }
+    }
+  }
+
+  if (shouldHide && !hiddenByFullscreen) {
+    hiddenByFullscreen = true;
+    mainWindow.setAlwaysOnTop(false);
+    if (mainWindow.isVisible()) {
+      mainWindow.hide();
+    }
+    if (updateTrayMenuFn) updateTrayMenuFn();
+  } else if (!shouldHide && hiddenByFullscreen) {
+    hiddenByFullscreen = false;
+    if (!manualGamingHide) {
+      mainWindow.showInactive();
+      enforceAlwaysOnTop();
+      widgetServer.forceBroadcast();
+    }
+    if (updateTrayMenuFn) updateTrayMenuFn();
+  } else if (!shouldHide && !hiddenByFullscreen && !manualGamingHide && fgChanged && (!fgInfo || fgInfo.pid !== process.pid)) {
+    enforceAlwaysOnTop();
   }
 }
 
@@ -204,20 +314,80 @@ function setupTray(port) {
   tray.setToolTip('AI Pulse Widget · Claude & AGY Monitor');
 
   const updateMenu = () => {
+    const cfg = widgetServer ? widgetServer.getConfig() : { autoHideFullscreen: true };
     const contextMenu = Menu.buildFromTemplate([
       {
         label: 'Modo Píldora Compacta (HUD)',
         click: () => {
+          manualGamingHide = false;
+          hiddenByFullscreen = false;
           mainWindow.show();
           setWindowMode('pill');
+          updateMenu();
         }
       },
       {
         label: 'Expandir Panel Completo',
         click: () => {
+          manualGamingHide = false;
+          hiddenByFullscreen = false;
           mainWindow.show();
           setWindowMode('expanded');
           mainWindow.focus();
+          updateMenu();
+        }
+      },
+      { type: 'separator' },
+      {
+        label: 'Siempre encima (Always on Top)',
+        type: 'checkbox',
+        checked: cfg.alwaysOnTop !== false,
+        click: (menuItem) => {
+          if (widgetServer) {
+            widgetServer.updateConfig({ alwaysOnTop: Boolean(menuItem.checked) });
+            widgetServer.forceBroadcast();
+          }
+          enforceAlwaysOnTop(true);
+          updateMenu();
+        }
+      },
+      {
+        label: 'Modo Juego Automático (Ocultar en Fullscreen)',
+        type: 'checkbox',
+        checked: cfg.autoHideFullscreen !== false,
+        click: (menuItem) => {
+          if (widgetServer) {
+            widgetServer.updateConfig({ autoHideFullscreen: menuItem.checked });
+          }
+          if (!menuItem.checked && hiddenByFullscreen) {
+            hiddenByFullscreen = false;
+            if (!manualGamingHide && mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.showInactive();
+              enforceAlwaysOnTop(true);
+              if (widgetServer) widgetServer.forceBroadcast();
+            }
+          }
+          updateMenu();
+        }
+      },
+      {
+        label: 'Ocultar HUD temporalmente (Modo Juego Manual)',
+        type: 'checkbox',
+        checked: manualGamingHide,
+        click: (menuItem) => {
+          manualGamingHide = Boolean(menuItem.checked);
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            if (manualGamingHide) {
+              mainWindow.setAlwaysOnTop(false);
+              mainWindow.hide();
+            } else {
+              hiddenByFullscreen = false;
+              mainWindow.showInactive();
+              enforceAlwaysOnTop(true);
+              if (widgetServer) widgetServer.forceBroadcast();
+            }
+          }
+          updateMenu();
         }
       },
       { type: 'separator' },
@@ -239,13 +409,19 @@ function setupTray(port) {
     tray.setContextMenu(contextMenu);
   };
 
+  updateTrayMenuFn = updateMenu;
   updateMenu();
 
   tray.on('click', () => {
     if (!mainWindow) return;
     if (!mainWindow.isVisible()) {
+      manualGamingHide = false;
+      hiddenByFullscreen = false;
       mainWindow.show();
+      enforceAlwaysOnTop(true);
       mainWindow.focus();
+      if (widgetServer) widgetServer.forceBroadcast();
+      updateMenu();
     } else if (currentMode === 'pill') {
       setWindowMode('expanded');
       mainWindow.focus();
@@ -264,6 +440,8 @@ async function initApp() {
 
   app.on('second-instance', () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
+      manualGamingHide = false;
+      hiddenByFullscreen = false;
       mainWindow.setSkipTaskbar(true);
       setWindowMode(currentMode);
       mainWindow.show();
@@ -273,6 +451,14 @@ async function initApp() {
   });
 
   widgetServer = createWidgetServer({
+    isRendererVisible: () =>
+      Boolean(
+        mainWindow &&
+          !mainWindow.isDestroyed() &&
+          mainWindow.isVisible() &&
+          !hiddenByFullscreen &&
+          !manualGamingHide
+      ),
     onAlert: (alertObj, cfg) => {
       if (cfg.desktopNotifications !== false) {
         showDesktopNotification(alertObj);
@@ -283,12 +469,17 @@ async function initApp() {
       }
     },
     onConfigChange: (cfg) => {
+      applyLoginItemSetting(cfg.launchAtStartup !== false);
       if (mainWindow && !mainWindow.isDestroyed()) {
-        enforceAlwaysOnTop();
+        enforceAlwaysOnTop(true);
         if (typeof cfg.opacity === 'number') {
-          mainWindow.setOpacity(Math.max(0.4, Math.min(1, cfg.opacity)));
+          applyWindowOpacity(cfg.opacity);
+        }
+        if (cfg.autoHideFullscreen === false && hiddenByFullscreen) {
+          evaluateFullscreenState(null);
         }
       }
+      if (updateTrayMenuFn) updateTrayMenuFn();
     },
     onWindowControl: (body) => {
       if (!mainWindow || mainWindow.isDestroyed()) return { ok: false };
@@ -318,6 +509,7 @@ async function initApp() {
   });
 
   const { port, config } = await widgetServer.start();
+  applyLoginItemSetting(config.launchAtStartup !== false);
 
   const primaryDisplay = screen.getPrimaryDisplay();
   const defaultWorkArea = primaryDisplay.workArea;
@@ -368,9 +560,9 @@ async function initApp() {
   });
 
   mainWindow.setSkipTaskbar(true);
-  enforceAlwaysOnTop();
+  enforceAlwaysOnTop(true);
   if (typeof config.opacity === 'number') {
-    mainWindow.setOpacity(Math.max(0.4, Math.min(1, config.opacity)));
+    applyWindowOpacity(config.opacity);
   }
 
   mainWindow.once('ready-to-show', () => {
@@ -385,7 +577,9 @@ async function initApp() {
     if (!mainWindow || mainWindow.isDestroyed()) return;
     mainWindow.setSkipTaskbar(true);
     enforceAlwaysOnTop();
-    mainWindow.show();
+    if (!hiddenByFullscreen && !manualGamingHide) {
+      mainWindow.show();
+    }
     mainWindow.webContents.send('widget:modeChanged', currentMode);
   });
 
@@ -405,8 +599,7 @@ async function initApp() {
 
   mainWindow.on('blur', () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
-      enforceAlwaysOnTop();
-      setTimeout(() => enforceAlwaysOnTop(), 100);
+      setTimeout(() => enforceAlwaysOnTop(), 450);
     }
   });
 
@@ -429,6 +622,12 @@ async function initApp() {
   mainWindow.loadURL(`http://127.0.0.1:${port}/`);
   setupTray(port);
 
+  fullscreenWatcher = startFullscreenWatcher({
+    onForegroundWindow: (fgInfo) => {
+      evaluateFullscreenState(fgInfo);
+    }
+  });
+
   ipcMain.handle('widget:setMode', (_e, mode) => {
     setWindowMode(mode);
     return currentMode;
@@ -437,21 +636,17 @@ async function initApp() {
   ipcMain.handle('widget:getMode', () => currentMode);
 
   ipcMain.handle('widget:setAlwaysOnTop', (_e, flag) => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      if (Boolean(flag)) {
-        mainWindow.setAlwaysOnTop(false);
-        mainWindow.setAlwaysOnTop(true, 'screen-saver');
-      } else {
-        mainWindow.setAlwaysOnTop(false);
-      }
+    const enabled = Boolean(flag);
+    if (widgetServer) {
+      widgetServer.updateConfig({ alwaysOnTop: enabled });
     }
+    enforceAlwaysOnTop();
+    if (updateTrayMenuFn) updateTrayMenuFn();
     return true;
   });
 
   ipcMain.handle('widget:setOpacity', (_e, val) => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.setOpacity(Math.max(0.4, Math.min(1, Number(val) || 0.96)));
-    }
+    applyWindowOpacity(Number(val) || 1);
     return true;
   });
 
@@ -484,6 +679,7 @@ app.whenReady().then(initApp);
 
 app.on('before-quit', () => {
   persistWindowPosition(true);
+  if (fullscreenWatcher) fullscreenWatcher.stop();
   if (widgetServer) widgetServer.stop();
 });
 

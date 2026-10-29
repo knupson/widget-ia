@@ -7,19 +7,29 @@ const { collectClaudeData } = require('./collectors/claudeCollector');
 const { RemoteManager } = require('./collectors/remoteManager');
 const { getHooksStatus, setClaudeHookEnabled, setAgyHookEnabled } = require('./services/hooksManager');
 const { focusSessionWindow } = require('./services/windowFocuser');
+const { getSessionMessages } = require('./services/conversationReader');
+const { sendSessionReply } = require('./services/remoteResponder');
+const { TunnelManager } = require('./services/tunnelManager');
 
 const CONFIG_PATH = path.resolve(__dirname, '..', 'config.json');
 const PUBLIC_DIR = path.resolve(__dirname, 'public');
 
 function loadConfig() {
   const defaultTopic = `ai-pulse-${crypto.randomBytes(5).toString('hex')}`;
+  const defaultAuthToken = crypto.randomBytes(8).toString('hex');
   const defaults = {
     port: 19876,
+    bindHost: '0.0.0.0',
+    remoteAuthToken: defaultAuthToken,
+    tunnelEnabled: false,
+    ntfyPushLocalAlerts: true,
     soundEnabled: true,
     soundTone: 'chime',
     desktopNotifications: true,
     alwaysOnTop: true,
-    opacity: 0.96,
+    autoHideFullscreen: true,
+    launchAtStartup: true,
+    opacity: 1.0,
     ntfyEnabled: true,
     ntfyTopic: defaultTopic,
     agyFiveHourLimitM: 25,
@@ -37,7 +47,24 @@ function loadConfig() {
   try {
     const parsed = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
     const merged = { ...defaults, ...parsed };
-    if (!merged.ntfyTopic) merged.ntfyTopic = defaultTopic;
+    let needsSave = false;
+    if (!merged.ntfyTopic) {
+      merged.ntfyTopic = defaultTopic;
+      needsSave = true;
+    }
+    if (!merged.remoteAuthToken) {
+      merged.remoteAuthToken = defaultAuthToken;
+      needsSave = true;
+    }
+    if (!merged.bindHost || merged.bindHost === '127.0.0.1') {
+      merged.bindHost = '0.0.0.0';
+      needsSave = true;
+    }
+    if (needsSave) {
+      try {
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(merged, null, 2), 'utf8');
+      } catch {}
+    }
     return merged;
   } catch {
     return defaults;
@@ -76,7 +103,7 @@ function addTokenBucket(target, src) {
   return target;
 }
 
-function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
+function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRendererVisible } = {}) {
   const config = loadConfig();
   const sseClients = new Set();
   const hookOverrides = new Map(); // sessionId -> { state, message, timestamp }
@@ -85,6 +112,57 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
   const recentAlerts = []; // últimas 25 alertas
 
   let latestSnapshot = null;
+  let lastBroadcastSig = '';
+  let lastBroadcastAt = 0;
+  let lastPollAt = 0;
+  let hooksStatusCache = { checkedAt: 0, data: null };
+
+  function getCachedHooksStatus(force = false) {
+    const now = Date.now();
+    if (!force && hooksStatusCache.data && now - hooksStatusCache.checkedAt < 15000) {
+      return hooksStatusCache.data;
+    }
+    const status = getHooksStatus();
+    hooksStatusCache = { checkedAt: now, data: status };
+    return status;
+  }
+
+  function buildSnapshotSignature(snap) {
+    return JSON.stringify({
+      summary: snap.summary,
+      sessions: snap.sessions.map((s) => ({
+        id: s.id,
+        state: s.state,
+        isOpen: s.isOpen,
+        hasUnreadAlert: s.hasUnreadAlert,
+        updatedAt: s.updatedAt,
+        turns: s.turns,
+        lastMessage: s.lastMessage,
+        currentAction: s.currentAction,
+        totalTok: s.tokens && s.tokens.total
+      })),
+      planFh: snap.planQuota && snap.planQuota.fiveHourPct,
+      planSd: snap.planQuota && snap.planQuota.sevenDayPct,
+      planResetId: snap.planQuota && snap.planQuota.lastReset && snap.planQuota.lastReset.id,
+      agyFh: snap.agyQuota && snap.agyQuota.fiveHourPct,
+      agySd: snap.agyQuota && snap.agyQuota.sevenDayPct,
+      agyBurn: snap.agyQuota && snap.agyQuota.burnRatePerHour,
+      hooksStatus: snap.hooksStatus,
+      ntfyConnected: snap.remoteSetup && snap.remoteSetup.ntfyConnected,
+      tunnelStatus: snap.mobileAccess && snap.mobileAccess.tunnel,
+      config: snap.config,
+      recentAlertsLen: snap.recentAlerts.length,
+      lastAlertId: snap.recentAlerts[0] && snap.recentAlerts[0].id
+    });
+  }
+
+  const tunnelManager = new TunnelManager({
+    config,
+    saveConfig: () => saveConfig(config),
+    onStateChange: () => {
+      refreshSnapshot(true);
+    }
+  });
 
   const remoteManager = new RemoteManager({
     config,
@@ -97,9 +175,33 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
       ) {
         triggerAlert(sessionObj, sessionObj.state);
       }
-      refreshSnapshot();
+      refreshSnapshot(true);
+    },
+    onRemoteReplyCommand: async (cmdPayload) => {
+      if (!cmdPayload || (!cmdPayload.text && !cmdPayload.quickAction)) return;
+      const targetId = cmdPayload.sessionId || cmdPayload.id;
+      const sessions = (latestSnapshot && latestSnapshot.sessions) || [];
+      const targetSession =
+        sessions.find((s) => s.id === targetId || s.sessionId === targetId) ||
+        sessions.find((s) => s.isOpen && (s.state === 'waiting_approval' || s.state === 'waiting_input'));
+      if (targetSession) {
+        await sendSessionReply({
+          ...targetSession,
+          text: cmdPayload.text,
+          quickAction: cmdPayload.quickAction
+        });
+        unreadAlerts.delete(targetSession.id);
+        setTimeout(() => refreshSnapshot(true), 500);
+      }
     }
   });
+
+  function getMobileBaseUrl() {
+    if (tunnelManager.publicUrl) return tunnelManager.publicUrl;
+    const ips = remoteManager.getLocalNetworkAddresses();
+    if (ips.length > 0) return `http://${ips[0].address}:${config.port}`;
+    return '';
+  }
 
   function triggerAlert(session, alertType, customMessage) {
     unreadAlerts.add(session.id);
@@ -130,6 +232,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
     if (typeof onAlert === 'function') {
       onAlert(alertObj, config);
     }
+    remoteManager.sendOutboundAlertPush(alertObj, getMobileBaseUrl(), config.remoteAuthToken);
   }
 
   function triggerQuotaResetAlert(resetObj) {
@@ -160,6 +263,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
     if (typeof onAlert === 'function') {
       onAlert(alertObj, config);
     }
+    remoteManager.sendOutboundAlertPush(alertObj, getMobileBaseUrl(), config.remoteAuthToken);
     return alertObj;
   }
 
@@ -237,7 +341,9 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
     };
   }
 
-  function refreshSnapshot() {
+  function refreshSnapshot(forceBroadcast = false) {
+    const now = Date.now();
+    lastPollAt = now;
     const agyData = collectAgyData(config);
     const claudeData = collectClaudeData(hookOverrides);
     const remoteSessions = remoteManager.getActiveRemoteSessions();
@@ -300,24 +406,67 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
     };
 
     const analytics = buildAnalytics(agyData, claudeData, allSessions);
+    const snippets = remoteManager.getRemoteSetupSnippets(config.port);
+    const primaryLanIp =
+      snippets.localIps && snippets.localIps.length > 0 ? snippets.localIps[0].address : '';
+    const token = config.remoteAuthToken || '';
+    const tunnelStatus = tunnelManager.getStatus();
+    const lanBase = primaryLanIp ? `http://${primaryLanIp}:${config.port}` : '';
+    const tunnelBase = tunnelStatus.publicUrl || '';
+    const lanAppUrl = lanBase ? `${lanBase}/?mode=web&token=${encodeURIComponent(token)}` : '';
+    const lanWidgetUrl = lanBase ? `${lanBase}/?mode=widget&token=${encodeURIComponent(token)}` : '';
+    const tunnelAppUrl = tunnelBase
+      ? `${tunnelBase}/?mode=web&token=${encodeURIComponent(token)}`
+      : '';
+    const tunnelWidgetUrl = tunnelBase
+      ? `${tunnelBase}/?mode=widget&token=${encodeURIComponent(token)}`
+      : '';
+    const activeAppUrl = tunnelAppUrl || lanAppUrl;
+    const activeWidgetUrl = tunnelWidgetUrl || lanWidgetUrl;
+
+    const mobileAccess = {
+      lanIp: primaryLanIp,
+      lanUrl: lanAppUrl,
+      lanAppUrl,
+      lanWidgetUrl,
+      tunnel: tunnelStatus,
+      tunnelUrl: tunnelAppUrl,
+      tunnelAppUrl,
+      tunnelWidgetUrl,
+      activeUrl: activeAppUrl,
+      activeAppUrl,
+      activeWidgetUrl
+    };
 
     latestSnapshot = {
-      timestamp: Date.now(),
+      timestamp: now,
       summary,
       sessions: allSessions,
       planQuota: claudeData.planQuota,
       agyQuota: agyData.agyQuota,
       analytics,
-      hooksStatus: getHooksStatus(),
+      hooksStatus: getCachedHooksStatus(),
       remoteSetup: {
-        ...remoteManager.getRemoteSetupSnippets(config.port),
+        ...snippets,
         ntfyConnected: remoteManager.ntfyConnected
       },
+      mobileAccess,
       config,
       recentAlerts
     };
 
-    broadcastSse('state', latestSnapshot);
+    if (sseClients.size > 0) {
+      const windowVisible = typeof isRendererVisible === 'function' ? isRendererVisible() : true;
+      const hasExternalWebClients = sseClients.size > 1;
+      if (windowVisible || hasExternalWebClients || forceBroadcast) {
+        const sig = buildSnapshotSignature(latestSnapshot);
+        if (forceBroadcast || sig !== lastBroadcastSig || now - lastBroadcastAt >= 30000) {
+          lastBroadcastSig = sig;
+          lastBroadcastAt = now;
+          broadcastSse('state', latestSnapshot);
+        }
+      }
+    }
     return latestSnapshot;
   }
 
@@ -353,7 +502,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
           timestamp: Date.now()
         });
       }
-      refreshSnapshot();
+      refreshSnapshot(true);
       const targetSession =
         latestSnapshot &&
         latestSnapshot.sessions.find((s) => s.sessionId === sessId || s.id === `claude:${sessId}`);
@@ -361,7 +510,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
         triggerAlert(targetSession, newState, msg);
       }
     } else if (provider === 'agy' || p.conversationId) {
-      refreshSnapshot();
+      refreshSnapshot(true);
       const convId = p.conversationId;
       const targetSession =
         latestSnapshot &&
@@ -390,6 +539,17 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
     });
   }
 
+  function isLocalLoopbackSocket(req) {
+    if (req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for']) {
+      return false; // Tráfico entrante desde Cloudflare Tunnel 4G
+    }
+    if (!isAllowedHostHeader(req.headers.host)) {
+      return false; // Acceso por IP LAN o dominio de túnel -> validar por token remoto
+    }
+    const addr = String((req.socket && req.socket.remoteAddress) || '');
+    return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
+  }
+
   function isAllowedLocalOrigin(originHeader) {
     if (!originHeader) return true; // Peticiones directas de proceso local / CLI sin header Origin
     try {
@@ -409,11 +569,38 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
     return hostname === '127.0.0.1' || hostname === 'localhost';
   }
 
+  function extractRequestToken(req, urlObj) {
+    const qToken = urlObj.searchParams.get('token');
+    if (qToken) return qToken.trim();
+    const hToken = req.headers['x-auth-token'];
+    if (hToken) return String(hToken).trim();
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      return authHeader.slice(7).trim();
+    }
+    const cookieHeader = String(req.headers.cookie || '');
+    const match = cookieHeader.match(/(?:^|;\s*)ai_pulse_token=([^;]+)/);
+    if (match && match[1]) {
+      try {
+        return decodeURIComponent(match[1].trim());
+      } catch {
+        return match[1].trim();
+      }
+    }
+    return '';
+  }
+
+  function isValidRemoteToken(tokenCandidate) {
+    const expected = String(config.remoteAuthToken || '').trim();
+    if (!expected || !tokenCandidate) return false;
+    return tokenCandidate === expected;
+  }
+
   function getCorsHeaders(req) {
     const origin = req.headers.origin;
     const headers = {
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type'
+      'Access-Control-Allow-Headers': 'Content-Type, X-Auth-Token, Authorization'
     };
     if (origin && isAllowedLocalOrigin(origin)) {
       headers['Access-Control-Allow-Origin'] = origin;
@@ -422,21 +609,28 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
     return headers;
   }
 
-  function sendJson(res, statusCode, obj, req = { headers: {} }) {
+  function sendJson(res, statusCode, obj, req = { headers: {} }, extraHeaders = {}) {
     const payload = JSON.stringify(obj);
     res.writeHead(statusCode, {
       'Content-Type': 'application/json; charset=utf-8',
-      ...getCorsHeaders(req)
+      ...getCorsHeaders(req),
+      ...extraHeaders
     });
     res.end(payload);
   }
 
   const server = http.createServer(async (req, res) => {
-    // Protección contra DNS Rebinding y Cross-Origin CSRF desde sitios web externos
-    if (!isAllowedHostHeader(req.headers.host) || !isAllowedLocalOrigin(req.headers.origin)) {
-      res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ ok: false, error: 'Forbidden origin or host' }));
-      return;
+    const urlObj = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`);
+    const pathname = urlObj.pathname;
+    const isLocalLoopback = isLocalLoopbackSocket(req);
+
+    // Si es socket local directo en PC, proteger contra DNS Rebinding y Cross-Origin CSRF desde sitios externos
+    if (isLocalLoopback) {
+      if (!isAllowedHostHeader(req.headers.host) || !isAllowedLocalOrigin(req.headers.origin)) {
+        res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'Forbidden origin or host' }));
+        return;
+      }
     }
 
     if (req.method === 'OPTIONS') {
@@ -445,12 +639,88 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
       return;
     }
 
-    const urlObj = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`);
-    const pathname = urlObj.pathname;
+    // Autenticación por token para clientes remotos (Celular Android por Wi-Fi LAN o Túnel 4G Cloudflare)
+    const reqToken = extractRequestToken(req, urlObj);
+    const hasValidToken = isValidRemoteToken(reqToken);
+    const cookieHeaders = {};
+    if (hasValidToken && urlObj.searchParams.get('token')) {
+      cookieHeaders['Set-Cookie'] = `ai_pulse_token=${encodeURIComponent(reqToken)}; Path=/; Max-Age=31536000; SameSite=Lax`;
+    }
+
+    if (!isLocalLoopback) {
+      const isPublicEndpoint = pathname === '/api/remote/report' || !pathname.startsWith('/api/');
+      if (!isPublicEndpoint && !hasValidToken) {
+        sendJson(res, 401, {
+          ok: false,
+          requiresAuth: true,
+          error: 'Clave de acceso remoto requerida. Escanea el código QR desde la pestaña Remotos en tu PC.'
+        }, req);
+        return;
+      }
+    }
 
     if (req.method === 'GET' && pathname === '/api/state') {
       if (!latestSnapshot) refreshSnapshot();
-      sendJson(res, 200, latestSnapshot, req);
+      sendJson(res, 200, latestSnapshot, req, cookieHeaders);
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/api/widget/compact') {
+      if (!latestSnapshot) refreshSnapshot();
+      const snap = latestSnapshot || {};
+      const sum = snap.summary || {};
+      const pq = snap.planQuota || {};
+      const aq = snap.agyQuota || {};
+      const ma = snap.mobileAccess || {};
+      const openSessions = ((snap.sessions || []).filter((s) => s.isOpen) || []).slice(0, 5).map((s) => ({
+        id: s.id,
+        provider: s.provider,
+        providerLabel: s.provider === 'agy' ? 'AGY' : 'CLAUDE',
+        projectName: s.projectName || s.title || 'Consola',
+        title: s.title || s.projectName || '',
+        state: s.state || 'idle',
+        statusText:
+          s.state === 'waiting_approval'
+            ? '⚠️ Pide permiso'
+            : s.state === 'waiting_input'
+            ? '💬 Lista p/ responder'
+            : s.state === 'running' || s.state === 'working'
+            ? '⚡ Trabajando'
+            : '● En espera',
+        lastMessage: String(s.currentAction || s.lastMessage || '').slice(0, 90)
+      }));
+      sendJson(
+        res,
+        200,
+        {
+          ok: true,
+          timestamp: snap.timestamp || Date.now(),
+          lanBase: ma.lanIp ? `http://${ma.lanIp}:${config.port}` : '',
+          tunnelBase: (ma.tunnel && ma.tunnel.publicUrl) || '',
+          summary: {
+            openCount: sum.totalOpen || 0,
+            workingCount: sum.running || 0,
+            waitingCount: sum.waitingInput || 0,
+            approvalCount: sum.waitingApproval || 0
+          },
+          quotas: {
+            claude5hPct: Math.round(Number(pq.fiveHourPct) || 0),
+            claude7dPct: Math.round(Number(pq.sevenDayPct) || 0),
+            agy5hPct: Math.round(Number(aq.fiveHourPct) || 0),
+            agy7dPct: Math.round(Number(aq.sevenDayPct) || 0),
+            claudeResetId: (pq.lastReset && pq.lastReset.id) || '',
+            claudeResetMsg:
+              pq.lastReset && pq.lastReset.isBonus
+                ? `🎁 ¡Bonus Claude! Cuota semanal bajó de ${pq.lastReset.fromPct}% a ${pq.lastReset.toPct}% (-${pq.lastReset.savedPct}%)`
+                : pq.lastReset
+                  ? `🔄 Cuota semanal de Claude renovada (${pq.lastReset.fromPct}% → ${pq.lastReset.toPct}%)`
+                  : ''
+          },
+          sessions: openSessions
+        },
+        req,
+        cookieHeaders
+      );
       return;
     }
 
@@ -459,11 +729,115 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
         'Content-Type': 'text/event-stream; charset=utf-8',
         'Cache-Control': 'no-cache, no-transform',
         Connection: 'keep-alive',
-        ...getCorsHeaders(req)
+        ...getCorsHeaders(req),
+        ...cookieHeaders
       });
       res.write(`event: state\ndata: ${JSON.stringify(latestSnapshot || refreshSnapshot())}\n\n`);
       sseClients.add(res);
       req.on('close', () => sseClients.delete(res));
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/api/sessions/messages') {
+      const targetId = urlObj.searchParams.get('id') || '';
+      if (!latestSnapshot) refreshSnapshot();
+      const result = getSessionMessages(targetId, latestSnapshot ? latestSnapshot.sessions : []);
+      sendJson(res, 200, result, req, cookieHeaders);
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/sessions/reply') {
+      const body = await parseJsonBody(req);
+      if (!latestSnapshot) refreshSnapshot();
+      const rawLookupId = String(body.sessionId || body.id || '').replace(/^(claude|agy|claude-app):/i, '');
+      const matchSession = (list) =>
+        list.find(
+          (s) =>
+            s.id === body.id ||
+            s.sessionId === body.sessionId ||
+            s.id === body.sessionId ||
+            (rawLookupId && s.sessionId === rawLookupId)
+        );
+
+      let sessions = (latestSnapshot && latestSnapshot.sessions) || [];
+      let targetSession = matchSession(sessions);
+      if (!targetSession || (!body.pid && !targetSession.pid && targetSession.isOpen !== false)) {
+        refreshSnapshot(false);
+        sessions = (latestSnapshot && latestSnapshot.sessions) || [];
+        targetSession = matchSession(sessions) || {};
+      }
+
+      const resolvedProvider = body.provider || targetSession.provider || 'claude';
+      const resolvedWorkspace = body.workspace || targetSession.workspace || '';
+      let resolvedPid = body.pid || targetSession.pid || null;
+
+      if (!resolvedPid) {
+        const wsLower = String(resolvedWorkspace || '').toLowerCase();
+        const openMatch =
+          (wsLower &&
+            sessions.find(
+              (s) =>
+                s.isOpen &&
+                s.pid &&
+                s.provider === resolvedProvider &&
+                String(s.workspace || '').toLowerCase() === wsLower
+            )) ||
+          sessions.find(
+            (s) =>
+              s.isOpen &&
+              s.pid &&
+              s.provider === resolvedProvider &&
+              (s.state === 'waiting_approval' || s.state === 'waiting_input')
+          ) ||
+          sessions.find((s) => s.isOpen && s.pid && s.provider === resolvedProvider);
+        if (openMatch) {
+          resolvedPid = openMatch.pid;
+        }
+      }
+
+      const resolvedSessionId =
+        targetSession.parentConversationId ||
+        body.sessionId ||
+        targetSession.sessionId ||
+        body.id ||
+        targetSession.id;
+
+      const replyPayload = {
+        id: body.id || targetSession.id,
+        sessionId: resolvedSessionId,
+        pid: resolvedPid,
+        provider: resolvedProvider,
+        surface: body.surface || targetSession.surface,
+        workspace: resolvedWorkspace,
+        isOpen: targetSession.isOpen !== false,
+        text: body.text || '',
+        quickAction: body.quickAction || ''
+      };
+
+      if (replyPayload.id) {
+        unreadAlerts.delete(replyPayload.id);
+      }
+
+      const result = await sendSessionReply(replyPayload);
+      setTimeout(() => refreshSnapshot(true), 450);
+      sendJson(res, 200, result, req);
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/tunnel/toggle') {
+      const body = await parseJsonBody(req);
+      const enable = Boolean(body.enabled);
+      config.tunnelEnabled = enable;
+      saveConfig(config);
+
+      let status;
+      if (enable) {
+        status = await tunnelManager.start();
+      } else {
+        status = tunnelManager.stop();
+      }
+      refreshSnapshot(true);
+      sendJson(res, 200, { ok: true, tunnel: status }, req);
       return;
     }
 
@@ -477,7 +851,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
     if (req.method === 'POST' && pathname === '/api/remote/report') {
       const body = await parseJsonBody(req);
       const sess = remoteManager.ingestRemotePayload(body, 'http');
-      refreshSnapshot();
+      refreshSnapshot(true);
       sendJson(res, 200, { ok: true, session: sess });
       return;
     }
@@ -504,7 +878,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
         },
         'ntfy'
       );
-      refreshSnapshot();
+      refreshSnapshot(true);
       sendJson(res, 200, { ok: true, session: sess });
       return;
     }
@@ -514,7 +888,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
       if (body.id) {
         remoteManager.removeRemoteSession(body.id);
         unreadAlerts.delete(body.id);
-        refreshSnapshot();
+        refreshSnapshot(true);
       }
       sendJson(res, 200, { ok: true });
       return;
@@ -527,7 +901,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
       } else if (body.id) {
         unreadAlerts.delete(body.id);
       }
-      refreshSnapshot();
+      refreshSnapshot(true);
       sendJson(res, 200, { ok: true });
       return;
     }
@@ -547,7 +921,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
       if (typeof onWindowControl === 'function') {
         onWindowControl({ action: 'ensureTopmost' });
       }
-      refreshSnapshot();
+      refreshSnapshot(true);
       sendJson(res, 200, result);
       return;
     }
@@ -565,7 +939,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
         label: '🎁 Reseteo Gratis (Bonus)'
       };
       const alertObj = triggerQuotaResetAlert(sampleReset);
-      refreshSnapshot();
+      refreshSnapshot(true);
       sendJson(res, 200, { ok: true, alert: alertObj });
       return;
     }
@@ -578,8 +952,9 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
         } else if (body.target === 'agy') {
           setAgyHookEnabled(Boolean(body.enabled));
         }
-        refreshSnapshot();
-        sendJson(res, 200, { ok: true, hooksStatus: getHooksStatus() });
+        getCachedHooksStatus(true);
+        refreshSnapshot(true);
+        sendJson(res, 200, { ok: true, hooksStatus: getCachedHooksStatus() });
       } catch (err) {
         sendJson(res, 500, { ok: false, error: err.message });
       }
@@ -596,9 +971,13 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
         'soundTone',
         'desktopNotifications',
         'alwaysOnTop',
+        'autoHideFullscreen',
+        'launchAtStartup',
         'opacity',
         'ntfyEnabled',
         'ntfyTopic',
+        'ntfyPushLocalAlerts',
+        'tunnelEnabled',
         'agyFiveHourLimitM',
         'agySevenDayLimitM',
         'sshHosts',
@@ -615,13 +994,14 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
         remoteManager.connectNtfyStream();
       }
       if (body.sshHosts) {
-        remoteManager.pollAllSshHosts();
+        remoteManager.resetSshBackoff();
+        remoteManager.pollAllSshHosts(true);
       }
       if (typeof onConfigChange === 'function') {
         onConfigChange(config);
       }
 
-      refreshSnapshot();
+      refreshSnapshot(true);
       sendJson(res, 200, { ok: true, config }, req);
       return;
     }
@@ -647,6 +1027,43 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
       return;
     }
 
+    if (req.method === 'GET' && pathname === '/manifest.json') {
+      const startToken = hasValidToken
+        ? reqToken
+        : isLocalLoopback
+          ? config.remoteAuthToken || ''
+          : '';
+      const startUrl = startToken
+        ? `/?mode=web&token=${encodeURIComponent(startToken)}`
+        : '/?mode=web';
+      sendJson(
+        res,
+        200,
+        {
+          name: 'AI Pulse — Claude & Antigravity Remote',
+          short_name: 'AI Pulse',
+          description:
+            'Monitor en vivo, widget compacto y respuesta remota para consolas Claude Code y Antigravity (AGY)',
+          start_url: startUrl,
+          display: 'standalone',
+          background_color: '#070504',
+          theme_color: '#ff6b1a',
+          orientation: 'portrait-primary',
+          icons: [
+            {
+              src: '/icon.svg',
+              sizes: 'any',
+              type: 'image/svg+xml',
+              purpose: 'any maskable'
+            }
+          ]
+        },
+        req,
+        cookieHeaders
+      );
+      return;
+    }
+
     // Servir archivos estáticos del frontend con protección de Path Traversal
     const safeRelPath = pathname === '/' ? 'index.html' : pathname.replace(/^[/\\]+/, '');
     const filePath = path.resolve(PUBLIC_DIR, safeRelPath);
@@ -664,9 +1081,20 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
         '.css': 'text/css; charset=utf-8',
         '.js': 'application/javascript; charset=utf-8',
         '.json': 'application/json; charset=utf-8',
-        '.svg': 'image/svg+xml'
+        '.svg': 'image/svg+xml',
+        '.apk': 'application/vnd.android.package-archive'
       };
-      res.writeHead(200, { 'Content-Type': mimeMap[ext] || 'application/octet-stream' });
+      const extraStaticHeaders =
+        ext === '.apk'
+          ? { 'Content-Disposition': 'attachment; filename="AI-Pulse.apk"', 'Cache-Control': 'no-cache' }
+          : ext === '.html' || ext === '.css' || ext === '.js'
+            ? { 'Cache-Control': 'no-cache, must-revalidate' }
+            : {};
+      res.writeHead(200, {
+        'Content-Type': mimeMap[ext] || 'application/octet-stream',
+        ...extraStaticHeaders,
+        ...cookieHeaders
+      });
       fs.createReadStream(filePath).pipe(res);
     } else {
       res.writeHead(404);
@@ -675,16 +1103,32 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
   });
 
   let pollTimer = null;
-  const bindHost = config.bindHost || '127.0.0.1';
+  const bindHost = config.bindHost || '0.0.0.0';
 
   function start() {
     return new Promise((resolve, reject) => {
       refreshSnapshot();
       remoteManager.start();
+      if (config.tunnelEnabled) {
+        tunnelManager.start();
+      }
 
       pollTimer = setInterval(() => {
         try {
-          refreshSnapshot();
+          const windowVisible = typeof isRendererVisible === 'function' ? isRendererVisible() : true;
+          const hasExternalClients = sseClients.size > 1;
+          const hasActiveClients = sseClients.size > 0 && (windowVisible || hasExternalClients);
+          const runningCount =
+            (latestSnapshot && latestSnapshot.summary && latestSnapshot.summary.running) || 0;
+          const intervalMs =
+            !hasActiveClients && unreadAlerts.size === 0
+              ? 10000
+              : runningCount > 0 || hasExternalClients
+                ? 2500
+                : 4500;
+          if (Date.now() - lastPollAt >= intervalMs - 100) {
+            refreshSnapshot();
+          }
         } catch {}
       }, 2500);
 
@@ -728,6 +1172,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
   function stop() {
     if (pollTimer) clearInterval(pollTimer);
     remoteManager.stop();
+    tunnelManager.stop();
     try {
       server.close();
     } catch {}
@@ -737,6 +1182,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl } = {}) {
     start,
     stop,
     getSnapshot: () => latestSnapshot || refreshSnapshot(),
+    forceBroadcast: () => refreshSnapshot(true),
     getConfig: () => config,
     updateConfig: (partial) => {
       if (partial && typeof partial === 'object') {

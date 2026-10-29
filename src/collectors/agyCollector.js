@@ -2,8 +2,14 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-// Cache incremental por conversación para no re-parsear archivos JSONL sin cambios
+// Cache incremental por conversación para no re-parsear archivos JSONL ni SQLite sin cambios
 const transcriptCache = new Map();
+let settingsCache = { key: '', data: null };
+let dbSummariesCache = { key: '', rows: [] };
+let historyMapCache = { key: '', map: new Map() };
+let brainScanCache = { mtimeMs: 0, checkedAt: 0, recentIds: [] };
+let agyResultCache = { key: '', data: null };
+const unlockedPresenceCache = new Map(); // file -> mtimeMs
 
 function getAgyBaseDir() {
   return path.join(os.homedir(), '.gemini', 'antigravity-cli');
@@ -21,12 +27,19 @@ function readAgySettings(baseDir) {
   };
   if (!fs.existsSync(settingsPath)) return defaults;
   try {
+    const st = fs.statSync(settingsPath);
+    const key = `${st.mtimeMs}:${st.size}`;
+    if (settingsCache.data && settingsCache.key === key) {
+      return settingsCache.data;
+    }
     const raw = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
-    return {
+    const data = {
       model: raw.model || defaults.model,
       gcpProject: (raw.gcp && raw.gcp.project) || defaults.gcpProject,
       gcpLocation: (raw.gcp && raw.gcp.location) || defaults.gcpLocation
     };
+    settingsCache = { key, data };
+    return data;
   } catch {
     return defaults;
   }
@@ -49,11 +62,25 @@ function getActiveLockedConversations(baseDir) {
     return activeMap;
   }
 
+  const now = Date.now();
   const buf = Buffer.alloc(1);
   for (const file of files) {
     if (!file.endsWith('.lock')) continue;
     const convId = file.slice(0, -5);
     const fullPath = path.join(presenceDir, file);
+    let fileMtimeMs = 0;
+    try {
+      fileMtimeMs = fs.statSync(fullPath).mtimeMs;
+    } catch {
+      continue;
+    }
+
+    // Si en el ciclo anterior no estaba bloqueado y su mtime tiene más de 60s sin cambios, no abrir descriptor
+    const prevUnlockedMtime = unlockedPresenceCache.get(file);
+    if (prevUnlockedMtime === fileMtimeMs && now - fileMtimeMs > 60000) {
+      continue;
+    }
+
     let fd = null;
     let isLocked = false;
     try {
@@ -72,11 +99,10 @@ function getActiveLockedConversations(baseDir) {
     }
 
     if (isLocked) {
-      let lockMtimeMs = Date.now();
-      try {
-        lockMtimeMs = fs.statSync(fullPath).mtimeMs;
-      } catch {}
-      activeMap.set(convId, { lockMtimeMs });
+      unlockedPresenceCache.delete(file);
+      activeMap.set(convId, { lockMtimeMs: fileMtimeMs || now });
+    } else {
+      unlockedPresenceCache.set(file, fileMtimeMs);
     }
   }
 
@@ -89,6 +115,21 @@ function getActiveLockedConversations(baseDir) {
 function readConversationSummaries(baseDir) {
   const dbPath = path.join(baseDir, 'conversation_summaries.db');
   if (!fs.existsSync(dbPath)) return [];
+
+  let cacheKey = '';
+  try {
+    const st = fs.statSync(dbPath);
+    let walPart = '0:0';
+    const walPath = `${dbPath}-wal`;
+    if (fs.existsSync(walPath)) {
+      const wst = fs.statSync(walPath);
+      walPart = `${wst.mtimeMs}:${wst.size}`;
+    }
+    cacheKey = `${st.mtimeMs}:${st.size}:${walPart}`;
+    if (dbSummariesCache.key === cacheKey) {
+      return dbSummariesCache.rows;
+    }
+  } catch {}
 
   let db = null;
   try {
@@ -114,9 +155,13 @@ function readConversationSummaries(baseDir) {
       ORDER BY last_modified_time DESC
       LIMIT 80
     `);
-    return stmt.all();
+    const rows = stmt.all();
+    if (cacheKey) {
+      dbSummariesCache = { key: cacheKey, rows };
+    }
+    return rows;
   } catch (err) {
-    return [];
+    return dbSummariesCache.rows || [];
   } finally {
     if (db) {
       try {
@@ -131,10 +176,16 @@ function readConversationSummaries(baseDir) {
  */
 function readHistoryMap(baseDir) {
   const histPath = path.join(baseDir, 'history.jsonl');
-  const map = new Map();
-  if (!fs.existsSync(histPath)) return map;
+  if (!fs.existsSync(histPath)) return new Map();
 
   try {
+    const st = fs.statSync(histPath);
+    const key = `${st.mtimeMs}:${st.size}`;
+    if (historyMapCache.key === key) {
+      return historyMapCache.map;
+    }
+
+    const map = new Map();
     const content = fs.readFileSync(histPath, 'utf8');
     const lines = content.split(/\r?\n/);
     for (let i = Math.max(0, lines.length - 250); i < lines.length; i++) {
@@ -151,8 +202,11 @@ function readHistoryMap(baseDir) {
         }
       } catch {}
     }
-  } catch {}
-  return map;
+    historyMapCache = { key, map };
+    return map;
+  } catch {
+    return historyMapCache.map;
+  }
 }
 
 const SLOT_MS = 15 * 60 * 1000; // Buckets de 15 minutos para ventanas móviles exactas (5h y 7d)
@@ -199,6 +253,8 @@ function parseTranscript(baseDir, convId) {
   let currentToolCall = null;
   let pendingQuestion = null;
   let lastActivityAt = stat.mtimeMs;
+  let lastPlannedCommandDaemon = false;
+  const activeBgTasks = new Map(); // taskId -> { taskId, detail, isDaemon, startedAt }
   const eightDaysAgo = Date.now() - 8 * 24 * 60 * 60 * 1000;
 
   for (let i = 0; i < lines.length; i++) {
@@ -226,6 +282,66 @@ function parseTranscript(baseDir, convId) {
       const cleanUser = (match ? match[1] : step.content).trim();
       if (cleanUser) lastUserPrompt = cleanUser.slice(0, 220);
       pendingQuestion = null;
+    }
+
+    if (step.type === 'GENERIC' && typeof step.content === 'string') {
+      const bgMatch = step.content.match(
+        /(?:Tool|Daemon task) is running (?:as a|in the) background (?:task )?with task id:\s*([^\s\r\n]+)/i
+      );
+      if (bgMatch) {
+        const taskId = bgMatch[1].trim();
+        const descMatch = step.content.match(/Task Description:\s*([^\r\n]+)/i);
+        const isDaemon =
+          lastPlannedCommandDaemon || /^Daemon task is running/i.test(step.content.trim());
+        activeBgTasks.set(taskId, {
+          taskId,
+          detail: descMatch ? descMatch[1].trim().slice(0, 110) : taskId,
+          isDaemon,
+          startedAt: stepTs
+        });
+      }
+
+      const cancelMatch = step.content.match(
+        /Task\s+"([^"]+)"\s+(?:cancelled|canceled|killed|completed|stopped)/i
+      );
+      if (cancelMatch) {
+        activeBgTasks.delete(cancelMatch[1].trim());
+      }
+
+      const statusMatch = step.content.match(
+        /Task:\s*([^\s\r\n]+)[\s\S]*?Status:\s*(RUNNING|COMPLETED|FAILED|CANCELLED|CANCELED|KILLED|DONE|EXITED)/i
+      );
+      if (statusMatch) {
+        const tId = statusMatch[1].trim();
+        const st = statusMatch[2].toUpperCase();
+        if (st === 'RUNNING') {
+          if (!activeBgTasks.has(tId)) {
+            activeBgTasks.set(tId, {
+              taskId: tId,
+              detail: tId,
+              isDaemon: false,
+              startedAt: stepTs
+            });
+          }
+        } else {
+          activeBgTasks.delete(tId);
+        }
+      }
+
+      if (/You have 0 background task\(s\) currently running/i.test(step.content)) {
+        activeBgTasks.clear();
+      }
+    }
+
+    if (step.type === 'SYSTEM_MESSAGE' && typeof step.content === 'string') {
+      const senderMatch = step.content.match(/\bsender=([^\s)\]]+)/i);
+      if (senderMatch) {
+        activeBgTasks.delete(senderMatch[1].trim());
+      }
+      const taskDoneMatch = step.content.match(/Task id\s+"([^"]+)"/i);
+      if (taskDoneMatch) {
+        activeBgTasks.delete(taskDoneMatch[1].trim());
+      }
     }
 
     if (step.type === 'PLANNER_RESPONSE') {
@@ -270,6 +386,28 @@ function parseTranscript(baseDir, convId) {
       }
 
       if (Array.isArray(step.tool_calls) && step.tool_calls.length > 0) {
+        lastPlannedCommandDaemon = step.tool_calls.some(
+          (t) =>
+            t &&
+            t.args &&
+            (t.args.IsDaemon === true ||
+              t.args.IsDaemon === 'true' ||
+              String(t.args.IsDaemon).toLowerCase() === 'true')
+        );
+
+        for (const tc of step.tool_calls) {
+          if (
+            tc &&
+            tc.name === 'manage_task' &&
+            tc.args &&
+            String(tc.args.Action || '').replace(/^["']+|["']+$/g, '') === 'kill' &&
+            tc.args.TaskId
+          ) {
+            const killedId = String(tc.args.TaskId).replace(/^["']+|["']+$/g, '').trim();
+            activeBgTasks.delete(killedId);
+          }
+        }
+
         const lastTool = step.tool_calls[step.tool_calls.length - 1];
         const toolName = lastTool.name || 'tool';
         let detail = '';
@@ -294,11 +432,15 @@ function parseTranscript(baseDir, convId) {
           pendingQuestion = null;
         }
       } else {
+        lastPlannedCommandDaemon = false;
         currentToolCall = null;
         pendingQuestion = null;
       }
     }
   }
+
+  const runningBgTasks = [...activeBgTasks.values()].filter((t) => !t.isDaemon);
+  const activeBgTask = runningBgTasks.length > 0 ? runningBgTasks[runningBgTasks.length - 1] : null;
 
   // Determinar estado detallado según los últimos pasos del transcript
   let transcriptState = 'idle'; // 'running' | 'waiting_approval' | 'waiting_input' | 'idle'
@@ -316,7 +458,7 @@ function parseTranscript(baseDir, convId) {
       lastStep.status === 'DONE' &&
       (!Array.isArray(lastStep.tool_calls) || lastStep.tool_calls.length === 0)
     ) {
-      transcriptState = 'waiting_input';
+      transcriptState = activeBgTask ? 'running' : 'waiting_input';
     } else if (
       lastStep.type === 'PLANNER_RESPONSE' &&
       Array.isArray(lastStep.tool_calls) &&
@@ -325,9 +467,10 @@ function parseTranscript(baseDir, convId) {
       transcriptState = pendingQuestion ? 'waiting_approval' : 'running';
     } else if (lastStep.type === 'GENERIC' && lastStep.status === 'DONE') {
       const ageMs = Date.now() - lastActivityAt;
-      transcriptState = ageMs < 60000 ? 'running' : 'waiting_input';
-    } else if (lastStep.type === 'USER_INPUT') {
-      transcriptState = 'running';
+      transcriptState = ageMs < 60000 || activeBgTask ? 'running' : 'waiting_input';
+    } else if (lastStep.type === 'USER_INPUT' || lastStep.type === 'SYSTEM_MESSAGE') {
+      const ageMs = Date.now() - lastActivityAt;
+      transcriptState = ageMs < 60000 || activeBgTask ? 'running' : 'waiting_input';
     }
   }
 
@@ -347,6 +490,8 @@ function parseTranscript(baseDir, convId) {
     lastUserPrompt,
     lastAssistantText,
     currentToolCall,
+    activeBgTasks: runningBgTasks,
+    activeBgTask,
     pendingQuestion,
     lastActivityAt,
     stepCount: lines.filter(Boolean).length
@@ -503,7 +648,8 @@ function collectAgyData(config = {}) {
     dbMap.set(row.conversation_id, row);
   }
 
-  const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const sevenDaysAgo = now - 7 * 24 * 60 * 60 * 1000;
   const candidateIds = new Set([...activeLocks.keys()]);
 
   for (const row of dbRows) {
@@ -516,16 +662,58 @@ function collectAgyData(config = {}) {
   const brainDir = path.join(baseDir, 'brain');
   if (fs.existsSync(brainDir)) {
     try {
-      for (const entry of fs.readdirSync(brainDir)) {
-        const trFile = path.join(brainDir, entry, '.system_generated', 'logs', 'transcript.jsonl');
-        if (fs.existsSync(trFile)) {
-          const st = fs.statSync(trFile);
-          if (st.mtimeMs >= sevenDaysAgo) {
-            candidateIds.add(entry);
+      const brainStat = fs.statSync(brainDir);
+      if (
+        brainStat.mtimeMs !== brainScanCache.mtimeMs ||
+        now - brainScanCache.checkedAt >= 30000 ||
+        brainScanCache.recentIds.length === 0
+      ) {
+        const recentIds = [];
+        for (const entry of fs.readdirSync(brainDir)) {
+          const trFile = path.join(brainDir, entry, '.system_generated', 'logs', 'transcript.jsonl');
+          if (fs.existsSync(trFile)) {
+            const st = fs.statSync(trFile);
+            if (st.mtimeMs >= sevenDaysAgo) {
+              recentIds.push(entry);
+            }
           }
         }
+        brainScanCache = { mtimeMs: brainStat.mtimeMs, checkedAt: now, recentIds };
+      }
+      for (const id of brainScanCache.recentIds) {
+        candidateIds.add(id);
       }
     } catch {}
+  }
+
+  // Verificar si los transcripts activos, locks, DB y configuración no cambiaron desde el último ciclo
+  const lockSigParts = [];
+  let hasRecentLiveActivity = false;
+  for (const [cid, linfo] of activeLocks.entries()) {
+    const trFile = path.join(baseDir, 'brain', cid, '.system_generated', 'logs', 'transcript.jsonl');
+    let trSig = '0:0';
+    try {
+      const st = fs.statSync(trFile);
+      trSig = `${st.mtimeMs}:${st.size}`;
+      if (now - st.mtimeMs < 90000) {
+        hasRecentLiveActivity = true;
+      }
+    } catch {}
+    lockSigParts.push(`${cid}:${linfo.lockMtimeMs}:${trSig}`);
+  }
+  const topCacheKey = [
+    settingsCache.key,
+    dbSummariesCache.key,
+    historyMapCache.key,
+    brainScanCache.mtimeMs,
+    lockSigParts.join(','),
+    config.agyFiveHourLimitM || 25,
+    config.agySevenDayLimitM || 100,
+    hasRecentLiveActivity ? Math.floor(now / 5000) : Math.floor(now / SLOT_MS)
+  ].join('|');
+
+  if (agyResultCache.data && agyResultCache.key === topCacheKey) {
+    return agyResultCache.data;
   }
 
   const sessions = [];
@@ -578,22 +766,40 @@ function collectAgyData(config = {}) {
     const dbStatus = (row && row.status) || '';
     const notFullyIdle = Boolean(row && Number(row.not_fully_idle) === 1);
     const isSubagent = Boolean(row && row.parent_conversation_id);
+    const childSubagents = dbRows.filter((r) => r.parent_conversation_id === convId);
+    const runningSubagents = childSubagents.filter(
+      (r) =>
+        Number(r.killed) !== 1 &&
+        (r.status === 'CASCADE_RUN_STATUS_RUNNING' || Number(r.not_fully_idle) === 1)
+    );
+    const hasActiveBgTaskFromTr = Boolean(
+      tr &&
+        tr.activeBgTask &&
+        (!row || notFullyIdle || Date.now() - (tr.activeBgTask.startedAt || tr.lastActivityAt || 0) < 15000)
+    );
+    const hasActiveBgWork =
+      notFullyIdle || runningSubagents.length > 0 || hasActiveBgTaskFromTr;
 
     let state = 'closed';
     if (isLocked) {
       if (tr && tr.transcriptState === 'waiting_approval') {
         state = 'waiting_approval';
-      } else if (dbStatus === 'CASCADE_RUN_STATUS_IDLE') {
-        state = 'waiting_input';
       } else if (
         dbStatus === 'CASCADE_RUN_STATUS_RUNNING' ||
-        (tr && tr.transcriptState === 'running')
+        hasActiveBgWork ||
+        (tr && tr.transcriptState === 'running' && (!row || notFullyIdle || Date.now() - tr.lastActivityAt < 15000))
       ) {
         state = 'running';
+      } else if (dbStatus === 'CASCADE_RUN_STATUS_IDLE') {
+        state = 'waiting_input';
       } else {
         state = 'waiting_input';
       }
-    } else if (dbStatus === 'CASCADE_RUN_STATUS_RUNNING' && tr && Date.now() - tr.lastActivityAt < 45000) {
+    } else if (
+      (dbStatus === 'CASCADE_RUN_STATUS_RUNNING' || hasActiveBgWork) &&
+      tr &&
+      Date.now() - tr.lastActivityAt < 45000
+    ) {
       state = 'running';
     }
 
@@ -610,8 +816,27 @@ function collectAgyData(config = {}) {
       lockInfo ? lockInfo.lockMtimeMs : 0
     );
 
-    const subagentsCount = dbRows.filter((r) => r.parent_conversation_id === convId).length;
-    const backgroundTasksCount = notFullyIdle && state === 'waiting_input' ? 1 : 0;
+    const subagentsCount = childSubagents.length;
+    const backgroundTasksCount =
+      (tr ? tr.activeBgTasksCount || 0 : 0) ||
+      runningSubagents.length ||
+      (notFullyIdle ? 1 : 0);
+
+    let currentAction = '';
+    if (state === 'running') {
+      if (tr && tr.currentToolCall) {
+        currentAction = `${tr.currentToolCall.name}${tr.currentToolCall.detail ? ': ' + tr.currentToolCall.detail : ''}`;
+      } else if (tr && tr.activeBgTask) {
+        currentAction = `⏳ Background: ${tr.activeBgTask.detail || 'comando en segundo plano'}`;
+      } else if (runningSubagents.length > 0) {
+        const subTitle = (runningSubagents[0].title || '').trim() || 'activo';
+        currentAction = `🤖 Subagente (${runningSubagents.length}): ${subTitle.slice(0, 60)}`;
+      } else if (notFullyIdle) {
+        currentAction = '⏳ Ejecutando tarea o comando en segundo plano...';
+      }
+    } else if (state === 'waiting_approval' && tr && tr.pendingQuestion) {
+      currentAction = `Pregunta: ${tr.pendingQuestion}`;
+    }
 
     if (isLocked || state !== 'closed' || Date.now() - updatedAt < 24 * 60 * 60 * 1000) {
       sessions.push({
@@ -639,12 +864,7 @@ function collectAgyData(config = {}) {
           (row && row.preview) ||
           (tr && tr.lastUserPrompt) ||
           '',
-        currentAction:
-          state === 'running' && tr && tr.currentToolCall
-            ? `${tr.currentToolCall.name}${tr.currentToolCall.detail ? ': ' + tr.currentToolCall.detail : ''}`
-            : state === 'waiting_approval' && tr && tr.pendingQuestion
-              ? `Pregunta: ${tr.pendingQuestion}`
-              : '',
+        currentAction,
         tokens: {
           input: (tr && tr.inputTokens) || 0,
           cacheRead: (tr && tr.cacheReadTokens) || 0,
@@ -669,11 +889,13 @@ function collectAgyData(config = {}) {
 
   const agyQuota = buildAgyQuota(slotAgg, settings, config);
 
-  return {
+  const result = {
     sessions,
     dailyTokens: dailyAgg,
     agyQuota
   };
+  agyResultCache = { key: topCacheKey, data: result };
+  return result;
 }
 
 module.exports = {

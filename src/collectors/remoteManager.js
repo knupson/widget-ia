@@ -4,19 +4,22 @@ const path = require('path');
 const { execFile } = require('child_process');
 
 class RemoteManager {
-  constructor({ config, saveConfig, onRemoteEvent }) {
+  constructor({ config, saveConfig, onRemoteEvent, onRemoteReplyCommand }) {
     this.config = config;
     this.saveConfig = saveConfig;
     this.onRemoteEvent = onRemoteEvent;
+    this.onRemoteReplyCommand = onRemoteReplyCommand;
 
     // Mapa de sesiones remotas: id -> sessionObject
     this.remoteSessions = new Map();
 
-    // Estado del stream ntfy.sh
+    // Estado del stream ntfy.sh y backoff exponencial por host SSH
     this.ntfyReq = null;
     this.ntfyConnected = false;
     this.ntfyReconnectTimer = null;
     this.sshPollTimer = null;
+    this.sshBackoff = new Map(); // target -> { failures, nextCheckAt, inFlight }
+    this.networkAddrCache = { checkedAt: 0, list: [] };
   }
 
   start() {
@@ -63,6 +66,10 @@ class RemoteManager {
             try {
               const evt = JSON.parse(line);
               if (evt.event === 'message' && evt.message) {
+                const tags = Array.isArray(evt.tags) ? evt.tags : [];
+                if (tags.includes('ai_pulse_outbound') || evt.title === 'AI Pulse 4G Listo') {
+                  continue;
+                }
                 let payload;
                 try {
                   payload = JSON.parse(evt.message);
@@ -72,6 +79,11 @@ class RemoteManager {
                     state: 'waiting_input',
                     message: evt.message
                   };
+                }
+                if (payload && payload.__fromAiPulseServer) continue;
+                if (payload && payload.type === 'remote_reply' && typeof this.onRemoteReplyCommand === 'function') {
+                  this.onRemoteReplyCommand(payload);
+                  continue;
                 }
                 this.ingestRemotePayload(payload, 'ntfy');
               }
@@ -181,6 +193,7 @@ class RemoteManager {
     );
     const effTok = Math.round(inTok + crTok * 0.1 + cwTok * 2 + outTok * 5);
 
+    const updatedAt = Number(payload.updatedAt) || Date.now();
     const sessionObj = {
       id: fullId,
       sessionId: rawSessionId,
@@ -196,7 +209,7 @@ class RemoteManager {
       title,
       projectName,
       workspace,
-      updatedAt: Date.now(),
+      updatedAt,
       turns: Number(payload.turns || (existing ? existing.turns + 1 : 1)),
       lastMessage: String(
         payload.message ||
@@ -212,7 +225,8 @@ class RemoteManager {
         cacheWrite: cwTok,
         output: outTok,
         total: totalTok,
-        effective: effTok
+        effective: effTok,
+        turns: Number(payload.turns || (existing ? existing.turns : 1))
       }
     };
 
@@ -235,15 +249,23 @@ class RemoteManager {
     setTimeout(() => this.pollAllSshHosts(), 3000);
   }
 
-  pollAllSshHosts() {
+  pollAllSshHosts(force = false) {
     const hosts = Array.isArray(this.config.sshHosts) ? this.config.sshHosts : [];
     for (const h of hosts) {
       if (!h || !h.enabled || !h.target) continue;
-      this.pollSingleSshHost(h);
+      this.pollSingleSshHost(h, force);
     }
   }
 
-  pollSingleSshHost(hostCfg) {
+  resetSshBackoff(target = null) {
+    if (target) {
+      this.sshBackoff.delete(String(target).trim());
+    } else {
+      this.sshBackoff.clear();
+    }
+  }
+
+  pollSingleSshHost(hostCfg, force = false) {
     const target = String(hostCfg.target || '').trim(); // ej. user@192.168.1.50
     // Prevenir inyección de opciones en OpenSSH (ej. targets que inicien con '-')
     if (!target || target.startsWith('-') || !/^[a-zA-Z0-9._-]+(@[a-zA-Z0-9._-]+)?$/.test(target)) {
@@ -251,6 +273,14 @@ class RemoteManager {
       hostCfg.lastError = 'Formato de host/usuario SSH inválido';
       return;
     }
+
+    const now = Date.now();
+    const bState = this.sshBackoff.get(target) || { failures: 0, nextCheckAt: 0, inFlight: false };
+    if (bState.inFlight) return;
+    if (!force && bState.nextCheckAt > now) return;
+
+    bState.inFlight = true;
+    this.sshBackoff.set(target, bState);
 
     const portNum = Number(hostCfg.port);
     const portArg = Number.isInteger(portNum) && portNum > 0 && portNum <= 65535 ? ['-p', String(portNum)] : [];
@@ -264,17 +294,134 @@ class RemoteManager {
         keyArg.push('-i', kp);
       }
     }
-    // Script bash compacto de solo lectura que inspecciona ~/.claude/sessions/*.json en el host remoto
-    const remoteCmd = `
-      HOST=$(hostname);
-      if [ -d "$HOME/.claude/sessions" ]; then
-        for f in "$HOME/.claude/sessions"/*.json; do
-          [ -e "$f" ] || continue;
-          cat "$f" 2>/dev/null | tr -d '\\n' | sed "s/}$/,\\"__host\\":\\"$HOST\\"}/";
-          echo "";
-        done
-      fi
-    `.trim();
+    // Script POSIX codificado en Base64 para compatibilidad total con cualquier login shell remoto (fish, bash, zsh, sh)
+    // Inspecciona tanto sesiones de Claude (~/.claude/sessions) como de Antigravity CLI (~/.gemini/antigravity-cli/brain)
+    const posixProbeScript = `
+if command -v python3 >/dev/null 2>&1; then
+  python3 - << 'PYEOF'
+import os, glob, json, time, socket, subprocess, re
+
+host = socket.gethostname()
+now = time.time()
+
+running_procs = ""
+try:
+    running_procs = subprocess.check_output(["ps", "-u", str(os.getuid()), "-o", "pid=,comm=,args="], text=True, stderr=subprocess.DEVNULL)
+except Exception:
+    pass
+
+has_agy_proc = bool(re.search(r"\\b(agy|antigravity|jetski)\\b", running_procs, re.I))
+
+for f in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
+    try:
+        mtime = os.path.getmtime(f)
+        if now - mtime > 86400:
+            continue
+        with open(f, "r", encoding="utf-8", errors="ignore") as fp:
+            data = json.load(fp)
+        pid = int(data.get("pid") or 0)
+        alive = False
+        if pid > 0:
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except Exception:
+                alive = False
+        st = "closed"
+        if alive:
+            st = "waiting_input" if data.get("status") == "idle" else "running"
+        print(json.dumps({
+            "__host": host,
+            "provider": "claude",
+            "sessionId": str(data.get("sessionId") or pid or os.path.basename(f)),
+            "title": data.get("name") or "Sesión Claude SSH",
+            "cwd": data.get("cwd") or "",
+            "state": st,
+            "updatedAt": int(mtime * 1000)
+        }))
+    except Exception:
+        pass
+
+brain_dirs = glob.glob(os.path.expanduser("~/.gemini/antigravity-cli/brain/*"))
+brain_dirs.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0, reverse=True)
+for idx, d in enumerate(brain_dirs[:10]):
+    tf = os.path.join(d, ".system_generated", "logs", "transcript.jsonl")
+    if not os.path.isfile(tf):
+        continue
+    try:
+        mtime = os.path.getmtime(tf)
+        if now - mtime > 86400:
+            continue
+        conv_id = os.path.basename(d)
+        in_tok = cr_tok = cw_tok = out_tok = turns = 0
+        title = ""
+        last_msg = ""
+        last_type = ""
+        last_status = ""
+        with open(tf, "r", encoding="utf-8", errors="ignore") as fp:
+            for line in fp:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                t = obj.get("type") or ""
+                last_type = t
+                last_status = obj.get("status") or ""
+                if t == "USER_INPUT":
+                    turns += 1
+                    if not title:
+                        raw = str(obj.get("content") or "")
+                        m = re.search(r"<USER_REQUEST>\\s*([\\s\\S]*?)\\s*</USER_REQUEST>", raw)
+                        txt = (m.group(1) if m else raw).strip().splitlines()[0] if (m or raw.strip()) else ""
+                        title = txt[:80]
+                elif t == "PLANNER_RESPONSE":
+                    in_tok += int(obj.get("input_tokens") or 0)
+                    cr_tok += int(obj.get("cache_read_tokens") or 0)
+                    cw_tok += int(obj.get("cache_creation_tokens") or 0)
+                    out_tok += int(obj.get("output_tokens") or 0)
+                    c = str(obj.get("content") or "").strip()
+                    if c:
+                        last_msg = c.splitlines()[0][:180]
+        is_recent_active = (idx == 0 and has_agy_proc and (now - mtime < 1800)) or (now - mtime < 45)
+        if is_recent_active:
+            st = "waiting_input" if (last_type == "PLANNER_RESPONSE" and last_status == "DONE") else "running"
+        else:
+            st = "closed"
+        print(json.dumps({
+            "__host": host,
+            "provider": "agy",
+            "sessionId": conv_id,
+            "title": title or f"AGY {conv_id[:8]}",
+            "cwd": "",
+            "state": st,
+            "updatedAt": int(mtime * 1000),
+            "turns": max(1, turns),
+            "message": last_msg,
+            "tokens": {
+                "input": in_tok,
+                "cacheRead": cr_tok,
+                "cacheWrite": cw_tok,
+                "output": out_tok
+            }
+        }))
+    except Exception:
+        pass
+PYEOF
+else
+  if [ -d "$HOME/.claude/sessions" ]; then
+    for f in "$HOME/.claude/sessions"/*.json; do
+      [ -e "$f" ] || continue
+      cat "$f" 2>/dev/null | tr -d '\\n\\r'
+      echo ""
+    done
+  fi
+fi
+`.trim();
+    const b64Script = Buffer.from(posixProbeScript, 'utf8').toString('base64');
+    const remoteCmd = `echo ${b64Script} | base64 -d | /bin/sh`;
 
     const args = [
       '-o', 'BatchMode=yes',
@@ -287,30 +434,62 @@ class RemoteManager {
       remoteCmd
     ];
 
-    execFile('ssh', args, { timeout: 8000 }, (err, stdout) => {
+    execFile('ssh', args, { timeout: 8000, windowsHide: true }, (err, stdout, stderr) => {
+      bState.inFlight = false;
+      const doneAt = Date.now();
       if (err) {
+        bState.failures = (bState.failures || 0) + 1;
+        // Backoff exponencial: <2 fallos -> 20s, 2 -> 60s, 3 -> 180s, >=4 -> 300s (5 min)
+        let delayMs = 20000;
+        if (bState.failures === 2) delayMs = 60000;
+        else if (bState.failures === 3) delayMs = 180000;
+        else if (bState.failures >= 4) delayMs = 300000;
+
+        bState.nextCheckAt = doneAt + delayMs;
+        this.sshBackoff.set(target, bState);
+
+        const cleanStderr = String(stderr || '')
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .filter(Boolean)
+          .pop();
         hostCfg.lastStatus = 'error';
-        hostCfg.lastError = err.message.slice(0, 120);
+        hostCfg.lastError = (cleanStderr || err.message || 'Error de conexión SSH').slice(0, 160);
+        hostCfg.nextRetryAt = bState.nextCheckAt;
+        if (typeof this.saveConfig === 'function') this.saveConfig();
         return;
       }
+
+      bState.failures = 0;
+      bState.nextCheckAt = doneAt + 20000;
+      this.sshBackoff.set(target, bState);
+
       hostCfg.lastStatus = 'ok';
       hostCfg.lastError = '';
-      hostCfg.lastCheckedAt = Date.now();
+      hostCfg.lastCheckedAt = doneAt;
+      hostCfg.nextRetryAt = null;
+      if (typeof this.saveConfig === 'function') this.saveConfig();
 
       const lines = String(stdout || '').split(/\r?\n/);
       for (const line of lines) {
         if (!line.trim().startsWith('{')) continue;
         try {
           const obj = JSON.parse(line.trim());
+          const hostName = hostCfg.label || obj.__host || target;
+          const isAgy = obj.provider === 'agy';
           this.ingestRemotePayload(
             {
-              host: hostCfg.label || obj.__host || target,
-              provider: 'claude',
-              sessionId: obj.sessionId || String(obj.pid),
-              title: obj.name || 'Sesión SSH',
-              cwd: obj.cwd || '',
-              state: obj.status === 'idle' ? 'waiting_input' : 'running',
-              message: `Monitoreado por SSH (${target})`
+              host: hostName,
+              provider: isAgy ? 'agy' : 'claude',
+              sessionId: obj.sessionId || String(obj.pid || 'ssh'),
+              title: obj.title || obj.name || (isAgy ? 'Sesión AGY SSH' : 'Sesión Claude SSH'),
+              projectName: hostName,
+              cwd: obj.cwd || `ssh://${target}`,
+              state: obj.state || (obj.status === 'idle' ? 'waiting_input' : 'running'),
+              updatedAt: obj.updatedAt || doneAt,
+              turns: obj.turns || 1,
+              message: obj.message || `Monitoreado por SSH (${target})`,
+              tokens: obj.tokens || undefined
             },
             'ssh'
           );
@@ -341,15 +520,33 @@ class RemoteManager {
    * Obtiene las IPs locales (LAN / Tailscale / VPN) para mostrar en el asistente de conexión remota
    */
   getLocalNetworkAddresses() {
+    const now = Date.now();
+    if (this.networkAddrCache.list.length > 0 && now - this.networkAddrCache.checkedAt < 60000) {
+      return this.networkAddrCache.list;
+    }
     const nets = os.networkInterfaces();
     const results = [];
     for (const [name, addrs] of Object.entries(nets)) {
       for (const addr of addrs || []) {
-        if (addr.family === 'IPv4' && !addr.internal) {
-          results.push({ interface: name, address: addr.address });
+        if (addr.family === 'IPv4' && !addr.internal && !addr.address.startsWith('169.254.')) {
+          const lowerName = name.toLowerCase();
+          const isVirtual =
+            lowerName.includes('vethernet') ||
+            lowerName.includes('wsl') ||
+            lowerName.includes('docker') ||
+            lowerName.includes('hyper-v') ||
+            lowerName.includes('virtual') ||
+            lowerName.includes('vbox') ||
+            lowerName.includes('vmware');
+          const isLan192 = addr.address.startsWith('192.168.');
+          const isLan10 = addr.address.startsWith('10.');
+          const priority = isVirtual ? 3 : isLan192 ? 0 : isLan10 ? 1 : 2;
+          results.push({ interface: name, address: addr.address, priority });
         }
       }
     }
+    results.sort((a, b) => a.priority - b.priority);
+    this.networkAddrCache = { checkedAt: now, list: results };
     return results;
   }
 
@@ -409,6 +606,54 @@ class RemoteManager {
       psRelayOneLiner,
       claudeRemoteHookJson
     };
+  }
+
+  /**
+   * Envía notificación push saliente por ntfy.sh al celular cuando una consola local termina o pide permiso
+   */
+  sendOutboundAlertPush(alertObj, mobileBaseUrl, authToken) {
+    if (!alertObj || alertObj.isRemote) return;
+    if (this.config.ntfyEnabled === false || !this.config.ntfyTopic) return;
+    if (this.config.ntfyPushLocalAlerts === false) return;
+
+    const topic = (this.config.ntfyTopic || '').trim();
+    if (!topic) return;
+
+    const isApproval = alertObj.alertType === 'waiting_approval';
+    const isBonus = alertObj.alertType === 'quota_reset';
+    const titlePrefix = isBonus ? '🎁 Cuota' : isApproval ? '⚠️ Permiso' : '✅ Lista';
+    const rawTitle = `${titlePrefix} [${alertObj.providerLabel || alertObj.provider}] ${alertObj.projectName || ''}`.trim();
+    // Header HTTP debe ser ASCII seguro
+    const safeAsciiTitle = rawTitle.replace(/[^\x20-\x7E]/g, '').trim() || 'AI Pulse Alert';
+
+    const headers = {
+      Title: safeAsciiTitle,
+      Priority: isApproval ? 'high' : 'default',
+      Tags: `${isApproval ? 'warning' : 'white_check_mark'},ai_pulse_outbound`
+    };
+
+    if (mobileBaseUrl) {
+      const clickUrl = `${mobileBaseUrl}/?session=${encodeURIComponent(alertObj.sessionId || '')}${
+        authToken ? `&token=${encodeURIComponent(authToken)}` : ''
+      }`;
+      headers.Click = clickUrl;
+    }
+
+    const bodyText = `${rawTitle}\n${alertObj.title || ''}\n${alertObj.message || ''}`.trim();
+
+    try {
+      const req = https.request(
+        `https://ntfy.sh/${encodeURIComponent(topic)}`,
+        {
+          method: 'POST',
+          headers
+        },
+        (res) => res.resume()
+      );
+      req.on('error', () => {});
+      req.write(bodyText);
+      req.end();
+    } catch {}
   }
 }
 

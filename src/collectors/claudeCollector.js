@@ -5,8 +5,15 @@ const v8 = require('v8');
 
 // Cache incremental por archivo JSONL y bases de Claude Desktop App
 const jsonlCache = new Map();
-let planUsageCache = { mtimeMs: 0, data: null };
-let desktopIdbCache = { key: '', data: null };
+const sessionFileCache = new Map();
+const projectFolderCache = new Map();
+let projectsRootCache = { mtimeMs: 0, folders: [] };
+let claudeJsonMetaCache = { key: '', data: null };
+let planUsageCache = { mtimeMs: '', data: null };
+let desktopScanCache = { checkedAt: 0, isAppOpen: false, ssFiles: [], idbLogFiles: [], rqBlobFiles: [], fileCacheKey: '' };
+let desktopIdbCache = { fileKey: '', allConvs: [], projectsMap: new Map(), resultKey: '', data: null };
+let sessionsDirCache = { mtimeMs: 0, files: [] };
+let claudeResultCache = { key: '', data: null };
 
 function getClaudeDir() {
   return path.join(os.homedir(), '.claude');
@@ -133,79 +140,105 @@ function unpackLevelDbWal(buf) {
  * Extrae las conversaciones abiertas y recientes de la App de Escritorio de Claude (%APPDATA%\Claude)
  */
 function collectClaudeDesktopSessions(appDataDir) {
-  const isAppOpen = isClaudeDesktopAppOpen(appDataDir);
-  const ssDir = path.join(appDataDir, 'Session Storage');
-  const lsDir = path.join(appDataDir, 'Local Storage', 'leveldb');
-  const idbDir = path.join(appDataDir, 'IndexedDB', 'https_claude.ai_0.indexeddb.leveldb');
-  const blobRootDir = path.join(appDataDir, 'IndexedDB', 'https_claude.ai_0.indexeddb.blob');
+  const now = Date.now();
+  const scanTtlMs = desktopScanCache.isAppOpen ? 10000 : 30000;
 
-  if (!fs.existsSync(idbDir) && !fs.existsSync(ssDir) && !fs.existsSync(lsDir)) {
-    return [];
-  }
+  let isAppOpen = desktopScanCache.isAppOpen;
+  let ssFiles = desktopScanCache.ssFiles;
+  let idbLogFiles = desktopScanCache.idbLogFiles;
+  let rqBlobFiles = desktopScanCache.rqBlobFiles;
+  let fileCacheKey = desktopScanCache.fileCacheKey;
 
-  // Construir firma de mtimes + ventana de 15s para refrescar estados por tiempo
-  let sigParts = [isAppOpen ? '1' : '0', String(Math.floor(Date.now() / 15000))];
-  const ssFiles = [];
-  for (const dir of [lsDir, ssDir]) {
-    if (fs.existsSync(dir)) {
+  if (!fileCacheKey || now - desktopScanCache.checkedAt >= scanTtlMs) {
+    isAppOpen = isClaudeDesktopAppOpen(appDataDir);
+    const ssDir = path.join(appDataDir, 'Session Storage');
+    const lsDir = path.join(appDataDir, 'Local Storage', 'leveldb');
+    const idbDir = path.join(appDataDir, 'IndexedDB', 'https_claude.ai_0.indexeddb.leveldb');
+    const blobRootDir = path.join(appDataDir, 'IndexedDB', 'https_claude.ai_0.indexeddb.blob');
+
+    if (!fs.existsSync(idbDir) && !fs.existsSync(ssDir) && !fs.existsSync(lsDir)) {
+      desktopScanCache = { checkedAt: now, isAppOpen, ssFiles: [], idbLogFiles: [], rqBlobFiles: [], fileCacheKey: 'empty' };
+      return [];
+    }
+
+    // Construir firma estrictamente por mtimeMs y size de archivos reales (sin invalidación por tiempo)
+    const sigParts = [];
+    ssFiles = [];
+    for (const dir of [lsDir, ssDir]) {
+      if (fs.existsSync(dir)) {
+        try {
+          for (const f of fs.readdirSync(dir)) {
+            if (f.endsWith('.log') || f.endsWith('.ldb')) {
+              const full = path.join(dir, f);
+              const st = fs.statSync(full);
+              ssFiles.push(full);
+              sigParts.push(`ss:${f}:${st.mtimeMs}:${st.size}`);
+            }
+          }
+        } catch {}
+      }
+    }
+
+    idbLogFiles = [];
+    if (fs.existsSync(idbDir)) {
       try {
-        for (const f of fs.readdirSync(dir)) {
-          if (f.endsWith('.log') || f.endsWith('.ldb')) {
-            const full = path.join(dir, f);
+        for (const f of fs.readdirSync(idbDir)) {
+          if (f.endsWith('.log')) {
+            const full = path.join(idbDir, f);
             const st = fs.statSync(full);
-            ssFiles.push(full);
-            sigParts.push(`ss:${f}:${st.mtimeMs}:${st.size}`);
+            idbLogFiles.push(full);
+            sigParts.push(`idb:${f}:${st.mtimeMs}:${st.size}`);
           }
         }
       } catch {}
     }
-  }
 
-  const idbLogFiles = [];
-  if (fs.existsSync(idbDir)) {
-    try {
-      for (const f of fs.readdirSync(idbDir)) {
-        if (f.endsWith('.log')) {
-          const full = path.join(idbDir, f);
-          const st = fs.statSync(full);
-          idbLogFiles.push(full);
-          sigParts.push(`idb:${f}:${st.mtimeMs}:${st.size}`);
-        }
-      }
-    } catch {}
-  }
-
-  const rqBlobFiles = [];
-  if (fs.existsSync(blobRootDir)) {
-    try {
-      for (const storeFolder of fs.readdirSync(blobRootDir)) {
-        const storePath = path.join(blobRootDir, storeFolder);
-        if (!fs.statSync(storePath).isDirectory()) continue;
-        for (const sub of fs.readdirSync(storePath)) {
-          const subPath = path.join(storePath, sub);
-          if (!fs.statSync(subPath).isDirectory()) continue;
-          for (const bf of fs.readdirSync(subPath)) {
-            const full = path.join(subPath, bf);
-            const st = fs.statSync(full);
-            if (st.size >= 400 && st.size <= 10 * 1024 * 1024) {
-              rqBlobFiles.push({ full, mtimeMs: st.mtimeMs, size: st.size });
-              sigParts.push(`blob:${storeFolder}/${sub}/${bf}:${st.mtimeMs}:${st.size}`);
+    rqBlobFiles = [];
+    if (fs.existsSync(blobRootDir)) {
+      try {
+        for (const storeFolder of fs.readdirSync(blobRootDir)) {
+          const storePath = path.join(blobRootDir, storeFolder);
+          if (!fs.statSync(storePath).isDirectory()) continue;
+          for (const sub of fs.readdirSync(storePath)) {
+            const subPath = path.join(storePath, sub);
+            if (!fs.statSync(subPath).isDirectory()) continue;
+            for (const bf of fs.readdirSync(subPath)) {
+              const full = path.join(subPath, bf);
+              const st = fs.statSync(full);
+              if (st.size >= 400 && st.size <= 10 * 1024 * 1024) {
+                rqBlobFiles.push({ full, mtimeMs: st.mtimeMs, size: st.size });
+                sigParts.push(`blob:${storeFolder}/${sub}/${bf}:${st.mtimeMs}:${st.size}`);
+              }
             }
           }
         }
-      }
-    } catch {}
+      } catch {}
+    }
+
+    fileCacheKey = sigParts.join('|') || 'empty';
+    desktopScanCache = {
+      checkedAt: now,
+      isAppOpen,
+      ssFiles,
+      idbLogFiles,
+      rqBlobFiles,
+      fileCacheKey
+    };
   }
 
-  const cacheKey = sigParts.join('|');
-  if (desktopIdbCache.data && desktopIdbCache.key === cacheKey) {
-    return desktopIdbCache.data;
+  if (fileCacheKey === 'empty') {
+    return [];
   }
 
-  const nodeV8Ver = v8.serialize(0)[1];
-  const convMap = new Map(); // uuid -> convMeta
-  const projectsMap = new Map(); // projectUuid -> projectName
-  const sessionActiveUuids = new Set(); // UUIDs activos en Session Storage actual
+  // Si los archivos en disco no cambiaron, reusar estructuras descomprimidas sin tocar LevelDB ni Snappy
+  let allConvs = desktopIdbCache.allConvs;
+  let projectsMap = desktopIdbCache.projectsMap;
+
+  if (desktopIdbCache.fileKey !== fileCacheKey) {
+    const nodeV8Ver = v8.serialize(0)[1];
+    const convMap = new Map(); // uuid -> convMeta
+    projectsMap = new Map(); // projectUuid -> projectName
+    const sessionActiveUuids = new Set(); // UUIDs activos en Session Storage actual
 
   // 1. Leer Local Storage y Session Storage (historial de navegación y snapshots del drawer)
   for (const full of ssFiles) {
@@ -439,14 +472,28 @@ function collectClaudeDesktopSessions(appDataDir) {
     } catch {}
   }
 
-  // Determinar cuáles conversaciones están "abiertas/activas" en la App de Escritorio
-  const allConvs = [...convMap.values()].sort((a, b) => {
-    const scoreA = Math.max(a.lastOpenedAt || 0, a.updatedAt || 0);
-    const scoreB = Math.max(b.lastOpenedAt || 0, b.updatedAt || 0);
-    return scoreB - scoreA;
-  });
+    // Determinar cuáles conversaciones están "abiertas/activas" en la App de Escritorio
+    allConvs = [...convMap.values()].sort((a, b) => {
+      const scoreA = Math.max(a.lastOpenedAt || 0, a.updatedAt || 0);
+      const scoreB = Math.max(b.lastOpenedAt || 0, b.updatedAt || 0);
+      return scoreB - scoreA;
+    });
 
-  const now = Date.now();
+    desktopIdbCache.fileKey = fileCacheKey;
+    desktopIdbCache.allConvs = allConvs;
+    desktopIdbCache.projectsMap = projectsMap;
+  }
+
+  // Verificar si alguna conversación tiene actividad en los últimos 6 minutos para evaluar expiración de estados en memoria
+  const hasRecentLiveActivity = allConvs.some((c) => {
+    const lastTs = Math.max(c.lastStartTs || 0, c.lastEndTs || 0, c.lastMsgUpdatedAt || 0);
+    return lastTs > 0 && now - lastTs < 6 * 60 * 1000;
+  });
+  const resultKey = `${fileCacheKey}:${isAppOpen ? '1' : '0'}:${hasRecentLiveActivity ? Math.floor(now / 15000) : 'stable'}`;
+  if (desktopIdbCache.data && desktopIdbCache.resultKey === resultKey) {
+    return desktopIdbCache.data;
+  }
+
   const desktopSessions = [];
 
   for (const c of allConvs) {
@@ -546,7 +593,8 @@ function collectClaudeDesktopSessions(appDataDir) {
     });
   }
 
-  desktopIdbCache = { key: cacheKey, data: desktopSessions };
+  desktopIdbCache.resultKey = resultKey;
+  desktopIdbCache.data = desktopSessions;
   return desktopSessions;
 }
 
@@ -569,16 +617,26 @@ function isPidAlive(pid) {
  */
 function readClaudeUtilizationMeta() {
   const claudeJsonPath = path.join(os.homedir(), '.claude.json');
-  const meta = {
+  const emptyMeta = {
     nextWeeklyResetAt: null,
     nextFiveHourResetAt: null,
     activePromo: null
   };
-  if (!fs.existsSync(claudeJsonPath)) return meta;
+  if (!fs.existsSync(claudeJsonPath)) return emptyMeta;
   try {
+    const st = fs.statSync(claudeJsonPath);
+    const cacheKey = `${st.mtimeMs}:${st.size}`;
+    if (claudeJsonMetaCache.data && claudeJsonMetaCache.key === cacheKey) {
+      return claudeJsonMetaCache.data;
+    }
+
+    const meta = { ...emptyMeta };
     const raw = JSON.parse(fs.readFileSync(claudeJsonPath, 'utf8'));
     const util = raw?.cachedUsageUtilization?.utilization;
-    if (!util) return meta;
+    if (!util) {
+      claudeJsonMetaCache = { key: cacheKey, data: meta };
+      return meta;
+    }
 
     if (util.seven_day?.resets_at) {
       const ts = Date.parse(util.seven_day.resets_at);
@@ -602,8 +660,11 @@ function readClaudeUtilizationMeta() {
         break;
       }
     }
-  } catch {}
-  return meta;
+    claudeJsonMetaCache = { key: cacheKey, data: meta };
+    return meta;
+  } catch {
+    return emptyMeta;
+  }
 }
 
 /**
@@ -632,7 +693,7 @@ function readPlanQuotaUsage() {
 
   try {
     const stat = fs.statSync(planPath);
-    const cacheBucket = `${stat.mtimeMs}:${Math.floor(Date.now() / 60000)}`;
+    const cacheBucket = `${stat.mtimeMs}:${stat.size}:${utilMeta.nextWeeklyResetAt || 0}:${utilMeta.nextFiveHourResetAt || 0}:${utilMeta.activePromo || ''}`;
     if (planUsageCache.data && planUsageCache.mtimeMs === cacheBucket) {
       return planUsageCache.data;
     }
@@ -803,26 +864,69 @@ function readActiveSessionFiles(claudeDir) {
   const map = new Map(); // sessionId -> sessionMeta
   if (!fs.existsSync(sessDir)) return map;
 
-  let files = [];
+  let files = sessionsDirCache.files;
+  let dirMtimeMs = 0;
   try {
-    files = fs.readdirSync(sessDir);
+    const dirStat = fs.statSync(sessDir);
+    dirMtimeMs = dirStat.mtimeMs;
+    if (dirMtimeMs !== sessionsDirCache.mtimeMs || files.length === 0) {
+      files = fs.readdirSync(sessDir).filter((f) => f.endsWith('.json'));
+      sessionsDirCache = { mtimeMs: dirMtimeMs, files };
+    }
   } catch {
     return map;
   }
 
+  const now = Date.now();
   for (const f of files) {
-    if (!f.endsWith('.json')) continue;
     const full = path.join(sessDir, f);
     try {
-      const obj = JSON.parse(fs.readFileSync(full, 'utf8'));
+      let cached = sessionFileCache.get(full);
+      // Si el directorio no cambió y la sesión ya estaba muerta hace más de 60s, evitar statSync/kill repetidos
+      if (
+        cached &&
+        cached.dirMtimeMs === dirMtimeMs &&
+        cached.isAlive === false &&
+        now - cached.mtimeMs > 60000
+      ) {
+        const obj = cached.obj;
+        if (obj && obj.sessionId && !map.has(obj.sessionId)) {
+          map.set(obj.sessionId, {
+            ...obj,
+            isAlive: false,
+            fileMtimeMs: cached.mtimeMs
+          });
+        }
+        continue;
+      }
+
+      const st = fs.statSync(full);
+      let obj = null;
+      let alive = false;
+      if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+        obj = cached.obj;
+        // Un PID muerto en un archivo sin cambios nunca revive; solo re-verificar PIDs que seguían vivos
+        alive = cached.isAlive ? isPidAlive(obj && obj.pid) : false;
+        cached.isAlive = alive;
+        cached.dirMtimeMs = dirMtimeMs;
+      } else {
+        obj = JSON.parse(fs.readFileSync(full, 'utf8'));
+        alive = isPidAlive(obj && obj.pid);
+        sessionFileCache.set(full, {
+          mtimeMs: st.mtimeMs,
+          size: st.size,
+          dirMtimeMs,
+          isAlive: alive,
+          obj
+        });
+      }
       if (!obj || !obj.sessionId) continue;
-      const alive = isPidAlive(obj.pid);
       const existing = map.get(obj.sessionId);
       if (!existing || alive || (obj.updatedAt || 0) > (existing.updatedAt || 0)) {
         map.set(obj.sessionId, {
           ...obj,
           isAlive: alive,
-          fileMtimeMs: fs.statSync(full).mtimeMs
+          fileMtimeMs: st.mtimeMs
         });
       }
     } catch {}
@@ -887,6 +991,8 @@ function parseClaudeJsonl(filePath) {
   let lastToolUse = null;
   let lastStopReason = '';
   let lastEventType = '';
+  let lastUserIsToolResult = false;
+  let activeBgCommand = null;
   let lastTimestampMs = stat.mtimeMs;
 
   const dailyTokens = {}; // YYYY-MM-DD -> { input, cacheRead, cacheWrite, output, total, effective, turns }
@@ -915,9 +1021,26 @@ function parseClaudeJsonl(filePath) {
     lastEventType = entry.type || lastEventType;
 
     if (entry.type === 'user' && entry.message) {
-      const txt = extractMessageText(entry.message.content);
-      if (txt && !txt.startsWith('<command-name>') && !txt.startsWith('[Request interrupted')) {
-        lastUserText = txt.replace(/\s+/g, ' ').slice(0, 220);
+      const contentArr = Array.isArray(entry.message.content) ? entry.message.content : [];
+      const hasToolResult = contentArr.some((b) => b && b.type === 'tool_result');
+      lastUserIsToolResult = hasToolResult;
+
+      if (hasToolResult) {
+        const resultText = JSON.stringify(contentArr);
+        if (
+          /Command running in background|running in the background|backgroundTaskId|Async agent launched/i.test(
+            resultText
+          )
+        ) {
+          activeBgCommand =
+            (lastToolUse && lastToolUse.detail) || 'Comando o subagente en segundo plano';
+        }
+      } else {
+        const txt = extractMessageText(entry.message.content);
+        if (txt && !txt.startsWith('<command-name>') && !txt.startsWith('[Request interrupted')) {
+          lastUserText = txt.replace(/\s+/g, ' ').slice(0, 220);
+        }
+        activeBgCommand = null;
       }
       lastToolUse = null;
     }
@@ -937,17 +1060,29 @@ function parseClaudeJsonl(filePath) {
         if (toolBlocks.length > 0) {
           const lastTb = toolBlocks[toolBlocks.length - 1];
           let detail = '';
+          let isBackground = false;
           if (lastTb.input) {
             detail =
               lastTb.input.description ||
               lastTb.input.command ||
               lastTb.input.file_path ||
               lastTb.input.pattern ||
+              lastTb.input.prompt ||
               '';
+            isBackground = Boolean(
+              lastTb.input.run_in_background ||
+                /^(Task|Agent|dispatch_agent|subagent)$/i.test(lastTb.name || '')
+            );
+          }
+          if (lastTb.name === 'KillShell' || lastTb.name === 'TaskStop') {
+            activeBgCommand = null;
+          } else if (lastTb.input && lastTb.input.run_in_background) {
+            activeBgCommand = String(detail || lastTb.name || 'Background').slice(0, 120);
           }
           lastToolUse = {
             name: lastTb.name || 'tool',
-            detail: String(detail).slice(0, 120)
+            detail: String(detail).slice(0, 120),
+            isBackground
           };
         } else if (msg.stop_reason === 'end_turn') {
           lastToolUse = null;
@@ -1032,6 +1167,8 @@ function parseClaudeJsonl(filePath) {
     lastToolUse,
     lastStopReason,
     lastEventType,
+    lastUserIsToolResult,
+    activeBgCommand,
     lastTimestampMs
   };
 
@@ -1052,32 +1189,94 @@ function collectClaudeData(hookStateOverrides = new Map()) {
   const jsonlFilesBySessionId = new Map();
 
   if (fs.existsSync(projectsDir)) {
-    let projFolders = [];
+    let projFolders = projectsRootCache.folders;
     try {
-      projFolders = fs.readdirSync(projectsDir);
+      const rootStat = fs.statSync(projectsDir);
+      if (rootStat.mtimeMs !== projectsRootCache.mtimeMs || projFolders.length === 0) {
+        projFolders = fs.readdirSync(projectsDir);
+        projectsRootCache = { mtimeMs: rootStat.mtimeMs, folders: projFolders };
+      }
     } catch {}
 
     for (const folder of projFolders) {
       const folderPath = path.join(projectsDir, folder);
-      let entries = [];
+      let folderRecord = projectFolderCache.get(folderPath);
+      let folderMtimeMs = 0;
       try {
-        entries = fs.readdirSync(folderPath);
+        folderMtimeMs = fs.statSync(folderPath).mtimeMs;
       } catch {
         continue;
       }
 
-      for (const entry of entries) {
-        if (!entry.endsWith('.jsonl')) continue;
-        const fullJsonl = path.join(folderPath, entry);
-        const sessId = entry.slice(0, -6);
+      if (!folderRecord || folderRecord.mtimeMs !== folderMtimeMs) {
+        const filesMap = new Map(); // sessId -> { fullJsonl, mtimeMs }
         try {
-          const st = fs.statSync(fullJsonl);
-          if (st.mtimeMs >= sevenDaysAgo || activeSessionsMap.has(sessId)) {
-            jsonlFilesBySessionId.set(sessId, fullJsonl);
+          const entries = fs.readdirSync(folderPath);
+          for (const entry of entries) {
+            if (!entry.endsWith('.jsonl')) continue;
+            const fullJsonl = path.join(folderPath, entry);
+            const sessId = entry.slice(0, -6);
+            try {
+              const st = fs.statSync(fullJsonl);
+              filesMap.set(sessId, { fullJsonl, mtimeMs: st.mtimeMs });
+            } catch {}
           }
-        } catch {}
+          folderRecord = { mtimeMs: folderMtimeMs, filesMap };
+          projectFolderCache.set(folderPath, folderRecord);
+        } catch {
+          continue;
+        }
+      }
+
+      for (const [sessId, info] of folderRecord.filesMap.entries()) {
+        if (info.mtimeMs >= sevenDaysAgo || activeSessionsMap.has(sessId)) {
+          jsonlFilesBySessionId.set(sessId, info.fullJsonl);
+        }
       }
     }
+  }
+
+  const desktopSessions = collectClaudeDesktopSessions(getClaudeAppDataDir());
+  const now = Date.now();
+  const aliveSigParts = [];
+  let hasRecentAliveActivity = false;
+
+  for (const [sessId, meta] of activeSessionsMap.entries()) {
+    if (!meta.isAlive) continue;
+    let jSig = '0:0';
+    let jMtime = 0;
+    const jPath = jsonlFilesBySessionId.get(sessId);
+    if (jPath) {
+      try {
+        const jSt = fs.statSync(jPath);
+        jSig = `${jSt.mtimeMs}:${jSt.size}`;
+        jMtime = jSt.mtimeMs;
+      } catch {}
+    }
+    const lastAct = Math.max(meta.updatedAt || 0, meta.fileMtimeMs || 0, jMtime);
+    if (now - lastAct < 10 * 60 * 1000) {
+      hasRecentAliveActivity = true;
+    }
+    aliveSigParts.push(`${sessId}:${meta.status || ''}:${meta.fileMtimeMs || 0}:${jSig}`);
+  }
+
+  const hookSigParts = [];
+  for (const [k, v] of hookStateOverrides.entries()) {
+    hookSigParts.push(`${k}:${v.state}:${v.timestamp}`);
+  }
+
+  const topCacheKey = [
+    sessionsDirCache.mtimeMs,
+    projectsRootCache.mtimeMs,
+    planUsageCache.mtimeMs,
+    desktopIdbCache.resultKey,
+    aliveSigParts.join(','),
+    hookSigParts.join(','),
+    hasRecentAliveActivity ? Math.floor(now / 3000) : Math.floor(now / 60000)
+  ].join('|');
+
+  if (claudeResultCache.data && claudeResultCache.key === topCacheKey) {
+    return claudeResultCache.data;
   }
 
   const dailyAgg = {};
@@ -1155,11 +1354,34 @@ function collectClaudeData(hookStateOverrides = new Map()) {
         parsed &&
         parsed.lastStopReason === 'tool_use' &&
         parsed.lastEventType === 'assistant' &&
-        Date.now() - parsed.lastTimestampMs < 120000
+        Date.now() - parsed.lastTimestampMs < 180000
       ) {
-        // Si se detuvo en tool_use hace más de 4 segundos sin avanzar, puede estar esperando confirmación de permiso
         const elapsed = Date.now() - parsed.lastTimestampMs;
-        state = elapsed > 4500 ? 'waiting_approval' : 'running';
+        if (parsed.lastToolUse && parsed.lastToolUse.isBackground) {
+          state = 'running';
+        } else {
+          state = elapsed > 6000 ? 'waiting_approval' : 'running';
+        }
+      } else if (
+        parsed &&
+        parsed.lastEventType === 'user' &&
+        parsed.lastUserIsToolResult &&
+        Date.now() - parsed.lastTimestampMs < 90000
+      ) {
+        state = 'running';
+      } else if (
+        parsed &&
+        parsed.lastEventType === 'user' &&
+        !parsed.lastUserIsToolResult &&
+        Date.now() - parsed.lastTimestampMs < 30000
+      ) {
+        state = 'running';
+      } else if (
+        parsed &&
+        parsed.activeBgCommand &&
+        Date.now() - parsed.lastTimestampMs < 10 * 60 * 1000
+      ) {
+        state = 'running';
       } else {
         state = 'waiting_input';
       }
@@ -1187,6 +1409,7 @@ function collectClaudeData(hookStateOverrides = new Map()) {
         isSubagent: false,
         state, // 'running' | 'waiting_approval' | 'waiting_input' | 'closed'
         stateLabel: stateLabelMap[state] || state,
+        backgroundTasksCount: parsed && parsed.activeBgCommand ? 1 : 0,
         title: sessionName,
         projectName,
         workspace,
@@ -1200,9 +1423,11 @@ function collectClaudeData(hookStateOverrides = new Map()) {
         currentAction:
           state === 'running' && parsed && parsed.lastToolUse
             ? `${parsed.lastToolUse.name}${parsed.lastToolUse.detail ? ': ' + parsed.lastToolUse.detail : ''}`
-            : state === 'waiting_approval' && parsed && parsed.lastToolUse
-              ? `Permiso requerido (${parsed.lastToolUse.name}): ${parsed.lastToolUse.detail}`
-              : '',
+            : state === 'running' && parsed && parsed.activeBgCommand
+              ? `⏳ Background: ${parsed.activeBgCommand}`
+              : state === 'waiting_approval' && parsed && parsed.lastToolUse
+                ? `Permiso requerido (${parsed.lastToolUse.name}): ${parsed.lastToolUse.detail}`
+                : '',
         tokens: {
           input: (parsed && parsed.inputTokens) || 0,
           cacheRead: (parsed && parsed.cacheReadTokens) || 0,
@@ -1217,7 +1442,6 @@ function collectClaudeData(hookStateOverrides = new Map()) {
   }
 
   // Incorporar las conversaciones activas y recientes de la App de Escritorio de Claude (%APPDATA%\Claude)
-  const desktopSessions = collectClaudeDesktopSessions(getClaudeAppDataDir());
   for (const ds of desktopSessions) {
     sessions.push(ds);
     if (ds.updatedAt >= sevenDaysAgo && ds.tokens && ds.tokens.total > 0) {
@@ -1251,12 +1475,14 @@ function collectClaudeData(hookStateOverrides = new Map()) {
     return b.updatedAt - a.updatedAt;
   });
 
-  return {
+  const result = {
     sessions,
     dailyTokens: dailyAgg,
     modelTokens: modelAgg,
     planQuota
   };
+  claudeResultCache = { key: topCacheKey, data: result };
+  return result;
 }
 
 module.exports = {

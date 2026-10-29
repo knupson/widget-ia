@@ -6,13 +6,45 @@
 (function () {
   const isElectron = Boolean(window.electronAPI);
   const urlParams = new URLSearchParams(window.location.search);
-  const isWebMode = urlParams.get('mode') === 'web' || !isElectron;
+  const isAndroidWidgetMode = urlParams.get('mode') === 'widget';
+  const isAndroidApp = urlParams.get('inApp') === '1' || /;\s*wv\)/i.test(navigator.userAgent || '');
+  const isWebMode = isAndroidWidgetMode || urlParams.get('mode') === 'web' || !isElectron;
+  let deepLinkSessionId = urlParams.get('session') || '';
+
+  // Token de autenticación remota (persiste en localStorage si se abrió con ?token=...)
+  let remoteAuthToken = urlParams.get('token') || '';
+  try {
+    if (remoteAuthToken) {
+      localStorage.setItem('aiPulseAuthToken', remoteAuthToken);
+    } else {
+      remoteAuthToken = localStorage.getItem('aiPulseAuthToken') || '';
+    }
+  } catch {}
+
+  // Registrar Service Worker para permitir instalar la PWA en Android
+  if ('serviceWorker' in navigator && !isElectron) {
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+  }
 
   let currentState = null;
   let activeFilter = 'open';
   let searchQuery = '';
   let activeTab = 'sessions';
   let audioCtx = null;
+
+  // Estado del modal de conversación en vivo y respuesta remota
+  let activeChatSessionId = null;
+  let chatPollTimer = null;
+  let urgentWidgetSession = null;
+
+  // Firmas de caché diferencial de DOM para evitar repintados sin cambios
+  let lastPillSig = '';
+  let lastSummarySig = '';
+  let lastSessionsSig = '';
+  let lastTokensSig = '';
+  let lastRemotesSig = '';
+  let lastSshListSig = '';
+  let editingSshIndex = null;
 
   // Consolas fijadas (Pin) guardadas en localStorage
   let pinnedIds = new Set();
@@ -30,17 +62,27 @@
     try {
       localStorage.setItem('aiPulsePinned', JSON.stringify([...pinnedIds]));
     } catch {}
+    lastSessionsSig = '';
     if (currentState) renderSessionsList(currentState);
   }
 
   // Inicializar modo visual del body de forma 100% segura
   try {
-    if (isWebMode) {
+    if (isAndroidWidgetMode) {
+      document.body.classList.remove('mode-pill', 'mode-expanded', 'mode-web');
+      document.body.classList.add('mode-android-widget');
+      document.getElementById('android-widget-view')?.classList.remove('hidden');
+    } else if (isWebMode) {
       document.body.classList.remove('mode-pill', 'mode-expanded');
       document.body.classList.add('mode-web');
+      if (isAndroidApp) {
+        document.body.classList.add('in-android-app');
+      }
       document.getElementById('btn-collapse-pill')?.classList.add('hidden');
       document.getElementById('btn-hide-tray')?.classList.add('hidden');
       document.getElementById('btn-open-web')?.classList.add('hidden');
+      document.getElementById('btn-toggle-pin')?.classList.add('hidden');
+      document.getElementById('btn-quit-app')?.classList.add('hidden');
     } else if (window.electronAPI) {
       const getModeFn = window.electronAPI.getMode || window.electronAPI.getWindowMode;
       if (typeof getModeFn === 'function') {
@@ -59,8 +101,12 @@
 
   function applyWindowModeClass(mode) {
     if (isWebMode) return;
+    const isExpanded = mode === 'expanded';
     document.body.classList.remove('mode-pill', 'mode-expanded');
-    document.body.classList.add(mode === 'expanded' ? 'mode-expanded' : 'mode-pill');
+    document.body.classList.add(isExpanded ? 'mode-expanded' : 'mode-pill');
+    if (isExpanded && currentState) {
+      renderAll(currentState);
+    }
   }
 
   async function requestWindowMode(mode) {
@@ -206,29 +252,86 @@
     } catch {}
   }
 
-  async function apiPost(endpoint, body = {}) {
+  function withAuthUrl(endpoint) {
+    if (!remoteAuthToken) return endpoint;
+    const sep = endpoint.includes('?') ? '&' : '?';
+    return `${endpoint}${sep}token=${encodeURIComponent(remoteAuthToken)}`;
+  }
+
+  function showAuthModal() {
+    document.getElementById('auth-modal')?.classList.remove('hidden');
+    document.getElementById('auth-token-input')?.focus();
+  }
+
+  async function apiGet(endpoint) {
     try {
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      });
+      const headers = {};
+      if (remoteAuthToken) headers['X-Auth-Token'] = remoteAuthToken;
+      const res = await fetch(withAuthUrl(endpoint), { headers });
+      if (res.status === 401) {
+        showAuthModal();
+        return { ok: false, unauthorized: true };
+      }
       return await res.json();
     } catch (e) {
       return { ok: false, error: e.message };
     }
   }
 
-  // Salta directamente a la primera consola que esté esperando respuesta o permiso
+  async function apiPost(endpoint, body = {}) {
+    try {
+      const headers = { 'Content-Type': 'application/json' };
+      if (remoteAuthToken) headers['X-Auth-Token'] = remoteAuthToken;
+      const res = await fetch(withAuthUrl(endpoint), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body)
+      });
+      if (res.status === 401) {
+        showAuthModal();
+        return { ok: false, unauthorized: true };
+      }
+      return await res.json();
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  }
+
+  // Salta directamente a la consola que esté esperando respuesta o permiso (y cicla entre ellas si hay varias)
+  let lastJumpedSessionId = null;
+  let lastJumpedAt = 0;
+
   async function jumpToFirstReadySession() {
     if (!currentState || !Array.isArray(currentState.sessions)) return;
-    const target = currentState.sessions.find(
-      (s) => s.isOpen && !s.isRemote && (s.state === 'waiting_approval' || s.state === 'waiting_input')
-    );
-    if (!target) {
-      showToast('No hay consolas locales esperando respuesta');
+    const readyList = currentState.sessions
+      .filter((s) => s.isOpen && (s.state === 'waiting_approval' || s.state === 'waiting_input'))
+      .sort((a, b) => {
+        if (a.state !== b.state) return a.state === 'waiting_approval' ? -1 : 1;
+        return (b.updatedAt || 0) - (a.updatedAt || 0);
+      });
+
+    if (readyList.length === 0) {
+      showToast('No hay consolas esperando respuesta');
       return;
     }
+
+    let target = readyList[0];
+    if (readyList.length > 1 && lastJumpedSessionId && Date.now() - lastJumpedAt < 10000) {
+      const prevIdx = readyList.findIndex((s) => s.id === lastJumpedSessionId);
+      if (prevIdx >= 0) {
+        target = readyList[(prevIdx + 1) % readyList.length];
+      }
+    }
+    lastJumpedSessionId = target.id;
+    lastJumpedAt = Date.now();
+
+    if (!isElectron) {
+      openChatModalById(target.id);
+      return;
+    }
+    const idxLabel =
+      readyList.length > 1 ? ` (${readyList.indexOf(target) + 1}/${readyList.length})` : '';
+    showToast(`🎯 Enfocando ${target.projectName || target.title}${idxLabel}`);
     await apiPost('/api/sessions/focus', {
       id: target.id,
       sessionId: target.sessionId || target.id,
@@ -238,7 +341,6 @@
       workspace: target.workspace || '',
       title: target.projectName || target.title || ''
     });
-    showToast(`🎯 Enfocando ${target.projectName || target.title}`);
   }
 
   function fmtDateTimeShort(ts) {
@@ -443,6 +545,33 @@
     const sum = data.summary || {};
     const clQuota = resolveClaudeQuota(data);
     const agyQuota = resolveAgyQuota(data);
+
+    const pillSig = [
+      sum.waitingInput || 0,
+      sum.waitingApproval || 0,
+      sum.running || 0,
+      sum.unreadAlertsCount || 0,
+      sum.totalOpen || 0,
+      clQuota.fiveHourPct,
+      clQuota.sevenDayPct,
+      clQuota.nextFiveHourResetAt || 0,
+      clQuota.nextWeeklyResetAt || 0,
+      clQuota.lastBonusReset ? clQuota.lastBonusReset.timestamp : 0,
+      agyQuota.available ? 1 : 0,
+      agyQuota.fiveHourPct,
+      agyQuota.sevenDayPct,
+      agyQuota.nextFiveHourResetAt || 0,
+      agyQuota.nextWeeklyResetAt || 0,
+      agyQuota.burnRatePerHour || 0,
+      agyQuota.cacheHitPct || 0,
+      data.config && data.config.soundEnabled ? 1 : 0,
+      data.config && data.config.alwaysOnTop !== false ? 1 : 0,
+      Math.floor(Date.now() / 60000)
+    ].join('|');
+
+    if (pillSig === lastPillSig) return;
+    lastPillSig = pillSig;
+
     const pillView = document.getElementById('pill-view');
     const orb = document.getElementById('pill-orb');
     const headerOrb = document.getElementById('header-orb');
@@ -464,25 +593,29 @@
     document.getElementById('pill-btn-jump')?.classList.toggle('hidden', waitingTotal === 0);
     document.getElementById('btn-jump-ready')?.classList.toggle('hidden', waitingTotal === 0);
 
-    // Estado del orbe y resplandor
-    pillView.classList.remove('glow-green', 'glow-amber');
-    orb.className = 'pill-orb';
-    headerOrb.className = 'header-orb';
-
+    // Estado del orbe y resplandor sin reiniciar clases si no cambiaron
+    let targetGlow = '';
+    let targetOrbState = '';
     if ((sum.waitingApproval || 0) > 0) {
-      pillView.classList.add('glow-amber');
-      orb.classList.add('state-approval');
-      headerOrb.classList.add('state-approval');
+      targetGlow = 'glow-amber';
+      targetOrbState = 'state-approval';
     } else if ((sum.unreadAlertsCount || 0) > 0 || (sum.waitingInput || 0) > 0) {
       if ((sum.unreadAlertsCount || 0) > 0) {
-        pillView.classList.add('glow-green');
+        targetGlow = 'glow-green';
       }
-      orb.classList.add('state-ready');
-      headerOrb.classList.add('state-ready');
+      targetOrbState = 'state-ready';
     } else if ((sum.running || 0) > 0) {
-      orb.classList.add('state-running');
-      headerOrb.classList.add('state-running');
+      targetOrbState = 'state-running';
     }
+
+    pillView.classList.toggle('glow-amber', targetGlow === 'glow-amber');
+    pillView.classList.toggle('glow-green', targetGlow === 'glow-green');
+
+    const nextOrbClass = targetOrbState ? `pill-orb ${targetOrbState}` : 'pill-orb';
+    if (orb.className !== nextOrbClass) orb.className = nextOrbClass;
+
+    const nextHeaderOrbClass = targetOrbState ? `header-orb ${targetOrbState}` : 'header-orb';
+    if (headerOrb.className !== nextHeaderOrbClass) headerOrb.className = nextHeaderOrbClass;
 
     // Cuota Claude en Píldora
     const clFh = clQuota.fiveHourPct != null ? clQuota.fiveHourPct : 0;
@@ -503,7 +636,7 @@
     const bonusR = clQuota.lastBonusReset;
     if (clResetTimer) {
       const primaryReset = clQuota.nextFiveHourResetAt || clQuota.nextWeeklyResetAt;
-      clResetTimer.textContent = primaryReset ? `⏳${fmtCountdownShort(primaryReset)}` : '';
+      clResetTimer.textContent = primaryReset ? `⏳${fmtCountdownShort(primaryReset).replace(/\s+/g, '')}` : '';
     }
     if (clResetBadge) {
       if (bonusR) {
@@ -542,7 +675,7 @@
     const agyResetTimer = document.getElementById('pill-agy-reset-timer');
     if (agyResetTimer) {
       const agyReset = agyQuota.nextFiveHourResetAt || agyQuota.nextWeeklyResetAt;
-      agyResetTimer.textContent = agyReset ? `⏳${fmtCountdownShort(agyReset)}` : '';
+      agyResetTimer.textContent = agyReset ? `⏳${fmtCountdownShort(agyReset).replace(/\s+/g, '')}` : '';
     }
 
     const pillAgyBox = document.getElementById('pill-agy-box');
@@ -560,6 +693,22 @@
     const soundIcon = data.config && data.config.soundEnabled ? '🔊' : '🔇';
     document.getElementById('pill-btn-sound').textContent = soundIcon;
     document.getElementById('btn-toggle-sound').textContent = soundIcon;
+
+    // Estado rápido de Siempre Encima (Always on Top)
+    const isTop = !(data.config && data.config.alwaysOnTop === false);
+    const pinTitle = isTop
+      ? 'Siempre encima (Always on Top: ACTIVO) · Clic para desactivar'
+      : 'Siempre encima (Always on Top: DESACTIVADO) · Clic para activar';
+    for (const id of ['pill-btn-pin', 'btn-toggle-pin']) {
+      const btn = document.getElementById(id);
+      if (btn) {
+        btn.classList.toggle('pin-on', isTop);
+        btn.classList.toggle('pin-off', !isTop);
+        btn.title = pinTitle;
+      }
+    }
+    const cfgTopEl = document.getElementById('cfg-always-top');
+    if (cfgTopEl) cfgTopEl.checked = isTop;
 
     // Botón de marcar alertas como vistas
     const btnAckAll = document.getElementById('btn-ack-all');
@@ -580,7 +729,7 @@
     if (burnChip) {
       const rate = agyQuota.burnRatePerHour || 0;
       const cacheHit = agyQuota.cacheHitPct || 0;
-      burnChip.textContent = `🔥 ${fmtNumber(rate)}/h · ⚡ ${cacheHit}% caché`;
+      burnChip.textContent = `🔥 ${fmtNumber(rate)}/h · ⚡ ${cacheHit}%`;
     }
   }
 
@@ -592,6 +741,31 @@
     const clQuota = resolveClaudeQuota(data);
     const agyQuota = resolveAgyQuota(data);
     const analytics = data.analytics || {};
+
+    const summarySig = [
+      sum.waitingInput || 0,
+      sum.waitingApproval || 0,
+      sum.running || 0,
+      sum.totalOpen || 0,
+      sum.remoteOpen || 0,
+      clQuota.fiveHourPct,
+      clQuota.sevenDayPct,
+      clQuota.nextFiveHourResetAt || 0,
+      clQuota.nextWeeklyResetAt || 0,
+      agyQuota.available ? 1 : 0,
+      agyQuota.fiveHourPct,
+      agyQuota.sevenDayPct,
+      agyQuota.nextFiveHourResetAt || 0,
+      agyQuota.nextWeeklyResetAt || 0,
+      agyQuota.model || '',
+      analytics.weekly?.combined?.total || 0,
+      analytics.weekly?.combined?.cacheRead || 0,
+      analytics.today?.combined?.total || 0,
+      Math.floor(Date.now() / 60000)
+    ].join('|');
+
+    if (summarySig === lastSummarySig) return;
+    lastSummarySig = summarySig;
 
     // KPI 1: Consolas
     const waitingTotal = (sum.waitingInput || 0) + (sum.waitingApproval || 0);
@@ -732,6 +906,27 @@
       return b.updatedAt - a.updatedAt;
     });
 
+    const sessionsSig = JSON.stringify({
+      activeFilter,
+      q,
+      pins: [...pinnedIds],
+      timeBucket: Math.floor(Date.now() / 30000),
+      items: filtered.map((s) => [
+        s.id,
+        s.state,
+        s.isOpen,
+        s.hasUnreadAlert,
+        s.updatedAt,
+        s.currentAction,
+        s.subagentsCount,
+        s.backgroundTasksCount,
+        s.tokens && s.tokens.total,
+        s.tokens && s.tokens.turns
+      ])
+    });
+    if (sessionsSig === lastSessionsSig) return;
+    lastSessionsSig = sessionsSig;
+
     if (filtered.length === 0) {
       container.innerHTML = `
         <div class="section-card" style="text-align:center; padding: 18px 10px;">
@@ -822,6 +1017,7 @@
               <span class="sr-time">${fmtRelativeTime(s.updatedAt)}</span>
 
               <div class="sr-actions">
+                <button class="btn-row-icon btn-chat" data-action="chat" data-id="${escapeHtml(s.id)}" title="Ver conversación en vivo y responder remotamente">💬</button>
                 <button class="btn-row-icon ${isPinned ? 'pinned-active' : ''}" data-action="pin" data-id="${escapeHtml(s.id)}" title="${isPinned ? 'Desfijar consola' : 'Fijar consola arriba'}">📌</button>
                 ${
                   s.hasUnreadAlert
@@ -1133,10 +1329,126 @@
   // =========================================================
   // RENDERIZADO: PESTAÑA 3 (REMOTOS Y HOOKS) Y PESTAÑA 4 (AJUSTES)
   // =========================================================
+  let activeQrMode = null; // 'app' | 'widget' | null
+  let lastQrEncodedUrl = '';
+
+  function resolveMobileUrls(data) {
+    const d = data || currentState || {};
+    const mob = d.mobileAccess || {};
+    const rem = d.remoteSetup || {};
+    const cfg = d.config || {};
+    const port = cfg.port || window.location.port || 19876;
+    const token = cfg.remoteAuthToken || remoteAuthToken || '';
+    const tokenSuffix = token ? `&token=${encodeURIComponent(token)}` : '';
+
+    const lanIp =
+      mob.lanIp ||
+      (Array.isArray(rem.localIps) && rem.localIps.length > 0 ? rem.localIps[0].address : '');
+    const fallbackBase = lanIp ? `http://${lanIp}:${port}` : window.location.origin;
+
+    const lanAppUrl =
+      mob.lanAppUrl || mob.lanUrl || `${fallbackBase}/?mode=web${tokenSuffix}`;
+    const lanWidgetUrl =
+      mob.lanWidgetUrl || `${fallbackBase}/?mode=widget${tokenSuffix}`;
+    const tunnelAppUrl = mob.tunnelAppUrl || mob.tunnelUrl || '';
+    const tunnelWidgetUrl = mob.tunnelWidgetUrl || '';
+
+    const activeAppUrl =
+      mob.activeAppUrl || mob.activeUrl || tunnelAppUrl || lanAppUrl;
+    const activeWidgetUrl =
+      mob.activeWidgetUrl || tunnelWidgetUrl || lanWidgetUrl;
+    const activeBase = (mob.tunnel && mob.tunnel.publicUrl) || fallbackBase;
+    const activeApkUrl = `${activeBase}/ai-pulse.apk`;
+
+    return {
+      lanIp,
+      lanAppUrl,
+      lanWidgetUrl,
+      tunnelAppUrl,
+      tunnelWidgetUrl,
+      activeAppUrl,
+      activeWidgetUrl,
+      activeApkUrl
+    };
+  }
+
+  function updateQrBoxIfOpen(urls) {
+    const qrBox = document.getElementById('mobile-qr-container');
+    const qrImg = document.getElementById('mobile-qr-img');
+    const qrTitle = document.getElementById('mobile-qr-title');
+    const qrCap = document.getElementById('mobile-qr-caption');
+    if (!qrBox || !qrImg || !activeQrMode || qrBox.classList.contains('hidden')) return;
+
+    const targetUrl =
+      activeQrMode === 'apk'
+        ? urls.activeApkUrl
+        : activeQrMode === 'widget'
+        ? urls.activeWidgetUrl
+        : urls.activeAppUrl;
+    const label =
+      activeQrMode === 'apk'
+        ? 'QR: Descargar AI-Pulse.apk (App + Widget Nativo Android)'
+        : activeQrMode === 'widget'
+        ? 'QR: Vista Mini-Widget (?mode=widget)'
+        : 'QR: App Completa + Responder (Android)';
+    if (qrTitle) qrTitle.textContent = label;
+    if (qrCap) qrCap.textContent = targetUrl;
+    if (targetUrl && targetUrl !== lastQrEncodedUrl) {
+      lastQrEncodedUrl = targetUrl;
+      qrImg.src = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&margin=8&data=${encodeURIComponent(targetUrl)}`;
+    }
+  }
+
   function renderRemotesAndSettings(data) {
     const hooks = data.hooksStatus || {};
     const rem = data.remoteSetup || {};
     const cfg = data.config || {};
+    const mob = data.mobileAccess || {};
+    const tun = mob.tunnel || {};
+    const urls = resolveMobileUrls(data);
+
+    // Estado de Acceso Celular Android (Wi-Fi + 4G Cloudflare Tunnel)
+    const chkTunnel = document.getElementById('chk-tunnel-4g');
+    const chkNtfyPush = document.getElementById('chk-ntfy-push-local');
+    const tunBadge = document.getElementById('tunnel-status-badge');
+    const tunSub = document.getElementById('tunnel-status-sub');
+    const appUrlEl = document.getElementById('mobile-app-url');
+    const widUrlEl = document.getElementById('mobile-widget-url');
+    const apkUrlEl = document.getElementById('mobile-apk-url');
+
+    if (chkTunnel) chkTunnel.checked = Boolean(tun.enabled || tun.status === 'running' || tun.status === 'starting');
+    if (chkNtfyPush) chkNtfyPush.checked = cfg.ntfyPushLocalAlerts !== false;
+
+    if (tunBadge) {
+      if (tun.status === 'running' && tun.publicUrl) {
+        tunBadge.textContent = '🌐 4G + Wi-Fi Activo';
+        tunBadge.className = 'badge-pill badge-ok';
+      } else if (tun.status === 'starting') {
+        tunBadge.textContent = '⏳ Iniciando túnel 4G...';
+        tunBadge.className = 'badge-pill badge-ochre';
+      } else if (tun.status === 'error') {
+        tunBadge.textContent = '⚠️ Error Túnel';
+        tunBadge.className = 'badge-pill badge-error';
+      } else {
+        tunBadge.textContent = urls.lanIp ? `📶 Wi-Fi (${urls.lanIp})` : '📶 Solo Wi-Fi LAN';
+        tunBadge.className = 'badge-pill';
+      }
+    }
+
+    if (tunSub) {
+      if (tun.status === 'running' && tun.publicUrl) {
+        tunSub.textContent = `Túnel 4G activo (${tun.publicUrl}) · Wi-Fi local: ${urls.lanIp || 'LAN'}:${cfg.port || 19876}`;
+      } else if (tun.status === 'error' && tun.lastError) {
+        tunSub.textContent = `Error túnel 4G: ${tun.lastError} · Usando IP Wi-Fi local (${urls.lanIp || 'LAN'})`;
+      } else {
+        tunSub.textContent = `En Wi-Fi usa tu IP local (${urls.lanIp || 'LAN'}:${cfg.port || 19876}). Activá este switch para entrar también por 4G sin VPN.`;
+      }
+    }
+
+    if (appUrlEl) appUrlEl.textContent = urls.activeAppUrl;
+    if (widUrlEl) widUrlEl.textContent = urls.activeWidgetUrl;
+    if (apkUrlEl) apkUrlEl.textContent = urls.activeApkUrl;
+    updateQrBoxIfOpen(urls);
 
     const chkClaude = document.getElementById('chk-hook-claude');
     const chkAgy = document.getElementById('chk-hook-agy');
@@ -1169,32 +1481,74 @@
     const sshList = document.getElementById('ssh-hosts-list');
     const hosts = cfg.sshHosts || [];
     if (sshList) {
-      if (hosts.length === 0) {
-        sshList.innerHTML = `<div class="muted-xs">No hay hosts SSH agregados. Usá el Modo 1 (arriba) si no tenés SSH.</div>`;
-      } else {
-        sshList.innerHTML = hosts
-          .map((h, idx) => {
-            const keyName = h.keyPath
-              ? String(h.keyPath).split(/[\\/]/).filter(Boolean).pop() || h.keyPath
-              : '';
-            const keyBadge = keyName
-              ? `<span class="ssh-key-badge" title="Llave privada: ${escapeHtml(h.keyPath)}">🔑 ${escapeHtml(keyName)}</span>`
-              : '';
-            return `
-          <div class="ssh-item">
-            <div style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+      if (editingSshIndex !== null && editingSshIndex >= hosts.length) {
+        editingSshIndex = null;
+      }
+      const sshSig = JSON.stringify({
+        editingSshIndex,
+        hosts: hosts.map((h) => [
+          h.label,
+          h.target,
+          h.port,
+          h.keyPath,
+          h.enabled,
+          h.lastStatus,
+          h.lastError
+        ])
+      });
+      if (sshSig !== lastSshListSig) {
+        lastSshListSig = sshSig;
+        if (hosts.length === 0) {
+          sshList.innerHTML = `<div class="muted-xs">No hay hosts SSH agregados. Usá el Modo 1 (arriba) si no tenés SSH.</div>`;
+        } else {
+          sshList.innerHTML = hosts
+            .map((h, idx) => {
+              const isEditing = editingSshIndex === idx;
+              const keyName = h.keyPath
+                ? String(h.keyPath).split(/[\\/]/).filter(Boolean).pop() || h.keyPath
+                : '';
+              const keyBadge = keyName
+                ? `<span class="ssh-key-badge" title="Llave privada: ${escapeHtml(h.keyPath)}">🔑 ${escapeHtml(keyName)}</span>`
+                : '';
+              const statusClass =
+                h.lastStatus === 'ok'
+                  ? 'badge-ok'
+                  : h.lastStatus === 'error'
+                  ? 'badge-error'
+                  : '';
+              const statusLabel =
+                h.lastStatus === 'ok'
+                  ? 'Conectado'
+                  : h.lastStatus === 'error'
+                  ? 'Error SSH'
+                  : 'Pendiente';
+              const statusTitle =
+                h.lastStatus === 'error' && h.lastError
+                  ? `Error SSH: ${h.lastError}`
+                  : h.lastStatus === 'ok'
+                  ? 'Conexión SSH activa'
+                  : 'Verificando conexión SSH...';
+              return `
+          <div class="ssh-item ${isEditing ? 'is-editing' : ''}" data-index="${idx}">
+            <div class="ssh-item-info" data-action="edit-ssh" data-index="${idx}" title="Clic para editar este host SSH${h.lastError ? '\nÚltimo estado: ' + h.lastError : ''}">
               <strong>${escapeHtml(h.label || h.target)}</strong>
               <span class="muted-xs"> (${escapeHtml(h.target)}:${h.port || 22})</span>
               ${keyBadge}
-              <span class="badge-pill ${h.lastStatus === 'ok' ? 'badge-ok' : ''}">
-                ${h.lastStatus === 'ok' ? 'Conectado' : h.lastStatus === 'error' ? 'Error SSH' : 'Pendiente'}
+              <span class="badge-pill ${statusClass}" title="${escapeHtml(statusTitle)}">
+                ${statusLabel}
               </span>
+              ${isEditing ? '<span class="badge-pill badge-ochre">✎ Editando</span>' : ''}
             </div>
-            <button class="btn-row-icon" data-action="remove-ssh" data-index="${idx}" title="Eliminar host">✕</button>
+            <div class="ssh-item-actions">
+              <button class="btn-row-icon ${isEditing ? 'pinned-active' : ''}" data-action="edit-ssh" data-index="${idx}" title="Editar host SSH">✎</button>
+              <button class="btn-row-icon" data-action="retry-ssh" data-index="${idx}" title="Probar / Reintentar conexión SSH ahora">🔄</button>
+              <button class="btn-row-icon" data-action="remove-ssh" data-index="${idx}" title="Eliminar host">✕</button>
+            </div>
           </div>
         `;
-          })
-          .join('');
+            })
+            .join('');
+        }
       }
     }
 
@@ -1203,6 +1557,8 @@
     const cfgTone = document.getElementById('cfg-sound-tone');
     const cfgNotif = document.getElementById('cfg-desktop-notif');
     const cfgTop = document.getElementById('cfg-always-top');
+    const cfgAutoHideFs = document.getElementById('cfg-auto-hide-fullscreen');
+    const cfgLaunchStartup = document.getElementById('cfg-launch-startup');
     const cfgOp = document.getElementById('cfg-opacity');
     const lblOp = document.getElementById('lbl-opacity');
     const lblPort = document.getElementById('lbl-local-port');
@@ -1213,9 +1569,12 @@
     if (cfgTone && document.activeElement !== cfgTone) cfgTone.value = cfg.soundTone || 'chime';
     if (cfgNotif) cfgNotif.checked = Boolean(cfg.desktopNotifications);
     if (cfgTop) cfgTop.checked = Boolean(cfg.alwaysOnTop);
+    if (cfgAutoHideFs) cfgAutoHideFs.checked = cfg.autoHideFullscreen !== false;
+    if (cfgLaunchStartup) cfgLaunchStartup.checked = cfg.launchAtStartup !== false;
     if (cfgOp && document.activeElement !== cfgOp) {
-      cfgOp.value = cfg.opacity || 0.96;
-      if (lblOp) lblOp.textContent = `${Math.round((cfg.opacity || 0.96) * 100)}%`;
+      const opVal = cfg.opacity != null ? Number(cfg.opacity) : 1;
+      cfgOp.value = opVal;
+      if (lblOp) lblOp.textContent = `${Math.round(opVal * 100)}%`;
     }
     if (cfgAgy5h && document.activeElement !== cfgAgy5h) {
       cfgAgy5h.value = cfg.agyFiveHourLimitM || 25;
@@ -1250,14 +1609,370 @@
     }
   }
 
+  // =========================================================
+  // RENDERIZADO: VISTA MINI-WIDGET ANDROID (/?mode=widget)
+  // =========================================================
+  function renderAndroidWidget(data) {
+    const sum = data.summary || {};
+    const clQuota = resolveClaudeQuota(data);
+    const agyQuota = resolveAgyQuota(data);
+
+    const readyEl = document.getElementById('aw-ready-count');
+    const apprEl = document.getElementById('aw-approval-count');
+    const runEl = document.getElementById('aw-running-count');
+    const apprWrap = document.getElementById('aw-approval-wrap');
+    const orb = document.getElementById('aw-orb');
+
+    if (readyEl) readyEl.textContent = sum.waitingInput || 0;
+    if (apprEl) apprEl.textContent = sum.waitingApproval || 0;
+    if (runEl) runEl.textContent = sum.running || 0;
+    if (apprWrap) apprWrap.classList.toggle('hidden', (sum.waitingApproval || 0) === 0);
+
+    if (orb) {
+      let orbState = 'state-idle';
+      if ((sum.waitingApproval || 0) > 0) orbState = 'state-approval';
+      else if ((sum.waitingInput || 0) > 0) orbState = 'state-ready';
+      else if ((sum.running || 0) > 0) orbState = 'state-running';
+      orb.className = `pill-orb ${orbState}`;
+    }
+
+    const clFh = clQuota.fiveHourPct != null ? clQuota.fiveHourPct : 0;
+    const clSd = clQuota.sevenDayPct != null ? clQuota.sevenDayPct : 0;
+    const awClFh = document.getElementById('aw-cl-fh');
+    const awClSd = document.getElementById('aw-cl-sd');
+    if (awClFh) awClFh.style.width = `${Math.min(100, clFh)}%`;
+    if (awClSd) awClSd.style.width = `${Math.min(100, clSd)}%`;
+    const awClFhTxt = document.getElementById('aw-cl-fh-txt');
+    const awClSdTxt = document.getElementById('aw-cl-sd-txt');
+    if (awClFhTxt) awClFhTxt.textContent = clQuota.fiveHourPct != null ? `${clFh}%` : '--%';
+    if (awClSdTxt) awClSdTxt.textContent = clQuota.sevenDayPct != null ? `${clSd}%` : '--%';
+
+    const awClTimer = document.getElementById('aw-cl-timer');
+    if (awClTimer) {
+      const r = clQuota.nextFiveHourResetAt || clQuota.nextWeeklyResetAt;
+      awClTimer.textContent = r ? `⏳${fmtCountdownShort(r)}` : '';
+    }
+    const awClBonus = document.getElementById('aw-cl-bonus');
+    if (awClBonus) {
+      awClBonus.classList.toggle('hidden', !clQuota.lastBonusReset);
+    }
+
+    const agyFh = agyQuota.fiveHourPct != null ? agyQuota.fiveHourPct : 0;
+    const agySd = agyQuota.sevenDayPct != null ? agyQuota.sevenDayPct : 0;
+    const awAgyFh = document.getElementById('aw-agy-fh');
+    const awAgySd = document.getElementById('aw-agy-sd');
+    if (awAgyFh) awAgyFh.style.width = `${Math.min(100, agyFh)}%`;
+    if (awAgySd) awAgySd.style.width = `${Math.min(100, agySd)}%`;
+    const awAgyFhTxt = document.getElementById('aw-agy-fh-txt');
+    const awAgySdTxt = document.getElementById('aw-agy-sd-txt');
+    if (awAgyFhTxt) awAgyFhTxt.textContent = agyQuota.available ? `${agyFh}%` : '--%';
+    if (awAgySdTxt) awAgySdTxt.textContent = agyQuota.available ? `${agySd}%` : '--%';
+
+    const awAgyTimer = document.getElementById('aw-agy-timer');
+    if (awAgyTimer) {
+      const r = agyQuota.nextFiveHourResetAt || agyQuota.nextWeeklyResetAt;
+      awAgyTimer.textContent = r ? `⏳${fmtCountdownShort(r)}` : '';
+    }
+
+    // Sesión prioritaria para mostrar en la tira inferior del widget Android
+    const openSessions = (data.sessions || []).filter((s) => s.isOpen);
+    const urgent =
+      openSessions.find((s) => s.state === 'waiting_approval') ||
+      openSessions.find((s) => s.state === 'waiting_input') ||
+      openSessions.find((s) => s.state === 'running') ||
+      openSessions[0] ||
+      null;
+
+    urgentWidgetSession = urgent;
+    const strip = document.getElementById('aw-urgent-strip');
+    const dot = document.getElementById('aw-urgent-dot');
+    const txt = document.getElementById('aw-urgent-text');
+    const btnApp = document.getElementById('aw-btn-quick-approve');
+    const btnChat = document.getElementById('aw-btn-quick-chat');
+
+    if (!urgent) {
+      strip?.classList.remove('is-urgent');
+      if (dot) dot.className = 'aw-urgent-dot dot';
+      if (txt) txt.textContent = 'Sin consolas abiertas ahora';
+      btnApp?.classList.add('hidden');
+      btnChat?.classList.add('hidden');
+    } else {
+      const isUrg = urgent.state === 'waiting_approval' || urgent.state === 'waiting_input';
+      strip?.classList.toggle('is-urgent', isUrg);
+      if (dot) {
+        const dc =
+          urgent.state === 'waiting_approval'
+            ? 'dot-amber'
+            : urgent.state === 'waiting_input'
+            ? 'dot-ready'
+            : 'dot-orange';
+        dot.className = `aw-urgent-dot dot ${dc}`;
+      }
+      if (txt) {
+        const prefix =
+          urgent.state === 'waiting_approval'
+            ? '⚠️ PERMISO: '
+            : urgent.state === 'waiting_input'
+            ? '✅ LISTA: '
+            : '⚡ ';
+        txt.textContent = `${prefix}${urgent.projectName || 'Global'} › ${urgent.title || urgent.sessionId}`;
+      }
+      btnApp?.classList.toggle('hidden', urgent.state !== 'waiting_approval');
+      btnChat?.classList.remove('hidden');
+    }
+  }
+
+  // =========================================================
+  // MODAL DE CONVERSACIÓN EN VIVO Y RESPUESTA REMOTA
+  // =========================================================
+  function findSessionById(idOrRaw) {
+    if (!idOrRaw || !currentState || !Array.isArray(currentState.sessions)) return null;
+    return (
+      currentState.sessions.find((s) => s.id === idOrRaw || s.sessionId === idOrRaw) || null
+    );
+  }
+
+  function updateChatModalHeader(sessionObj) {
+    if (!sessionObj) return;
+    const provPill = document.getElementById('chat-provider-pill');
+    const projName = document.getElementById('chat-project-name');
+    const stateTag = document.getElementById('chat-state-tag');
+    const titleEl = document.getElementById('chat-session-title');
+
+    if (provPill) {
+      const provClass = sessionObj.isRemote
+        ? 'prov-remote'
+        : sessionObj.provider === 'claude'
+        ? 'prov-claude'
+        : 'prov-agy';
+      const shortProv = sessionObj.isRemote
+        ? 'REM'
+        : sessionObj.provider === 'claude'
+        ? sessionObj.surface === 'app'
+          ? 'CL·APP'
+          : 'CLAUDE'
+        : 'AGY';
+      provPill.className = `provider-pill ${provClass}`;
+      provPill.textContent = shortProv;
+    }
+    if (projName) projName.textContent = sessionObj.projectName || 'Proyecto';
+    if (stateTag) {
+      stateTag.className = `sr-state-tag st-${sessionObj.state || 'waiting_input'}`;
+      stateTag.textContent = compactStateLabel(sessionObj);
+    }
+    if (titleEl) {
+      titleEl.textContent = sessionObj.currentAction
+        ? `⚡ ${sessionObj.currentAction}`
+        : sessionObj.title || sessionObj.workspace || sessionObj.id;
+    }
+  }
+
+  async function refreshChatMessages(scrollToBottom = false) {
+    if (!activeChatSessionId) return;
+    const s = findSessionById(activeChatSessionId);
+    if (s) updateChatModalHeader(s);
+
+    const listEl = document.getElementById('chat-messages-list');
+    if (!listEl) return;
+
+    const res = await apiGet(
+      `/api/sessions/messages?id=${encodeURIComponent(activeChatSessionId)}&limit=55`
+    );
+    if (!res || !res.ok) {
+      if (scrollToBottom) {
+        listEl.innerHTML = `<div class="muted-xs" style="padding:12px;text-align:center;">No se pudo cargar el historial (${escapeHtml(res?.error || 'error')})</div>`;
+      }
+      return;
+    }
+
+    const msgs = Array.isArray(res.messages) ? res.messages : [];
+    if (msgs.length === 0) {
+      listEl.innerHTML = `<div class="muted-xs" style="padding:16px;text-align:center;">Sin mensajes de texto legibles todavía en esta sesión. Podés usar los botones rápidos o enviar un mensaje abajo.</div>`;
+      return;
+    }
+
+    const wasNearBottom =
+      scrollToBottom ||
+      listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight < 90;
+
+    listEl.innerHTML = msgs
+      .map((m) => {
+        const isUser = m.role === 'user';
+        const roleLabel = isUser ? '🧑 Vos' : '🤖 Agente IA';
+        const timeStr = m.timestamp ? fmtTimeShort(m.timestamp) : '';
+
+        let toolsHtml = '';
+        if (Array.isArray(m.tools) && m.tools.length > 0) {
+          const visibleTools = m.tools.slice(-6);
+          const hiddenCount = Math.max(0, m.tools.length - visibleTools.length);
+          const chips = visibleTools
+            .map((t) => {
+              const label =
+                typeof t === 'string'
+                  ? t
+                  : `${t.name || 'tool'}${t.detail ? ': ' + String(t.detail).replace(/^["']+|["']+$/g, '') : ''}`;
+              return `<span class="chat-tool-badge">🔧 ${escapeHtml(label)}</span>`;
+            })
+            .join('');
+          const moreChip =
+            hiddenCount > 0
+              ? `<span class="chat-tool-badge">+${hiddenCount} herramientas previas</span>`
+              : '';
+          toolsHtml = `<div class="chat-msg-tools">${moreChip}${chips}</div>`;
+        }
+
+        const questionsHtml =
+          Array.isArray(m.questions) && m.questions.length > 0
+            ? m.questions
+                .map(
+                  (q) => `
+              <div class="chat-question-card">
+                <div class="chat-question-title">❓ ${escapeHtml(q.question)}</div>
+                <div class="chat-question-opts">
+                  ${(q.options || [])
+                    .map(
+                      (opt, idx) =>
+                        `<button type="button" class="btn-question-opt" data-opt-text="${escapeHtml(opt)}" data-opt-idx="${idx + 1}">${idx + 1}. ${escapeHtml(opt)}</button>`
+                    )
+                    .join('')}
+                </div>
+              </div>
+            `
+                )
+                .join('')
+            : '';
+
+        return `
+          <div class="chat-msg ${isUser ? 'chat-msg-user' : 'chat-msg-assistant'}">
+            <div class="chat-msg-meta">
+              <span>${roleLabel}</span>
+              <span>${escapeHtml(timeStr)}</span>
+            </div>
+            ${m.text ? `<div>${escapeHtml(m.text)}</div>` : ''}
+            ${toolsHtml}
+            ${questionsHtml}
+          </div>
+        `;
+      })
+      .join('');
+
+    if (wasNearBottom) {
+      listEl.scrollTop = listEl.scrollHeight;
+    }
+  }
+
+  function openChatModalById(sessionId) {
+    if (!sessionId) return;
+    activeChatSessionId = sessionId;
+    const modal = document.getElementById('chat-modal');
+    const listEl = document.getElementById('chat-messages-list');
+    if (listEl) {
+      listEl.innerHTML = `<div class="muted-xs" style="padding:16px;text-align:center;">Cargando conversación en vivo...</div>`;
+    }
+    const s = findSessionById(sessionId) || {
+      id: sessionId,
+      sessionId,
+      provider: String(sessionId).startsWith('agy:') ? 'agy' : 'claude',
+      projectName: 'Sesión',
+      state: 'waiting_input'
+    };
+    updateChatModalHeader(s);
+    modal?.classList.remove('hidden');
+
+    // Marcar alerta como vista al abrir el chat
+    if (s.hasUnreadAlert) {
+      apiPost('/api/sessions/ack', { id: s.id });
+    }
+
+    refreshChatMessages(true);
+    clearInterval(chatPollTimer);
+    chatPollTimer = setInterval(() => {
+      refreshChatMessages(false);
+    }, 3200);
+  }
+
+  function closeChatModal() {
+    activeChatSessionId = null;
+    clearInterval(chatPollTimer);
+    chatPollTimer = null;
+    document.getElementById('chat-modal')?.classList.add('hidden');
+  }
+
+  async function sendReplyPayload({ sessionObj, text = '', quickAction = '' }) {
+    const s = sessionObj || findSessionById(activeChatSessionId);
+    if (!s) {
+      showToast('Seleccioná una sesión primero');
+      return;
+    }
+    const sendBtn = document.getElementById('btn-chat-send');
+    if (sendBtn) sendBtn.disabled = true;
+
+    const res = await apiPost('/api/sessions/reply', {
+      id: s.id,
+      sessionId: s.sessionId || s.id,
+      pid: s.pid || null,
+      provider: s.provider || 'claude',
+      surface: s.surface || 'cli',
+      workspace: s.workspace || '',
+      isOpen: s.isOpen !== false,
+      isRemote: Boolean(s.isRemote),
+      text,
+      quickAction
+    });
+
+    if (sendBtn) sendBtn.disabled = false;
+
+    if (res && res.ok) {
+      showToast(
+        quickAction
+          ? `✅ Acción "${quickAction}" enviada a ${s.projectName || 'consola'}`
+          : `✅ Respuesta enviada a ${s.projectName || 'consola'}`
+      );
+      setTimeout(() => refreshChatMessages(true), 1100);
+      setTimeout(() => refreshChatMessages(true), 2800);
+    } else {
+      showToast(`⚠️ ${res?.error || 'No se pudo enviar la respuesta'}`);
+    }
+  }
+
+  function renderActiveTab(data) {
+    if (!data) return;
+    if (activeTab === 'sessions') {
+      renderSessionsList(data);
+    } else if (activeTab === 'tokens') {
+      renderTokensTab(data);
+    } else if (activeTab === 'remotes' || activeTab === 'settings') {
+      renderRemotesAndSettings(data);
+    }
+  }
+
   function renderAll(data) {
     if (!data) return;
     currentState = data;
+
+    // Si se abrió con ?session=... (ej. desde notificación push en Android), abrir ese chat automáticamente
+    if (deepLinkSessionId) {
+      const targetId = deepLinkSessionId;
+      deepLinkSessionId = '';
+      setTimeout(() => openChatModalById(targetId), 120);
+    }
+
+    if (isAndroidWidgetMode) {
+      renderAndroidWidget(data);
+      return;
+    }
+
     renderPill(data);
+
+    if (document.hidden) return;
+
+    // En modo píldora (#panel-view tiene display:none), evitar tocar el DOM oculto
+    if (!isWebMode && document.body.classList.contains('mode-pill')) {
+      return;
+    }
+
     renderSummaryStrip(data);
-    renderSessionsList(data);
-    renderTokensTab(data);
-    renderRemotesAndSettings(data);
+    renderActiveTab(data);
   }
 
   function switchTab(tabName) {
@@ -1268,6 +1983,9 @@
     document.querySelectorAll('.tab-pane').forEach((pane) => {
       pane.classList.toggle('active', pane.id === `tab-${tabName}`);
     });
+    if (currentState) {
+      renderActiveTab(currentState);
+    }
   }
 
   // =========================================================
@@ -1327,6 +2045,19 @@
     document.getElementById('pill-btn-sound')?.addEventListener('click', toggleQuickSound);
     document.getElementById('btn-toggle-sound')?.addEventListener('click', toggleQuickSound);
 
+    const toggleQuickAlwaysOnTop = async (ev) => {
+      if (ev) ev.stopPropagation();
+      const currentTop = !(currentState && currentState.config && currentState.config.alwaysOnTop === false);
+      const next = !currentTop;
+      if (window.electronAPI && window.electronAPI.setAlwaysOnTop) {
+        window.electronAPI.setAlwaysOnTop(next);
+      }
+      await apiPost('/api/config', { alwaysOnTop: next });
+      showToast(next ? '📌 Siempre encima (Always on Top) activado' : '🔓 Siempre encima desactivado');
+    };
+    document.getElementById('pill-btn-pin')?.addEventListener('click', toggleQuickAlwaysOnTop);
+    document.getElementById('btn-toggle-pin')?.addEventListener('click', toggleQuickAlwaysOnTop);
+
     document.getElementById('btn-ack-all')?.addEventListener('click', () => {
       apiPost('/api/sessions/ack', { all: true });
     });
@@ -1350,15 +2081,26 @@
       if (currentState) renderSessionsList(currentState);
     });
 
-    // Acciones delegadas en filas de sesión (clic en botones)
+    // Acciones delegadas en filas de sesión (clic en botones o tap en móvil)
     const sessionsListEl = document.getElementById('sessions-list');
     sessionsListEl?.addEventListener('click', async (ev) => {
       const btn = ev.target.closest('button[data-action]');
-      if (!btn) return;
+      if (!btn) {
+        // En navegador web / celular Android, tocar la fila abre directamente el chat en vivo
+        if (!isElectron) {
+          const row = ev.target.closest('.session-row');
+          if (row && row.dataset.sessionId) {
+            openChatModalById(row.dataset.sessionId);
+          }
+        }
+        return;
+      }
       ev.stopPropagation();
       const action = btn.dataset.action;
 
-      if (action === 'focus') {
+      if (action === 'chat') {
+        openChatModalById(btn.dataset.id);
+      } else if (action === 'focus') {
         await apiPost('/api/sessions/focus', {
           id: btn.dataset.id,
           sessionId: btn.dataset.rawSessionId || btn.dataset.id,
@@ -1395,6 +2137,166 @@
         title: row.dataset.title
       });
       showToast(`🎯 Saltando a pestaña de ${row.dataset.title || 'consola'}...`);
+    });
+
+    // =========================================================
+    // EVENTOS: MODAL DE CONVERSACIÓN EN VIVO Y RESPUESTA REMOTA
+    // =========================================================
+    document.getElementById('btn-chat-close')?.addEventListener('click', closeChatModal);
+    document.getElementById('chat-modal')?.addEventListener('click', (ev) => {
+      if (ev.target.id === 'chat-modal') closeChatModal();
+    });
+    document.getElementById('btn-chat-refresh')?.addEventListener('click', () => {
+      refreshChatMessages(true);
+      showToast('↻ Historial actualizado');
+    });
+    document.getElementById('btn-chat-focus-pc')?.addEventListener('click', async () => {
+      const s = findSessionById(activeChatSessionId);
+      if (!s) return;
+      await apiPost('/api/sessions/focus', {
+        id: s.id,
+        sessionId: s.sessionId || s.id,
+        pid: s.pid || null,
+        provider: s.provider,
+        surface: s.surface || 'cli',
+        workspace: s.workspace || '',
+        title: s.projectName || s.title || ''
+      });
+      showToast(`🎯 Enfocando ${s.projectName || 'consola'} en la PC...`);
+    });
+
+    // Botones rápidos (✅ Aprobar, ↵ Enter, 1, 2, 3, ❌ Rechazar, Esc)
+    document.getElementById('chat-quick-bar')?.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('button[data-quick]');
+      if (!btn) return;
+      sendReplyPayload({ quickAction: btn.dataset.quick });
+    });
+
+    // Opciones interactivas de ask_question dentro del chat
+    document.getElementById('chat-messages-list')?.addEventListener('click', (ev) => {
+      const optBtn = ev.target.closest('button.btn-question-opt');
+      if (!optBtn) return;
+      const optText = optBtn.dataset.optText || '';
+      if (optText) {
+        sendReplyPayload({ text: optText });
+      }
+    });
+
+    // Formulario de envío de texto libre a la sesión
+    document.getElementById('chat-reply-form')?.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const input = document.getElementById('chat-reply-input');
+      const text = (input?.value || '').trim();
+      if (!text) return;
+      input.value = '';
+      await sendReplyPayload({ text });
+    });
+
+    document.getElementById('chat-reply-input')?.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' && !ev.shiftKey) {
+        ev.preventDefault();
+        document.getElementById('chat-reply-form')?.requestSubmit();
+      }
+    });
+
+    // =========================================================
+    // EVENTOS: VISTA MINI-WIDGET ANDROID (/?mode=widget)
+    // =========================================================
+    const openFullAppFromWidget = () => {
+      window.location.href = withAuthUrl('/?mode=web');
+    };
+    document.getElementById('aw-btn-open-app')?.addEventListener('click', openFullAppFromWidget);
+    document.getElementById('aw-open-app-area')?.addEventListener('click', openFullAppFromWidget);
+
+    document.getElementById('aw-btn-quick-approve')?.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      if (urgentWidgetSession) {
+        sendReplyPayload({ sessionObj: urgentWidgetSession, quickAction: 'approve' });
+      }
+    });
+
+    const openUrgentWidgetChat = () => {
+      if (urgentWidgetSession) {
+        openChatModalById(urgentWidgetSession.id);
+      } else {
+        openFullAppFromWidget();
+      }
+    };
+    document.getElementById('aw-btn-quick-chat')?.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      openUrgentWidgetChat();
+    });
+    document.getElementById('aw-urgent-info')?.addEventListener('click', openUrgentWidgetChat);
+
+    // =========================================================
+    // EVENTOS: ACCESO CELULAR ANDROID Y TÚNEL 4G SIN VPN
+    // =========================================================
+    document.getElementById('chk-tunnel-4g')?.addEventListener('change', async (ev) => {
+      const enabled = ev.target.checked;
+      showToast(
+        enabled
+          ? '🌐 Iniciando túnel 4G Cloudflare (descargando si hace falta)...'
+          : '⏹ Deteniendo túnel 4G...'
+      );
+      await apiPost('/api/tunnel/toggle', { enabled });
+    });
+
+    document.getElementById('chk-ntfy-push-local')?.addEventListener('change', async (ev) => {
+      const enabled = ev.target.checked;
+      await apiPost('/api/config', { ntfyPushLocalAlerts: enabled });
+      showToast(
+        enabled
+          ? '📲 Alertas push al celular activadas'
+          : '🔕 Alertas push al celular desactivadas'
+      );
+    });
+
+    document.getElementById('btn-copy-mobile-app')?.addEventListener('click', () => {
+      const urls = resolveMobileUrls(currentState);
+      copyText(urls.activeAppUrl, '📱 Link de App Android copiado');
+    });
+
+    document.getElementById('btn-copy-mobile-widget')?.addEventListener('click', () => {
+      const urls = resolveMobileUrls(currentState);
+      copyText(urls.activeWidgetUrl, '📱 Link de Mini-Widget Android copiado');
+    });
+
+    const openQrMode = (mode) => {
+      activeQrMode = mode;
+      lastQrEncodedUrl = '';
+      const qrBox = document.getElementById('mobile-qr-container');
+      qrBox?.classList.remove('hidden');
+      updateQrBoxIfOpen(resolveMobileUrls(currentState));
+    };
+
+    document.getElementById('btn-qr-apk')?.addEventListener('click', () => {
+      openQrMode('apk');
+    });
+
+    document.getElementById('btn-qr-app')?.addEventListener('click', () => {
+      openQrMode('app');
+    });
+
+    document.getElementById('btn-qr-widget')?.addEventListener('click', () => {
+      openQrMode('widget');
+    });
+
+    document.getElementById('btn-close-qr')?.addEventListener('click', () => {
+      activeQrMode = null;
+      document.getElementById('mobile-qr-container')?.classList.add('hidden');
+    });
+
+    // Modal de ingreso manual de Token Remoto
+    document.getElementById('auth-token-form')?.addEventListener('submit', (ev) => {
+      ev.preventDefault();
+      const val = (document.getElementById('auth-token-input')?.value || '').trim();
+      if (!val) return;
+      remoteAuthToken = val;
+      try {
+        localStorage.setItem('aiPulseAuthToken', val);
+      } catch {}
+      document.getElementById('auth-modal')?.classList.add('hidden');
+      connectRealtimeStream();
     });
 
     // Probar aviso de Reseteo Gratis (Bonus) de Claude
@@ -1436,30 +2338,159 @@
       });
     });
 
-    // Agregar / quitar host SSH
-    document.getElementById('btn-add-ssh')?.addEventListener('click', async () => {
+    // Agregar / editar / reintentar / quitar host SSH
+    const startEditingSshHost = (idx) => {
+      const hosts = currentState?.config?.sshHosts || [];
+      const h = hosts[idx];
+      if (!h) return;
+
+      editingSshIndex = idx;
+      const lblInput = document.getElementById('ssh-label');
+      const tgtInput = document.getElementById('ssh-target');
+      const prtInput = document.getElementById('ssh-port');
+      const keyInput = document.getElementById('ssh-key');
+      const addBtn = document.getElementById('btn-add-ssh');
+      const cancelBtn = document.getElementById('btn-cancel-ssh');
+      const formEl = document.getElementById('ssh-add-form');
+      const hintEl = document.getElementById('ssh-form-hint');
+
+      if (lblInput) lblInput.value = h.label || '';
+      if (tgtInput) tgtInput.value = h.target || '';
+      if (prtInput) prtInput.value = h.port || 22;
+      if (keyInput) keyInput.value = h.keyPath || '';
+      if (addBtn) addBtn.textContent = '💾 Guardar';
+      if (cancelBtn) cancelBtn.classList.remove('hidden');
+      if (formEl) formEl.classList.add('is-editing');
+      if (hintEl) hintEl.textContent = `Editando "${h.label || h.target}" · Enter guarda, Esc cancela`;
+
+      lastSshListSig = '';
+      if (currentState) renderRemotesAndSettings(currentState);
+      if (tgtInput) {
+        tgtInput.focus();
+        tgtInput.select();
+      }
+    };
+
+    const cancelEditingSshHost = () => {
+      editingSshIndex = null;
+      const lblInput = document.getElementById('ssh-label');
+      const tgtInput = document.getElementById('ssh-target');
+      const prtInput = document.getElementById('ssh-port');
+      const keyInput = document.getElementById('ssh-key');
+      const addBtn = document.getElementById('btn-add-ssh');
+      const cancelBtn = document.getElementById('btn-cancel-ssh');
+      const formEl = document.getElementById('ssh-add-form');
+      const hintEl = document.getElementById('ssh-form-hint');
+
+      if (lblInput) lblInput.value = '';
+      if (tgtInput) tgtInput.value = '';
+      if (prtInput) prtInput.value = '';
+      if (keyInput) keyInput.value = '';
+      if (addBtn) addBtn.textContent = '+ Agregar Host';
+      if (cancelBtn) cancelBtn.classList.add('hidden');
+      if (formEl) formEl.classList.remove('is-editing');
+      if (hintEl) hintEl.textContent = 'Soporta llave privada (`-i`) · Clic en ✎ para editar';
+
+      lastSshListSig = '';
+      if (currentState) renderRemotesAndSettings(currentState);
+    };
+
+    const submitSshHostForm = async () => {
       const label = document.getElementById('ssh-label')?.value.trim();
       const target = document.getElementById('ssh-target')?.value.trim();
       const port = Number(document.getElementById('ssh-port')?.value) || 22;
-      const keyPath = document.getElementById('ssh-key')?.value.trim() || '';
-      if (!target) return;
+      const keyPath = (document.getElementById('ssh-key')?.value.trim() || '').replace(/^["']+|["']+$/g, '');
+      if (!target) {
+        showToast('Ingresá usuario@host para el servidor SSH');
+        document.getElementById('ssh-target')?.focus();
+        return;
+      }
 
       const hosts = [...(currentState?.config?.sshHosts || [])];
-      hosts.push({ label: label || target, target, port, keyPath, enabled: true });
+      const wasEditing = editingSshIndex !== null && hosts[editingSshIndex];
+
+      if (wasEditing) {
+        hosts[editingSshIndex] = {
+          ...hosts[editingSshIndex],
+          label: label || target,
+          target,
+          port,
+          keyPath,
+          enabled: true,
+          lastStatus: 'pending',
+          lastError: '',
+          nextRetryAt: null
+        };
+      } else {
+        hosts.push({
+          label: label || target,
+          target,
+          port,
+          keyPath,
+          enabled: true,
+          lastStatus: 'pending',
+          lastError: ''
+        });
+      }
+
+      cancelEditingSshHost();
       await apiPost('/api/config', { sshHosts: hosts });
-      document.getElementById('ssh-label').value = '';
-      document.getElementById('ssh-target').value = '';
-      if (document.getElementById('ssh-key')) document.getElementById('ssh-key').value = '';
-      showToast(keyPath ? 'Servidor SSH + Llave agregados' : 'Servidor SSH agregado');
-    });
+      showToast(
+        wasEditing
+          ? 'Host SSH actualizado · Probando conexión...'
+          : keyPath
+          ? 'Servidor SSH + Llave agregados'
+          : 'Servidor SSH agregado'
+      );
+    };
+
+    document.getElementById('btn-add-ssh')?.addEventListener('click', submitSshHostForm);
+    document.getElementById('btn-cancel-ssh')?.addEventListener('click', cancelEditingSshHost);
+
+    for (const inputId of ['ssh-label', 'ssh-target', 'ssh-port', 'ssh-key']) {
+      document.getElementById(inputId)?.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter') {
+          ev.preventDefault();
+          submitSshHostForm();
+        } else if (ev.key === 'Escape' && editingSshIndex !== null) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          cancelEditingSshHost();
+        }
+      });
+    }
 
     document.getElementById('ssh-hosts-list')?.addEventListener('click', async (ev) => {
-      const btn = ev.target.closest('button[data-action="remove-ssh"]');
-      if (!btn) return;
-      const idx = Number(btn.dataset.index);
-      const hosts = [...(currentState?.config?.sshHosts || [])];
-      hosts.splice(idx, 1);
-      await apiPost('/api/config', { sshHosts: hosts });
+      const actionEl = ev.target.closest('[data-action]');
+      if (!actionEl) return;
+      const action = actionEl.dataset.action;
+      const idx = Number(actionEl.dataset.index);
+      if (Number.isNaN(idx)) return;
+
+      if (action === 'edit-ssh') {
+        startEditingSshHost(idx);
+      } else if (action === 'retry-ssh') {
+        const hosts = [...(currentState?.config?.sshHosts || [])];
+        if (!hosts[idx]) return;
+        hosts[idx] = {
+          ...hosts[idx],
+          lastStatus: 'pending',
+          lastError: '',
+          nextRetryAt: null
+        };
+        await apiPost('/api/config', { sshHosts: hosts });
+        showToast(`🔄 Reintentando SSH con ${hosts[idx].label || hosts[idx].target}...`);
+      } else if (action === 'remove-ssh') {
+        const hosts = [...(currentState?.config?.sshHosts || [])];
+        hosts.splice(idx, 1);
+        if (editingSshIndex === idx) {
+          cancelEditingSshHost();
+        } else if (editingSshIndex !== null && editingSshIndex > idx) {
+          editingSshIndex -= 1;
+        }
+        await apiPost('/api/config', { sshHosts: hosts });
+        showToast('Host SSH eliminado');
+      }
     });
 
     // Guardar límites de cuota AGY
@@ -1495,6 +2526,52 @@
       if (window.electronAPI) window.electronAPI.setAlwaysOnTop(val);
     });
 
+    document.getElementById('cfg-auto-hide-fullscreen')?.addEventListener('change', (ev) => {
+      const val = ev.target.checked;
+      apiPost('/api/config', { autoHideFullscreen: val });
+    });
+
+    document.getElementById('cfg-launch-startup')?.addEventListener('change', (ev) => {
+      const val = ev.target.checked;
+      apiPost('/api/config', { launchAtStartup: val });
+      showToast(val ? '🚀 Inicio automático con Windows activado' : 'Inicio con Windows desactivado');
+    });
+
+    document.addEventListener('visibilitychange', () => {
+      if (isWebMode) {
+        if (document.hidden) {
+          // Ahorro total de batería en Android/Web en segundo plano: cerrar SSE y timers
+          if (activeEventSource) {
+            try { activeEventSource.close(); } catch {}
+            activeEventSource = null;
+          }
+          if (sseRetryTimer) {
+            clearTimeout(sseRetryTimer);
+            sseRetryTimer = null;
+          }
+          if (chatPollTimer) {
+            clearInterval(chatPollTimer);
+            chatPollTimer = null;
+          }
+          return;
+        } else {
+          // Al volver al frente en el celular, reconectar stream en vivo inmediatamente
+          if (!activeEventSource) {
+            connectRealtimeStream();
+          }
+          if (activeChatSessionId && !chatPollTimer) {
+            refreshChatMessages(false);
+            chatPollTimer = setInterval(() => {
+              if (!document.hidden) refreshChatMessages(false);
+            }, 4000);
+          }
+        }
+      }
+      if (!document.hidden && currentState) {
+        renderAll(currentState);
+      }
+    });
+
     document.getElementById('cfg-opacity')?.addEventListener('input', (ev) => {
       const val = Number(ev.target.value);
       const lbl = document.getElementById('lbl-opacity');
@@ -1517,6 +2594,10 @@
       const isInput = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
 
       if (ev.key === 'Escape') {
+        if (activeChatSessionId) {
+          closeChatModal();
+          return;
+        }
         if (isInput) {
           ev.target.blur();
           return;
@@ -1538,13 +2619,31 @@
   // =========================================================
   // CONEXIÓN SSE EN TIEMPO REAL (/api/stream)
   // =========================================================
+  let activeEventSource = null;
+  let sseRetryTimer = null;
   function connectRealtimeStream() {
-    fetch('/api/state')
-      .then((r) => r.json())
-      .then((snap) => renderAll(snap))
+    if (sseRetryTimer) {
+      clearTimeout(sseRetryTimer);
+      sseRetryTimer = null;
+    }
+    if (activeEventSource) {
+      try {
+        activeEventSource.close();
+      } catch {}
+      activeEventSource = null;
+    }
+    if (isWebMode && document.hidden) {
+      return;
+    }
+
+    apiGet('/api/state')
+      .then((snap) => {
+        if (snap && !snap.unauthorized) renderAll(snap);
+      })
       .catch(() => {});
 
-    const es = new EventSource('/api/stream');
+    const es = new EventSource(withAuthUrl('/api/stream'));
+    activeEventSource = es;
 
     es.addEventListener('state', (ev) => {
       try {
@@ -1569,8 +2668,12 @@
     });
 
     es.onerror = () => {
-      es.close();
-      setTimeout(connectRealtimeStream, 3000);
+      try { es.close(); } catch {}
+      if (activeEventSource === es) activeEventSource = null;
+      if (isWebMode && document.hidden) return;
+      if (!sseRetryTimer) {
+        sseRetryTimer = setTimeout(connectRealtimeStream, 3500);
+      }
     };
   }
 

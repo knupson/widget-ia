@@ -7,7 +7,8 @@
     "start": "node start-electron.js",
     "electron": "electron .",
     "web": "node src/server.js",
-    "build:launcher": "node scripts/build-launcher.js"
+    "build:launcher": "node scripts/build-launcher.js",
+    "build:apk": "node scripts/build-android-apk.js"
   },
   "keywords": [
     "claude-code",

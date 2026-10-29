@@ -1,8 +1,11 @@
-# Dependencies
+# Dependencies & auto-downloaded binaries
 node_modules/
+bin/
 
-# User local configuration (contains personal ntfyTopic / SSH hosts)
+# User local configuration (contains personal ntfyTopic / SSH hosts / pre-configured APK)
 config.json
+src/public/ai-pulse.apk
+*.idsig
 
 # Logs & OS files
 *.log
