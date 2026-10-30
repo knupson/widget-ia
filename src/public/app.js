@@ -2236,6 +2236,8 @@
       renderSessionsList(data);
     } else if (activeTab === 'tokens') {
       renderTokensTab(data);
+    } else if (activeTab === 'usage' && typeof window.renderUsageTab === 'function') {
+      window.renderUsageTab(data);
     } else if (activeTab === 'remotes' || activeTab === 'settings') {
       renderRemotesAndSettings(data);
     }
