@@ -935,7 +935,7 @@
       return true;
     });
 
-    // Urgencia primero; el orden recibido se conserva dentro de cada grupo.
+    // Fijadas primero, después urgencia y, dentro de cada grupo, la más reciente.
     const statePriority = {
       waiting_approval: 0, waiting_question: 0, question: 0, needs_you: 0,
       failed: 1, error: 1,
@@ -944,7 +944,12 @@
       idle: 4, closed: 5, offline: 5
     };
     const urgency = (s) => s.isOpen === false ? 5 : (statePriority[s.state] ?? 4);
-    filtered.sort((a, b) => urgency(a) - urgency(b));
+    filtered.sort((a, b) => {
+      const pinA = pinnedIds.has(a.id);
+      const pinB = pinnedIds.has(b.id);
+      if (pinA !== pinB) return pinA ? -1 : 1;
+      return urgency(a) - urgency(b) || (b.updatedAt || 0) - (a.updatedAt || 0);
+    });
 
     const sessionsSig = JSON.stringify({
       activeFilter,

@@ -12,7 +12,9 @@ function createQuotaThresholdNotifier(notify) {
       if (!Number.isFinite(pct) || !Number.isFinite(resetAt) || resetAt <= now) continue;
       const id = `${provider}:${key}`;
       let window = windows.get(id);
-      if (!window || window.resetAt !== resetAt) {
+      // resets_at puede variar unos segundos entre lecturas: sólo una diferencia
+      // de más de 10 min es una ventana nueva.
+      if (!window || Math.abs(window.resetAt - resetAt) > 10 * 60000) {
         window = { resetAt, fired: new Set() };
         windows.set(id, window);
       }
