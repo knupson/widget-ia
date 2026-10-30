@@ -2,6 +2,7 @@ const fs = require('fs');
 const { TOKEN_WEIGHTS } = require('./tokenWeights');
 const os = require('os');
 const path = require('path');
+const { getRateLimitsSnapshot } = require('./codexRateLimits');
 
 const WEEK = 7 * 24 * 3600 * 1000;
 const emptyBucket = () => ({ input: 0, cacheRead: 0, cacheWrite: 0, output: 0, total: 0, effective: 0, turns: 0 });
@@ -17,32 +18,39 @@ function add(target, source) {
 }
 
 function normalizeWindow(window, now) {
-  if (!window || !Number.isFinite(window.used_percent)) return null;
-  const resetsAt = number(window.resets_at) * 1000 || null;
+  if (!window) return null;
+  const usedPct = window.usedPercent ?? window.used_percent;
+  if (!Number.isFinite(usedPct)) return null;
+  const resetSeconds = window.resetsAt ?? window.resets_at;
+  const resetsAt = Number.isFinite(resetSeconds) ? resetSeconds * 1000 : null;
   return {
-    usedPct: Math.max(0, Math.min(100, window.used_percent)),
-    windowMinutes: number(window.window_minutes),
+    usedPct: Math.max(0, Math.min(100, usedPct)),
+    windowMinutes: number(window.windowDurationMins ?? window.window_minutes),
     resetsAt,
     expired: resetsAt !== null && resetsAt <= now
   };
 }
 
-function buildCodexQuota(snapshot, now) {
-  if (!snapshot) return { available: false, source: 'local-session', fiveHourPct: null, sevenDayPct: null };
-  const { limits, timestamp } = snapshot;
-  const windows = [limits.primary, limits.secondary].filter(Boolean).map((w) => normalizeWindow(w, now)).filter(Boolean);
-  const fiveHour = windows.find((w) => w.windowMinutes === 300);
-  const sevenDay = windows.find((w) => w.windowMinutes === 10080);
+function buildCodexQuota(snapshot, now, liveSnapshot = null) {
+  const live = liveSnapshot && now - liveSnapshot.fetchedAt < 3 * 60 * 1000;
+  const selected = live ? liveSnapshot : snapshot;
+  const limits = selected?.limits || {};
+  const timestamp = live ? selected.fetchedAt : selected?.timestamp ?? null;
+  const slots = [limits.primary, limits.secondary].map((w) => normalizeWindow(w, now));
+  const windows = slots.filter(Boolean);
+  const fiveHour = windows.find((w) => w.windowMinutes > 0 && w.windowMinutes <= 1440)
+    || (slots[0]?.windowMinutes === 0 ? slots[0] : null);
+  const sevenDay = windows.find((w) => w.windowMinutes >= 6 * 24 * 60)
+    || (slots[1]?.windowMinutes === 0 ? slots[1] : null);
   return {
-    available: true,
-    source: 'local-session',
-    limitId: limits.limit_id || 'codex',
-    planType: limits.plan_type || null,
+    available: Boolean(selected),
+    source: live ? 'codex-app-server' : 'local-session',
+    limitId: limits.limitId || limits.limit_id || 'codex',
+    planType: limits.planType || limits.plan_type || null,
     updatedAt: timestamp,
-    stale: now - timestamp > 15 * 60 * 1000,
-    // Ventana vencida sin actividad posterior (si la hubiera, habría un rollout más nuevo): arranca en 0%
-    fiveHourPct: fiveHour ? (fiveHour.expired ? 0 : fiveHour.usedPct) : null,
-    sevenDayPct: sevenDay ? (sevenDay.expired ? 0 : sevenDay.usedPct) : null,
+    stale: live ? false : timestamp === null || now - timestamp > 15 * 60 * 1000,
+    fiveHourPct: fiveHour && !fiveHour.expired ? fiveHour.usedPct : null,
+    sevenDayPct: sevenDay && !sevenDay.expired ? sevenDay.usedPct : null,
     nextFiveHourResetAt: fiveHour && !fiveHour.expired ? fiveHour.resetsAt : null,
     nextWeeklyResetAt: sevenDay && !sevenDay.expired ? sevenDay.resetsAt : null,
     windows
@@ -98,7 +106,7 @@ function parseRolloutLine(data, line) {
   data.updatedAt = Math.max(data.updatedAt, timestamp);
 }
 
-// No lee auth.json ni consulta modelos: sólo rollouts locales, con lectura incremental.
+// Cuota oficial por app-server; sesiones y tokens por lectura incremental de rollouts.
 function createCodexCollector({ home = process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), clock = Date.now } = {}) {
   const cache = new Map();
   let files = [];
@@ -141,6 +149,7 @@ function createCodexCollector({ home = process.env.CODEX_HOME || path.join(os.ho
 
   return function collectCodexData() {
     const now = clock();
+    const liveQuota = getRateLimitsSnapshot();
     if (now - scannedAt >= 15000) {
       files = [];
       discover(path.join(home, 'sessions'));
@@ -184,7 +193,7 @@ function createCodexCollector({ home = process.env.CODEX_HOME || path.join(os.ho
         lastMessage: data.lastMessage, currentAction: isOpen ? 'Trabajando (actividad reciente)' : ''
       });
     }
-    return { sessions, dailyTokens, codexQuota: buildCodexQuota(quota, now) };
+    return { sessions, dailyTokens, codexQuota: buildCodexQuota(quota, now, liveQuota) };
   };
 }
 

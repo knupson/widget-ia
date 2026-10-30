@@ -11,6 +11,7 @@ const { focusSessionWindow } = require('./services/windowFocuser');
 const { getSessionMessages } = require('./services/conversationReader');
 const { sendSessionReply } = require('./services/remoteResponder');
 const { TunnelManager } = require('./services/tunnelManager');
+const processCounter = require('./services/processCounter');
 
 const CONFIG_PATH = path.resolve(__dirname, '..', 'config.json');
 const PUBLIC_DIR = path.resolve(__dirname, 'public');
@@ -196,6 +197,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
   function buildSnapshotSignature(snap) {
     return JSON.stringify({
       summary: snap.summary,
+      running: snap.running,
       sessions: snap.sessions.map((s) => ({
         id: s.id,
         state: s.state,
@@ -521,6 +523,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
     latestSnapshot = {
       timestamp: now,
       summary,
+      running: processCounter.getCounts(),
       sessions: allSessions,
       planQuota: claudeData.planQuota,
       agyQuota: agyData.agyQuota,
@@ -896,6 +899,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
         {
           ok: true,
           timestamp: snap.timestamp || Date.now(),
+          running: processCounter.getCounts(),
           lanBase: ma.lanIp ? `http://${ma.lanIp}:${config.port}` : '',
           tunnelBase: (ma.tunnel && ma.tunnel.publicUrl) || '',
           summary: {
@@ -1352,6 +1356,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
   const bindHost = config.bindHost || '127.0.0.1';
 
   function start() {
+    processCounter.start();
     return new Promise((resolve, reject) => {
       refreshSnapshot();
       remoteManager.start();
@@ -1417,6 +1422,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
   }
 
   function stop() {
+    processCounter.stop();
     if (pollTimer) clearInterval(pollTimer);
     remoteManager.stop();
     tunnelManager.stop();

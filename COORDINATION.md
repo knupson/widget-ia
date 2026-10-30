@@ -47,3 +47,7 @@ Estado: aplicado por 8 agentes con archivos disjuntos; sólo `node --check` y pr
 - **Frontend/docs**: marca "ant." para Claude vencido, carrera del chat, dedupe, accesibilidad, README/package.json/.gitattributes.
 
 Pendiente: rotar token/topic y reconstruir APK (invalida el pairing del celular), Electron 35 → vigente, quitar `.exe` trackeados, tests de los parsers exportados, y `MainActivity.java:279` ("Actualizar APK") apunta a una ruta pública que ya no existe.
+
+## Codex — contador de instancias, 2026-10-30
+
+Responsable: sesión del contador. Alcance: src/services/processCounter.js, src/server.js, src/public/app.js (sólo contador y firmas), src/public/index.html, src/public/styles.css. Se conservan cambios previos; codexCollector.js y codexRateLimits.js quedan fuera del alcance. Estado: terminado, reserva cerrada. Validación: check 21/21 OK, diff sin errores y pruebas simuladas de filtros/caché/ciclo de vida OK. Ejecución real de 3 s: {"claude":0,"codex":0,"agy":0,"updatedAt":null}; Get-CimInstance devolvió acceso denegado en el entorno restringido. No se probó Electron visualmente.

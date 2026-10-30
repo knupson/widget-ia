@@ -778,17 +778,17 @@ function buildAgyQuota(slotAgg, settings, config = {}, providerStatus = null) {
   const burnRatePerHour =
     oneHour.total > 0 ? oneHour.total : Math.round(fiveHour.total / 5);
 
-  const hasOfficialWeekly = Boolean(officialWeekly);
+  const hasOfficialQuota = Boolean(officialWeekly || officialFiveHour);
 
   return {
     available: true,
     source:
       providerStatus && providerStatus.exhausted
         ? 'provider-error'
-        : hasOfficialWeekly
+        : hasOfficialQuota
         ? 'google-api'
         : 'provider-logs',
-    estimated: false,
+    estimated: !hasOfficialQuota || Boolean(providerStatus && providerStatus.exhausted),
     model: settings.model,
     gcpProject: (officialApi && officialApi.projectId) || settings.gcpProject,
     gcpLocation: (officialApi && officialApi.region) || settings.gcpLocation,

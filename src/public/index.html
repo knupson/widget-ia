@@ -45,7 +45,7 @@
     <div class="aw-quotas-row">
       <div class="aw-q-card">
         <div class="aw-q-head">
-          <span class="brand-cl">🟠 CLAUDE</span>
+          <span class="brand-cl">🟠 CLAUDE <span class="run-count" data-running-provider="claude" title="Instancias corriendo"></span></span>
           <span class="aw-q-meta">
             <span id="aw-cl-timer">--</span>
             <span id="aw-cl-bonus" class="hidden">🎁</span>
@@ -67,7 +67,7 @@
 
       <div class="aw-q-card">
         <div class="aw-q-head">
-          <span class="brand-agy">🟡 AGY</span>
+          <span class="brand-agy">🟡 AGY <span class="run-count" data-running-provider="agy" title="Instancias corriendo"></span></span>
           <span class="aw-q-meta" id="aw-agy-timer">--</span>
         </div>
         <div class="aw-q-bars">
@@ -86,7 +86,7 @@
     </div>
 
     <div class="aw-q-card aw-codex-card" id="aw-codex-box">
-      <div class="aw-q-head"><span class="brand-codex">CODEX</span><span class="aw-q-meta" id="aw-codex-timer">--</span></div>
+      <div class="aw-q-head"><span class="brand-codex">CODEX <span class="run-count" data-running-provider="codex" title="Instancias corriendo"></span></span><span class="aw-q-meta" id="aw-codex-timer">--</span></div>
       <div class="aw-q-bars">
         <div class="aw-q-line"><span>5h</span><div class="pq-bar"><div id="aw-codex-fh" class="pq-fill fill-codex" style="width:0%"></div></div><strong id="aw-codex-fh-txt">--%</strong></div>
         <div class="aw-q-line"><span>7d</span><div class="pq-bar"><div id="aw-codex-sd" class="pq-fill fill-codex" style="width:0%"></div></div><strong id="aw-codex-sd-txt">--%</strong></div>
@@ -138,7 +138,7 @@
       <div class="pill-dual-quotas">
         <div class="pill-q-col" id="pill-claude-box" title="Cuota Oficial Plan Claude (5h / 7d)">
           <div class="pq-header">
-            <span class="pq-brand brand-cl"><i class="pq-dot dot-cl"></i>CLAUDE</span>
+            <span class="pq-brand brand-cl"><i class="pq-dot dot-cl"></i>CLAUDE <span class="run-count" data-running-provider="claude" title="Instancias corriendo"></span></span>
             <span class="pq-meta-right">
               <span id="pill-cl-reset-timer" class="pq-reset-timer" title="Tiempo para el próximo reseteo de cuota">--</span>
               <span id="pill-cl-reset-badge" class="pq-reset-tag hidden" title="¡Claude aplicó un Reseteo Gratis / Bonus!">🎁</span>
@@ -160,7 +160,7 @@
 
         <div class="pill-q-col" id="pill-agy-box" title="Pulso & Cuota Antigravity AGY (5h / 7d)">
           <div class="pq-header">
-            <span class="pq-brand brand-agy"><i class="pq-dot dot-agy"></i>AGY</span>
+            <span class="pq-brand brand-agy"><i class="pq-dot dot-agy"></i>AGY <span class="run-count" data-running-provider="agy" title="Instancias corriendo"></span></span>
             <span id="pill-agy-reset-timer" class="pq-reset-timer" title="Próxima liberación de ventana AGY">--</span>
           </div>
           <div class="pq-bars-stack">
@@ -177,7 +177,7 @@
           </div>
         </div>
         <div class="pill-q-col" id="pill-codex-box">
-          <div class="pq-header"><span class="pq-brand brand-codex"><i class="pq-dot dot-codex"></i>CODEX</span><span id="pill-codex-reset-timer" class="pq-reset-timer">--</span></div>
+          <div class="pq-header"><span class="pq-brand brand-codex"><i class="pq-dot dot-codex"></i>CODEX <span class="run-count" data-running-provider="codex" title="Instancias corriendo"></span></span><span id="pill-codex-reset-timer" class="pq-reset-timer">--</span></div>
           <div class="pq-bars-stack">
             <div class="pq-line"><span class="pq-sub">5h</span><div class="pq-bar"><div id="pill-codex-fh" class="pq-fill fill-codex" style="width:0%"></div></div><span id="pill-codex-fh-txt" class="pq-val">--%</span></div>
             <div class="pq-line"><span class="pq-sub">7d</span><div class="pq-bar"><div id="pill-codex-sd" class="pq-fill fill-codex" style="width:0%"></div></div><span id="pill-codex-sd-txt" class="pq-val">--%</span></div>
@@ -247,7 +247,7 @@
       <!-- KPI 2: Cuota Plan Claude -->
       <div class="kpi-card kpi-claude" id="kpi-claude-card" title="Cuota oficial de tu Plan Claude (5h y 7 días)">
         <div class="kpi-top">
-          <span class="kpi-label">Claude</span>
+          <span class="kpi-label">Claude <span class="run-count" data-running-provider="claude" title="Instancias corriendo"></span></span>
           <span class="kpi-tag tag-cl">PLAN</span>
         </div>
         <div class="kpi-quota-row">
@@ -264,7 +264,7 @@
       <!-- KPI 3: Cuota & Pulso AGY -->
       <div class="kpi-card kpi-agy" id="kpi-agy-card" title="Uso y cuota de referencia de Antigravity (5h y 7 días)">
         <div class="kpi-top">
-          <span class="kpi-label">AGY</span>
+          <span class="kpi-label">AGY <span class="run-count" data-running-provider="agy" title="Instancias corriendo"></span></span>
           <span class="kpi-tag tag-agy" id="kpi-agy-model-tag">ARGON</span>
         </div>
         <div class="kpi-quota-row">
@@ -280,7 +280,7 @@
 
       <!-- KPI 4: Tokens Combinados & Eficiencia -->
       <div class="kpi-card kpi-codex" id="kpi-codex-card" title="Última cuota informada por Codex en los registros locales">
-        <div class="kpi-top"><span class="kpi-label">CODEX</span><span class="kpi-tag">OpenAI</span></div>
+        <div class="kpi-top"><span class="kpi-label">CODEX <span class="run-count" data-running-provider="codex" title="Instancias corriendo"></span></span><span class="kpi-tag">OpenAI</span></div>
         <div class="kpi-quota-row"><span>5h <strong id="kpi-codex-fh-val">--%</strong></span><span>7d <strong id="kpi-codex-sd-val">--%</strong></span></div>
         <div class="dual-mini-bars">
           <div class="dmb-track"><div id="kpi-codex-fh-bar" class="dmb-fill fill-codex" style="width:0%"></div></div>
@@ -338,7 +338,7 @@
         <div class="section-card card-accent-orange">
           <div class="section-header">
             <div class="sh-left">
-              <span class="provider-pill prov-claude">CLAUDE</span>
+              <span class="provider-pill prov-claude">CLAUDE <span class="run-count" data-running-provider="claude" title="Instancias corriendo"></span></span>
               <h3>Cuota Oficial Plan Claude</h3>
             </div>
             <span id="quota-updated-at" class="muted-xs">Sincronizado con Claude App</span>
@@ -392,7 +392,7 @@
         <div class="section-card card-accent-ochre">
           <div class="section-header">
             <div class="sh-left">
-              <span class="provider-pill prov-agy">AGY</span>
+              <span class="provider-pill prov-agy">AGY <span class="run-count" data-running-provider="agy" title="Instancias corriendo"></span></span>
               <h3>Consumo estimado AGY</h3>
             </div>
             <span id="agy-meta-badge" class="badge-pill badge-ochre">Gemini 4 Argon</span>
@@ -430,7 +430,7 @@
         </div>
 
         <div class="section-card card-accent-codex">
-          <div class="section-header"><div class="sh-left"><span class="provider-pill prov-codex">CODEX</span><h3>Uso y límites de Codex</h3></div><span id="codex-plan" class="badge-pill">--</span></div>
+          <div class="section-header"><div class="sh-left"><span class="provider-pill prov-codex">CODEX <span class="run-count" data-running-provider="codex" title="Instancias corriendo"></span></span><h3>Uso y límites de Codex</h3></div><span id="codex-plan" class="badge-pill">--</span></div>
           <div class="quota-gauges-grid">
             <div class="quota-box">
               <div class="qb-top"><span>Ventana 5 horas</span><strong id="codex-fh-pct" class="qb-pct brand-codex">--%</strong></div>

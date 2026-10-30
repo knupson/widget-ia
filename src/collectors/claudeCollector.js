@@ -633,13 +633,16 @@ function readClaudeUtilizationMeta() {
       return meta;
     }
 
+    const parseResetAt = (value) => typeof value === 'number'
+      ? (value < 1e12 ? value * 1000 : value)
+      : Date.parse(value);
     if (util.seven_day?.resets_at) {
-      const ts = Date.parse(util.seven_day.resets_at);
-      if (!Number.isNaN(ts)) meta.nextWeeklyResetAt = ts;
+      const ts = parseResetAt(util.seven_day.resets_at);
+      if (Number.isFinite(ts)) meta.nextWeeklyResetAt = ts;
     }
     if (util.five_hour?.resets_at) {
-      const ts = Date.parse(util.five_hour.resets_at);
-      if (!Number.isNaN(ts)) meta.nextFiveHourResetAt = ts;
+      const ts = parseResetAt(util.five_hour.resets_at);
+      if (Number.isFinite(ts)) meta.nextFiveHourResetAt = ts;
     }
 
     const promoKeys = [
@@ -745,6 +748,7 @@ function readDesktopPlanQuotaUsage() {
             fromPct: prevSd,
             toPct: currSd,
             savedPct: drop,
+            estimated: true,
             isBonus,
             label: isBonus ? '🎁 Reseteo Gratis (Bonus)' : '🔄 Reseteo Semanal'
           });
@@ -759,11 +763,14 @@ function readDesktopPlanQuotaUsage() {
     const now = Date.now();
     // Si nextWeeklyResetAt ya pasó o no está disponible, proyectar en bloques de 7 días desde la referencia o último reset
     let nextWeeklyResetAt = utilMeta.nextWeeklyResetAt;
+    let nextWeeklyResetEstimated = false;
     if (nextWeeklyResetAt && nextWeeklyResetAt <= now) {
+      nextWeeklyResetEstimated = true;
       while (nextWeeklyResetAt <= now) {
         nextWeeklyResetAt += 7 * 24 * 3600 * 1000;
       }
     } else if (!nextWeeklyResetAt && latestHistoricalReset) {
+      nextWeeklyResetEstimated = true;
       const schedReset = allResets.find((r) => !r.isBonus) || latestHistoricalReset;
       nextWeeklyResetAt = schedReset.timestamp + 7 * 24 * 3600 * 1000;
       while (nextWeeklyResetAt <= now) {
@@ -788,8 +795,10 @@ function readDesktopPlanQuotaUsage() {
 
     // Calcular cuándo resetea la cuota de 5 horas si está activa (fh > 0)
     let nextFiveHourResetAt = utilMeta.nextFiveHourResetAt;
+    let nextFiveHourResetEstimated = false;
     if (!nextFiveHourResetAt || nextFiveHourResetAt <= now) {
       if (fiveHourPct > 0) {
+        nextFiveHourResetEstimated = true;
         const fiveHoursAgo = now - 5 * 3600 * 1000;
         let windowStartTs = latest.t || now;
         for (let i = entries.length - 1; i >= 0; i--) {
@@ -835,6 +844,9 @@ function readDesktopPlanQuotaUsage() {
       updatedAt,
       nextWeeklyResetAt,
       nextFiveHourResetAt: stale ? null : nextFiveHourResetAt,
+      estimated: nextWeeklyResetEstimated || (!stale && nextFiveHourResetEstimated),
+      nextWeeklyResetEstimated,
+      nextFiveHourResetEstimated: !stale && nextFiveHourResetEstimated,
       activePromo: utilMeta.activePromo,
       lastReset: stale ? null : lastReset,
       lastBonusReset: stale ? null : lastBonusReset,
@@ -910,6 +922,9 @@ function readPlanQuotaUsage() {
     ...(desktop || {}),
     available: true,
     source: 'claude-code-statusline',
+    estimated: false,
+    nextFiveHourResetEstimated: false,
+    nextWeeklyResetEstimated: false,
     stale: false,
     fiveHourPct: cli.fiveHourPct,
     sevenDayPct: cli.sevenDayPct,
@@ -917,7 +932,7 @@ function readPlanQuotaUsage() {
     lastKnownSevenDayPct: cli.sevenDayPct,
     updatedAt: cli.lastSeenAt,
     nextFiveHourResetAt: cli.nextFiveHourResetAt,
-    nextWeeklyResetAt: cli.nextWeeklyResetAt || (desktop && desktop.nextWeeklyResetAt) || null
+    nextWeeklyResetAt: cli.nextWeeklyResetAt
   };
 }
 

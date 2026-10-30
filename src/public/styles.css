@@ -67,6 +67,7 @@ body {
 .card-accent-codex { border-left: 2px solid var(--codex-color); }
 .provider-status { margin: 8px 0; color: var(--text-muted); font-size: 11px; line-height: 1.4; }
 .quota-exhausted { color: var(--danger) !important; }
+.run-count { color: var(--text-muted); font-size: 0.85em; font-weight: normal; }
 .aw-codex-card { margin-top: 6px; }
 
 /* =========================================================

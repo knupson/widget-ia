@@ -150,6 +150,7 @@ function parseOfficialQuotaPayload(payload, cred, fetchedAt = Date.now()) {
   if (!payload || !Array.isArray(payload.groups)) return null;
   let weeklyBucket = null;
   let fiveHourBucket = null;
+  const otherBuckets = [];
 
   for (const group of payload.groups) {
     const buckets = Array.isArray(group && group.buckets) ? group.buckets : [];
@@ -177,22 +178,26 @@ function parseOfficialQuotaPayload(payload, cred, fetchedAt = Date.now()) {
       };
 
       if (win.includes('week') || win === '7d') {
-        weeklyBucket = parsedBucket;
-      } else if (win.includes('5h') || win.includes('five') || win.includes('hour') || win.includes('day') || win.includes('daily')) {
+        if (!weeklyBucket || rem < weeklyBucket.remainingFraction) weeklyBucket = parsedBucket;
+      } else if (/(^|[^a-z0-9])(5h|five_hour|fivehour)(?=$|[^a-z0-9])/.test(win) ||
+        Math.abs(Number(b.windowDurationMinutes ?? b.windowMinutes ?? b.durationMinutes) - 300) <= 1) {
         fiveHourBucket = parsedBucket;
+      } else {
+        otherBuckets.push(parsedBucket);
       }
     }
   }
 
   return {
-    available: Boolean(weeklyBucket || fiveHourBucket),
+    available: Boolean(weeklyBucket || fiveHourBucket || otherBuckets.length),
     fetchedAt,
     email: (cred && cred.id_token_email) || '',
     projectId: (cred && cred.project_id) || '',
     region: (cred && cred.region) || 'global',
     userTier: (cred && cred.user_tier) || '',
     weekly: weeklyBucket,
-    fiveHour: fiveHourBucket
+    fiveHour: fiveHourBucket,
+    other: otherBuckets
   };
 }
 
@@ -220,7 +225,6 @@ function triggerBackgroundOfficialQuotaRefresh(now = Date.now()) {
 
       if (needReloadCred) {
         const freshCred = await loadAgyCredentialFromKeyring();
-        apiQuotaCache.cred = freshCred;
         if (freshCred) {
           apiQuotaCache.cred = freshCred;
           apiQuotaCache.credLoadedAt = Date.now();
@@ -232,7 +236,6 @@ function triggerBackgroundOfficialQuotaRefresh(now = Date.now()) {
       let res = await fetchBusinessAiCodeQuota(apiQuotaCache.cred);
       if (res && res.httpStatus === 401) {
         const freshCred = await loadAgyCredentialFromKeyring();
-        apiQuotaCache.cred = freshCred;
         if (freshCred) {
           apiQuotaCache.cred = freshCred;
           apiQuotaCache.credLoadedAt = Date.now();
@@ -327,7 +330,7 @@ function parseQuotaLogActivity(text, fileTime = Date.now()) {
     // Si el error informa "Resets in 0s.", delay es 0 pero el timestamp de reset es conocido (timestamp + 0)
     const computedResetAt = hasDuration ? timestamp + delay : null;
 
-    // Inferir ventana: en AGY la sesión rotativa es de 5h (<= 5h de espera al reset)
+    // La ventana se infiere del plazo restante; el log no confirma su duración total.
     const windowType = hasDuration
       ? delay <= 5 * 3600 * 1000 + 60000
         ? '5h'
@@ -343,6 +346,7 @@ function parseQuotaLogActivity(text, fileTime = Date.now()) {
         resetDelayMs: hasDuration ? delay : null,
         message: 'AGY informó que el pool de cuota está agotado.',
         window: windowType,
+        windowInferred: hasDuration,
         lastSuccessAt: 0
       };
     }

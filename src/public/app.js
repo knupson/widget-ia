@@ -424,6 +424,11 @@
     };
   }
 
+  // Los horarios del historial local se muestran como estimaciones.
+  function claudeResetPrefix(quota) {
+    return quota.source === 'claude-code-statusline' ? '' : '~';
+  }
+
   // Aviso de lectura vencida de Claude (Claude Desktop dejó de escribir su historial)
   function claudeStaleTip(q) {
     const hace = q.updatedAt ? ` (hace ${fmtRelativeTime(q.updatedAt)})` : '';
@@ -534,18 +539,26 @@
   // =========================================================
   // RENDERIZADO: PÍLDORA COMPACTA (MODO 1)
   // =========================================================
+  function renderRunningCounts(data) {
+    document.querySelectorAll('[data-running-provider]').forEach((el) => {
+      const count = data.running?.[el.dataset.runningProvider] || 0;
+      el.textContent = count > 0 ? ` (${count})` : '';
+    });
+  }
+
   function renderPill(data) {
     const sum = data.summary || {};
     const clQuota = resolveClaudeQuota(data);
     const agyQuota = resolveAgyQuota(data);
 
     const pillSig = [
+      data.running?.claude || 0, data.running?.codex || 0, data.running?.agy || 0,
       sum.waitingInput || 0,
       sum.waitingApproval || 0,
       sum.running || 0,
       sum.unreadAlertsCount || 0,
       sum.totalOpen || 0,
-      clQuota.fiveHourPct,
+      clQuota.source, clQuota.fiveHourPct,
       clQuota.sevenDayPct,
       clQuota.nextFiveHourResetAt || 0,
       clQuota.nextWeeklyResetAt || 0,
@@ -636,26 +649,26 @@
       const primaryReset = clQuota.nextFiveHourResetAt || clQuota.nextWeeklyResetAt;
       clResetTimer.textContent = clStale
         ? 'ant.'
-        : primaryReset ? `⏳${fmtCountdownShort(primaryReset).replace(/\s+/g, '')}` : '';
-      clResetTimer.title = clStale ? claudeStaleTip(clQuota) : 'Tiempo para el próximo reseteo de cuota';
+        : primaryReset ? `⏳${claudeResetPrefix(clQuota)}${fmtCountdownShort(primaryReset).replace(/\s+/g, '')}` : '';
+      clResetTimer.title = clStale ? claudeStaleTip(clQuota) : `Tiempo para el próximo reseteo de cuota${claudeResetPrefix(clQuota) ? ' (estimado)' : ''}`;
     }
     if (clResetBadge) {
       if (bonusR) {
         clResetBadge.classList.remove('hidden');
-        clResetBadge.title = `🎁 Último Reseteo Gratis (Bonus): ${fmtDateTimeShort(bonusR.timestamp)} · Bajó de ${bonusR.fromPct}% → ${bonusR.toPct}% (-${bonusR.savedPct}%)`;
+        clResetBadge.title = `🎁 Último Reseteo Gratis (Bonus): ${bonusR.estimated ? '~' : ''}${fmtDateTimeShort(bonusR.timestamp)} · Bajó de ${bonusR.fromPct}% → ${bonusR.toPct}% (-${bonusR.savedPct}%)`;
       } else {
         clResetBadge.classList.add('hidden');
       }
     }
     if (pillClBox) {
       const next5hStr = clQuota.nextFiveHourResetAt
-        ? `\n⏳ Reset 5h: ${fmtTimeShort(clQuota.nextFiveHourResetAt)} (${fmtCountdown(clQuota.nextFiveHourResetAt)})`
+        ? `\n⏳ Reset 5h: ${claudeResetPrefix(clQuota)}${fmtTimeShort(clQuota.nextFiveHourResetAt)} (${fmtCountdown(clQuota.nextFiveHourResetAt)})`
         : '';
       const nextStr = clQuota.nextWeeklyResetAt
-        ? `\n📅 Reset semanal (7d): ${fmtDateTimeShort(clQuota.nextWeeklyResetAt)} (${fmtCountdown(clQuota.nextWeeklyResetAt)})`
+        ? `\n📅 Reset semanal (7d): ${claudeResetPrefix(clQuota)}${fmtDateTimeShort(clQuota.nextWeeklyResetAt)} (${fmtCountdown(clQuota.nextWeeklyResetAt)})`
         : '';
       const bonusStr = bonusR
-        ? `\n🎁 Último Bonus Gratis: ${fmtDateTimeShort(bonusR.timestamp)} (${bonusR.fromPct}% → ${bonusR.toPct}%)`
+        ? `\n🎁 Último Bonus Gratis: ${bonusR.estimated ? '~' : ''}${fmtDateTimeShort(bonusR.timestamp)} (${bonusR.fromPct}% → ${bonusR.toPct}%)`
         : '';
       const clLine = clStale ? claudeStaleTip(clQuota) : `5h: ${clFh}% | Semanal (7d): ${clSd}%`;
       pillClBox.title = `🟠 CLAUDE (Plan Pro/Max)\n${clLine}${next5hStr}${nextStr}${bonusStr}`;
@@ -745,12 +758,13 @@
     const analytics = data.analytics || {};
 
     const summarySig = [
+      data.running?.claude || 0, data.running?.codex || 0, data.running?.agy || 0,
       sum.waitingInput || 0,
       sum.waitingApproval || 0,
       sum.running || 0,
       sum.totalOpen || 0,
       sum.remoteOpen || 0,
-      clQuota.fiveHourPct,
+      clQuota.source, clQuota.fiveHourPct,
       clQuota.sevenDayPct,
       clQuota.nextFiveHourResetAt || 0,
       clQuota.nextWeeklyResetAt || 0,
@@ -804,7 +818,7 @@
       if (clStale) {
         kpiClaudeSub.textContent = `Hoy: ${fmtNumber(todayClaudeTok)} tok · ant.`;
       } else if (clQuota.nextFiveHourResetAt || clQuota.nextWeeklyResetAt) {
-        kpiClaudeSub.textContent = `⏳5h:${fmtCountdownShort(clQuota.nextFiveHourResetAt)} · 7d:${fmtCountdownShort(clQuota.nextWeeklyResetAt)}`;
+        kpiClaudeSub.textContent = `⏳5h:${claudeResetPrefix(clQuota)}${fmtCountdownShort(clQuota.nextFiveHourResetAt)} · 7d:${claudeResetPrefix(clQuota)}${fmtCountdownShort(clQuota.nextWeeklyResetAt)}`;
       } else {
         kpiClaudeSub.textContent = `Hoy: ${fmtNumber(todayClaudeTok)} tok`;
       }
@@ -813,8 +827,8 @@
     if (kpiClaudeCard) {
       kpiClaudeCard.title = clStale ? claudeStaleTip(clQuota) : [
         `Cuota Plan Claude · Hoy: ${fmtNumber(todayClaudeTok)} tok`,
-        clQuota.nextFiveHourResetAt ? `⏳ Reset 5h: ${fmtTimeShort(clQuota.nextFiveHourResetAt)} (${fmtCountdown(clQuota.nextFiveHourResetAt)})` : '',
-        clQuota.nextWeeklyResetAt ? `📅 Reset 7d: ${fmtDateTimeShort(clQuota.nextWeeklyResetAt)} (${fmtCountdown(clQuota.nextWeeklyResetAt)})` : ''
+        clQuota.nextFiveHourResetAt ? `⏳ Reset 5h: ${claudeResetPrefix(clQuota)}${fmtTimeShort(clQuota.nextFiveHourResetAt)} (${fmtCountdown(clQuota.nextFiveHourResetAt)})` : '',
+        clQuota.nextWeeklyResetAt ? `📅 Reset 7d: ${claudeResetPrefix(clQuota)}${fmtDateTimeShort(clQuota.nextWeeklyResetAt)} (${fmtCountdown(clQuota.nextWeeklyResetAt)})` : ''
       ].filter(Boolean).join('\n');
     }
 
@@ -1087,7 +1101,7 @@
 
     // Firma diferencial: el SSE llega seguido y la pestaña sólo se reconstruye si cambió algo visible
     const tokensSig = JSON.stringify([
-      clQuota.fiveHourPct, clQuota.sevenDayPct, clQuota.stale, clQuota.lastKnownFiveHourPct,
+      clQuota.source, clQuota.fiveHourPct, clQuota.sevenDayPct, clQuota.stale, clQuota.lastKnownFiveHourPct,
       clQuota.lastKnownSevenDayPct, clQuota.updatedAt || 0, clQuota.nextFiveHourResetAt || 0,
       clQuota.nextWeeklyResetAt || 0, clQuota.resets, clQuota.history,
       agyQuota, analytics, Math.floor(Date.now() / 60000)
@@ -1123,14 +1137,14 @@
     const clFhResetEl = document.getElementById('tokens-cl-fh-reset');
     if (clFhResetEl) {
       clFhResetEl.textContent = clQuota.nextFiveHourResetAt
-        ? `⏳ Resetea: ${fmtTimeShort(clQuota.nextFiveHourResetAt)} (${fmtCountdown(clQuota.nextFiveHourResetAt)})`
+        ? `⏳ Resetea: ${claudeResetPrefix(clQuota)}${fmtTimeShort(clQuota.nextFiveHourResetAt)} (${fmtCountdown(clQuota.nextFiveHourResetAt)})`
         : '⏳ Ventana móvil 5h activa';
     }
 
     const clSdResetEl = document.getElementById('tokens-cl-sd-reset');
     if (clSdResetEl) {
       clSdResetEl.textContent = clQuota.nextWeeklyResetAt
-        ? `⏳ Resetea: ${fmtDateTimeShort(clQuota.nextWeeklyResetAt)} (${fmtCountdown(clQuota.nextWeeklyResetAt)})`
+        ? `⏳ Resetea: ${claudeResetPrefix(clQuota)}${fmtDateTimeShort(clQuota.nextWeeklyResetAt)} (${fmtCountdown(clQuota.nextWeeklyResetAt)})`
         : '⏳ Ventana semanal (7d)';
     }
 
@@ -1164,16 +1178,16 @@
     const next5hEl = document.getElementById('claude-next-5h-txt');
     if (next5hEl) {
       next5hEl.textContent = clQuota.nextFiveHourResetAt
-        ? `${fmtTimeShort(clQuota.nextFiveHourResetAt)} (${fmtCountdownShort(clQuota.nextFiveHourResetAt)})`
+        ? `${claudeResetPrefix(clQuota)}${fmtTimeShort(clQuota.nextFiveHourResetAt)} (${fmtCountdownShort(clQuota.nextFiveHourResetAt)})`
         : 'En ventana';
     }
 
     const nextResetEl = document.getElementById('claude-next-reset-txt');
     if (nextResetEl) {
       if (clQuota.nextWeeklyResetAt) {
-        nextResetEl.textContent = `${fmtDateTimeShort(clQuota.nextWeeklyResetAt)} (${fmtCountdownShort(clQuota.nextWeeklyResetAt)})`;
+        nextResetEl.textContent = `${claudeResetPrefix(clQuota)}${fmtDateTimeShort(clQuota.nextWeeklyResetAt)} (${fmtCountdownShort(clQuota.nextWeeklyResetAt)})`;
       } else {
-        nextResetEl.textContent = 'Viernes 07:00 hs';
+        nextResetEl.textContent = 'Sin horario de reset informado';
       }
     }
 
@@ -1182,7 +1196,7 @@
       if (clQuota.lastBonusReset) {
         bonusBadgeEl.classList.remove('hidden');
         bonusBadgeEl.textContent = `🎁 Bonus -${clQuota.lastBonusReset.savedPct}%`;
-        bonusBadgeEl.title = `Detectado el ${fmtDateTimeShort(clQuota.lastBonusReset.timestamp)}`;
+        bonusBadgeEl.title = `Detectado el ${clQuota.lastBonusReset.estimated ? '~' : ''}${fmtDateTimeShort(clQuota.lastBonusReset.timestamp)}`;
       } else {
         bonusBadgeEl.classList.add('hidden');
       }
@@ -1204,7 +1218,7 @@
               <div class="crp-item ${r.isBonus ? 'is-bonus' : ''}">
                 <div class="crp-item-left">
                   ${badgeHtml}
-                  <span class="crp-date">${escapeHtml(fmtDateTimeShort(r.timestamp))}</span>
+                  <span class="crp-date">${r.estimated ? '~' : ''}${escapeHtml(fmtDateTimeShort(r.timestamp))}</span>
                 </div>
                 <div class="crp-drop">
                   ${r.fromPct}% → ${r.toPct}%
@@ -1707,8 +1721,8 @@
     const awClTimer = document.getElementById('aw-cl-timer');
     if (awClTimer) {
       const r = clQuota.nextFiveHourResetAt || clQuota.nextWeeklyResetAt;
-      awClTimer.textContent = clQuota.stale ? 'ant.' : r ? `⏳${fmtCountdownShort(r)}` : '';
-      awClTimer.title = clQuota.stale ? claudeStaleTip(clQuota) : '';
+      awClTimer.textContent = clQuota.stale ? 'ant.' : r ? `⏳${claudeResetPrefix(clQuota)}${fmtCountdownShort(r)}` : '';
+      awClTimer.title = clQuota.stale ? claudeStaleTip(clQuota) : claudeResetPrefix(clQuota) ? 'Próximo reseteo (estimado)' : '';
     }
     const awClBonus = document.getElementById('aw-cl-bonus');
     if (awClBonus) {
@@ -2055,7 +2069,7 @@
     const offFiveHour = agy.officialFiveHour || (status.officialApi && status.officialApi.fiveHour) || null;
 
     let message = offWeekly
-      ? `✅ Cuota Semanal Oficial Google (${agy.gcpProject || 'GCP'}): ${offWeekly.usedPctExact}% usado (${offWeekly.remainingPctExact}% libre) · Reset: ${fmtDateTimeShort(offWeekly.resetAt)}. En ventana 5h Google solo reporta estado activo o HTTP 429.`
+      ? `✅ Cuota Semanal Oficial Google (${agy.gcpProject || 'GCP'}): ${offWeekly.usedPctExact}% usado (${offWeekly.remainingPctExact}% libre) · Reset: ${fmtDateTimeShort(offWeekly.resetAt)}. ${offFiveHour ? 'Ventana de 5h informada por la API.' : 'Google no informa una ventana de 5h para este plan en la API; el dato de 5h sólo aparece si hay un 429.'}`
       : 'Consultando cuota semanal oficial en businessaicode.googleapis.com...';
     if (isExhausted) {
       message = `🚫 Pool de cuota AGY (${status.window === '7d' ? '7d' : '5h'}) agotado (HTTP 429). ${
@@ -2080,11 +2094,15 @@
       } else if (value != null) {
         dispVal = `${Math.round(value)}%`;
       } else if (key === 'fh') {
-        dispVal = 'OK';
+        dispVal = '--';
       }
       for (const id of [`pill-agy-${key}-txt`, `aw-agy-${key}-txt`, `kpi-agy-${key}-val`, `agy-${key}-pct`]) {
         text(id, dispVal);
-        document.getElementById(id)?.classList.toggle('quota-exhausted', isKeyExhausted);
+        const el = document.getElementById(id);
+        if (el) {
+          el.classList.toggle('quota-exhausted', isKeyExhausted);
+          el.title = key === 'fh' && value == null && !isKeyExhausted ? 'Sin dato oficial de 5h' : '';
+        }
       }
       for (const barId of [`pill-agy-${key}`, `aw-agy-${key}`, `kpi-agy-${key}-bar`, `agy-${key}-bar`]) {
         const barEl = document.getElementById(barId);
@@ -2119,7 +2137,7 @@
       ? `⏳${fmtCountdownShort(primaryOfficialReset)}`
       : 'Activo';
     let kpiSub = agy.nextWeeklyResetAt
-      ? `5h: ${isExhausted && status.window !== '7d' ? '100%' : 'OK'} · 7d reset: ${fmtCountdownShort(agy.nextWeeklyResetAt)}`
+      ? `5h: ${isExhausted && status.window !== '7d' ? '100%' : agy.fiveHourPct != null ? `${Math.round(agy.fiveHourPct)}%` : '--'} · 7d reset: ${fmtCountdownShort(agy.nextWeeklyResetAt)}`
       : `5h:${fmtNumber(agy.fiveHour?.total || 0)} · 7d:${fmtNumber(agy.sevenDay?.total || 0)}`;
 
     if (isExhausted) {
@@ -2170,7 +2188,7 @@
     } else {
       text(
         'tokens-agy-fh-reset',
-        '✅ Pool 5h operativo (Google no expone % de 5h por API; solo informa reset exacto al llegar al 100%)'
+        'Google no informa una ventana de 5h para este plan en la API; el dato de 5h sólo aparece si hay un 429'
       );
     }
 
@@ -2197,6 +2215,7 @@
   function renderAll(data) {
     if (!data) return;
     currentState = data;
+    renderRunningCounts(data);
 
     // Si se abrió con ?session=... (ej. desde notificación push en Android), abrir ese chat automáticamente
     if (deepLinkSessionId) {
