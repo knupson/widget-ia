@@ -12,6 +12,7 @@ const { getSessionMessages } = require('./services/conversationReader');
 const { sendSessionReply } = require('./services/remoteResponder');
 const { TunnelManager } = require('./services/tunnelManager');
 const { createUsageHistoryStore } = require('./services/usageHistory');
+const { createProjectUsageAggregator } = require('./services/projectUsage');
 const processCounter = require('./services/processCounter');
 
 const CONFIG_PATH = path.resolve(__dirname, '..', 'config.json');
@@ -236,6 +237,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
   });
 
   const usageHistoryStore = createUsageHistoryStore();
+  const projectUsageAggregator = createProjectUsageAggregator();
 
   const remoteManager = new RemoteManager({
     config,
@@ -867,6 +869,12 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
       if (!latestSnapshot) refreshSnapshot();
       const range = urlObj.searchParams.get('range') || '24h';
       sendJson(res, 200, usageHistoryStore.getHistory({ range }), req, cookieHeaders);
+      return;
+    }
+
+    if (req.method === 'GET' && (pathname === '/api/usage/projects' || pathname === '/api/usage/summary')) {
+      const force = urlObj.searchParams.get('force') === '1';
+      sendJson(res, 200, projectUsageAggregator.getUsageReport({ force }), req, cookieHeaders);
       return;
     }
 
