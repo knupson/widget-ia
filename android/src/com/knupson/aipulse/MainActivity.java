@@ -2,6 +2,7 @@ package com.knupson.aipulse;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.DownloadManager;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
@@ -9,6 +10,7 @@ import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.PowerManager;
 import android.provider.Settings;
 import android.text.InputType;
@@ -273,15 +275,31 @@ public class MainActivity extends Activity {
                     loadedBaseUrl = "";
                     connectAndLoad(null, true);
                 })
-                .setNeutralButton("⬇️ Actualizar APK", (d, w) -> {
-                    String base = ConfigStore.getLastActiveBase(MainActivity.this);
-                    if (base != null && !base.isEmpty()) {
-                        Intent browserIntent = new Intent(Intent.ACTION_VIEW, Uri.parse(base + "/ai-pulse.apk"));
-                        startActivity(browserIntent);
-                    }
-                })
+                .setNeutralButton("⬇️ Actualizar APK", (d, w) -> downloadApkUpdate())
                 .setNegativeButton("Cancelar", null)
                 .show();
+    }
+
+    /** /api/apk exige el token por header: el navegador no puede mandarlo, DownloadManager sí. */
+    private void downloadApkUpdate() {
+        String base = ConfigStore.getLastActiveBase(this);
+        if (base == null || base.isEmpty()) {
+            Toast.makeText(this, "Conectate a la PC primero", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        try {
+            DownloadManager.Request req = new DownloadManager.Request(Uri.parse(base + "/api/apk"));
+            req.addRequestHeader("Authorization", "Bearer " + ConfigStore.getAuthToken(this));
+            req.setTitle("AI Pulse – actualización");
+            req.setMimeType("application/vnd.android.package-archive");
+            req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+            req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "ai-pulse.apk");
+            DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+            dm.enqueue(req);
+            Toast.makeText(this, "Descargando… tocá la notificación para instalar", Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "No se pudo descargar: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
     }
 
     private int dp(int v) {
