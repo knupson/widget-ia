@@ -2,6 +2,20 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
+
+/**
+ * Script temporal en un directorio por usuario (LOCALAPPDATA) con nombre aleatorio.
+ * El llamador lo borra después de usarlo.
+ */
+function writeTempScript(prefix, content) {
+  const base = process.env.LOCALAPPDATA || os.homedir();
+  const dir = path.join(base, 'AI Pulse Widget', 'run');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `${prefix}-${crypto.randomBytes(12).toString('hex')}.ps1`);
+  fs.writeFileSync(file, content, 'utf8');
+  return file;
+}
 
 /**
  * Trae al frente la ventana y la PESTAÑA exacta de consola (Windows Terminal, PowerShell, CMD, VS Code o Claude App)
@@ -346,17 +360,6 @@ function Select-WindowsTerminalTab([IntPtr]$wtHwnd, [int]$wtPid, [int]$tabIndex)
 }
 
 $isCurrentlyAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isCurrentlyAdmin -and $PSCommandPath) {
-    $outFile = "$PSCommandPath.out"
-    try {
-        Start-Process -FilePath "powershell.exe" -Verb RunAs -WindowStyle Hidden -Wait -ArgumentList "-NoProfile -STA -NonInteractive -ExecutionPolicy Bypass -Command \`"& '$PSCommandPath' | Out-File -FilePath '$outFile' -Encoding utf8\`""
-        if (Test-Path $outFile) {
-            Get-Content $outFile -Raw
-            Remove-Item $outFile -Force -ErrorAction SilentlyContinue
-            exit 0
-        }
-    } catch {}
-}
 
 $targetPid = ${safePid}
 $provider = "${safeProvider}"
@@ -502,15 +505,18 @@ if ($candidates -and $candidates.Count -gt 0) {
     exit 0
 }
 
+# Sin elevación no se puede enfocar una ventana elevada: se informa, no se pide UAC
+if (-not $isCurrentlyAdmin) {
+    Write-Output "needs_elevation"
+    exit 0
+}
+
 Write-Output "not_found"
 `;
 
-    const tmpScript = path.join(
-      os.tmpdir(),
-      `ai-pulse-focus-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.ps1`
-    );
+    let tmpScript = '';
     try {
-      fs.writeFileSync(tmpScript, psScript, 'utf8');
+      tmpScript = writeTempScript('ai-pulse-focus', psScript);
     } catch (e) {
       resolve({ ok: false, reason: e.message });
       return;
@@ -529,6 +535,15 @@ Write-Output "not_found"
           return;
         }
         const out = String(stdout || '').trim();
+        if (out.startsWith('needs_elevation')) {
+          resolve({
+            ok: false,
+            reason: 'needs_elevation',
+            detail: out,
+            error: 'No se encontró la ventana sin elevación. Si la sesión corre como administrador, ejecutá el widget como administrador.'
+          });
+          return;
+        }
         resolve({ ok: out.startsWith('focused_'), detail: out });
       }
     );

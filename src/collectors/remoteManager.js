@@ -1,7 +1,67 @@
 const https = require('https');
+const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 const { execFile } = require('child_process');
+
+/*
+ * FORMATO DE COMANDOS remote_reply POR ntfy (FIRMADOS) — para el emisor Android
+ *
+ * Mensaje ntfy (body = JSON, sin tags especiales):
+ *   { "type": "remote_reply", "sessionId": "<id>", "text": "<texto o vacío>",
+ *     "quickAction": "<acción o vacío>", "ts": <epoch ms entero>, "sig": "<hex>" }
+ *
+ * Canonical (string, UTF-8):
+ *   "v1|" + type + "|" + b64(sessionId) + "|" + b64(text) + "|" + b64(quickAction) + "|" + ts
+ *   b64 = Base64 estándar con padding (RFC 4648) de los bytes UTF-8 del campo; campo vacío -> ""
+ *   ts  = entero en decimal, sin ceros a la izquierda
+ *
+ * sig = HMAC-SHA256(key = remoteAuthToken en UTF-8, msg = canonical), en hex minúsculas.
+ * Reglas del receptor: |ahora - ts| <= 120000 ms; sig no reutilizable (cache en memoria).
+ * Si falla cualquier regla el comando se descarta sin responder.
+ */
+
+const TOPIC_RE = /^[A-Za-z0-9_-]{8,64}$/;
+const CMD_MAX_SKEW_MS = 2 * 60 * 1000;
+const MAX_REMOTE_SESSIONS = 200;
+const REMOTE_SESSION_TTL_MS = 5 * 60 * 1000;
+const ALLOWED_STATES = ['running', 'waiting_input', 'waiting_approval', 'closed'];
+
+// Limpia cadenas externas: sin caracteres de control y con largo máximo
+function cleanStr(value, max) {
+  return String(value == null ? '' : value).replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, max);
+}
+
+// Contadores de tokens: número finito, >= 0 y acotado
+function cleanCount(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.min(n, 1e12) : 0;
+}
+
+function b64(value) {
+  return Buffer.from(String(value == null ? '' : value), 'utf8').toString('base64');
+}
+
+function buildCommandCanonical(cmd) {
+  return ['v1', cmd.type, b64(cmd.sessionId), b64(cmd.text), b64(cmd.quickAction), String(cmd.ts)].join('|');
+}
+
+// Valida keyPath de SSH: sin '-' inicial, sin control, debe existir como archivo
+function resolveSshKeyPath(raw) {
+  if (raw == null || !String(raw).trim()) return { ok: true, path: '' };
+  let kp = String(raw).trim().replace(/^["']|["']$/g, '');
+  if (/[\u0000-\u001f\u007f]/.test(kp)) return { ok: false, error: 'Ruta de clave SSH con caracteres de control' };
+  if (kp.startsWith('-')) return { ok: false, error: 'Ruta de clave SSH inválida' };
+  if (kp.startsWith('~/') || kp.startsWith('~\\')) kp = path.join(os.homedir(), kp.slice(2));
+  kp = path.resolve(kp);
+  try {
+    if (!fs.statSync(kp).isFile()) return { ok: false, error: 'La ruta de la clave SSH no es un archivo' };
+  } catch {
+    return { ok: false, error: 'La clave SSH no existe en la ruta indicada' };
+  }
+  return { ok: true, path: kp };
+}
 
 class RemoteManager {
   constructor({ config, saveConfig, onRemoteEvent, onRemoteReplyCommand }) {
@@ -17,9 +77,36 @@ class RemoteManager {
     this.ntfyReq = null;
     this.ntfyConnected = false;
     this.ntfyReconnectTimer = null;
+    this.ntfyWatchdogTimer = null;
+    this.ntfyLastDataAt = 0;
     this.sshPollTimer = null;
     this.sshBackoff = new Map(); // target -> { failures, nextCheckAt, inFlight }
     this.networkAddrCache = { checkedAt: 0, list: [] };
+    this.replayCache = new Map(); // sig de comando remote_reply aceptado -> expiresAt
+  }
+
+  /**
+   * Verifica un remote_reply firmado (ver formato al inicio del archivo).
+   * Devuelve true solo si la firma es válida, el ts está en ventana y la sig no fue usada.
+   */
+  verifyRemoteCommand(cmd) {
+    const key = String(this.config.remoteAuthToken || '');
+    if (!key || !cmd || cmd.type !== 'remote_reply') return false;
+    if (typeof cmd.sig !== 'string' || !/^[a-f0-9]{64}$/i.test(cmd.sig)) return false;
+    if (!Number.isSafeInteger(cmd.ts) || !cmd.sessionId) return false;
+    const now = Date.now();
+    if (Math.abs(now - cmd.ts) > CMD_MAX_SKEW_MS) return false;
+
+    const expected = crypto.createHmac('sha256', key).update(buildCommandCanonical(cmd)).digest('hex');
+    const given = cmd.sig.toLowerCase();
+    if (!crypto.timingSafeEqual(Buffer.from(given, 'hex'), Buffer.from(expected, 'hex'))) return false;
+
+    for (const [sig, expiresAt] of this.replayCache) {
+      if (expiresAt < now) this.replayCache.delete(sig);
+    }
+    if (this.replayCache.has(given)) return false;
+    this.replayCache.set(given, cmd.ts + CMD_MAX_SKEW_MS);
+    return true;
   }
 
   start() {
@@ -45,61 +132,93 @@ class RemoteManager {
     this.disconnectNtfyStream();
     const topic = (this.config.ntfyTopic || '').trim();
     if (!topic || this.config.ntfyEnabled === false) return;
+    if (!TOPIC_RE.test(topic)) {
+      console.warn('[ntfy] ntfyTopic inválido (usar 8-64 caracteres [A-Za-z0-9_-]); no se suscribe');
+      this.ntfyConnected = false;
+      return;
+    }
 
     const url = `https://ntfy.sh/${encodeURIComponent(topic)}/json`;
     try {
-      const req = https.get(url, { headers: { Accept: 'application/x-ndjson' } }, (res) => {
-        if (res.statusCode !== 200) {
-          this.ntfyConnected = false;
-          this.scheduleNtfyReconnect();
-          return;
-        }
-        this.ntfyConnected = true;
-        let buffer = '';
-
-        res.on('data', (chunk) => {
-          buffer += chunk.toString('utf8');
-          const lines = buffer.split(/\r?\n/);
-          buffer = lines.pop() || '';
-          for (const line of lines) {
-            if (!line.trim()) continue;
-            try {
-              const evt = JSON.parse(line);
-              if (evt.event === 'message' && evt.message) {
-                const tags = Array.isArray(evt.tags) ? evt.tags : [];
-                if (tags.includes('ai_pulse_outbound') || evt.title === 'AI Pulse 4G Listo') {
-                  continue;
-                }
-                let payload;
-                try {
-                  payload = JSON.parse(evt.message);
-                } catch {
-                  payload = {
-                    host: evt.title || 'CLI Remoto',
-                    state: 'waiting_input',
-                    message: evt.message
-                  };
-                }
-                if (payload && payload.__fromAiPulseServer) continue;
-                if (payload && payload.type === 'remote_reply' && typeof this.onRemoteReplyCommand === 'function') {
-                  this.onRemoteReplyCommand(payload);
-                  continue;
-                }
-                this.ingestRemotePayload(payload, 'ntfy');
-              }
-            } catch {}
+      const req = https.get(
+        url,
+        {
+          headers: { Accept: 'application/x-ndjson' },
+          timeout: 95000
+        },
+        (res) => {
+          if (res.statusCode !== 200) {
+            this.ntfyConnected = false;
+            this.scheduleNtfyReconnect();
+            return;
           }
-        });
+          this.ntfyConnected = true;
+          this.ntfyLastDataAt = Date.now();
+          this.networkAddrCache.checkedAt = 0;
+          let buffer = '';
 
-        res.on('end', () => {
-          this.ntfyConnected = false;
-          this.scheduleNtfyReconnect();
-        });
+          // Watchdog para cortes silenciosos de internet (ntfy.sh envía keepalive cada ~45s)
+          if (this.ntfyWatchdogTimer) clearInterval(this.ntfyWatchdogTimer);
+          this.ntfyWatchdogTimer = setInterval(() => {
+            if (this.ntfyConnected && Date.now() - this.ntfyLastDataAt > 95000) {
+              this.disconnectNtfyStream();
+              this.scheduleNtfyReconnect(2000);
+            }
+          }, 30000);
 
-        res.on('error', () => {
-          this.ntfyConnected = false;
-          this.scheduleNtfyReconnect();
-        });
+          res.on('data', (chunk) => {
+            this.ntfyLastDataAt = Date.now();
+            buffer += chunk.toString('utf8');
+            const lines = buffer.split(/\r?\n/);
+            buffer = lines.pop() || '';
+            for (const line of lines) {
+              if (!line.trim()) continue;
+              try {
+                const evt = JSON.parse(line);
+                if (evt.event === 'message' && evt.message) {
+                  const tags = Array.isArray(evt.tags) ? evt.tags : [];
+                  if (tags.includes('ai_pulse_outbound') || evt.title === 'AI Pulse 4G Listo') {
+                    continue;
+                  }
+                  let payload;
+                  try {
+                    payload = JSON.parse(evt.message);
+                  } catch {
+                    payload = {
+                      host: evt.title || 'CLI Remoto',
+                      state: 'waiting_input',
+                      message: evt.message
+                    };
+                  }
+                  if (payload && payload.__fromAiPulseServer) continue;
+                  if (payload && payload.type === 'remote_reply') {
+                    // Comando sin firma válida, vencido o repetido: se descarta sin ingerirlo
+                    if (this.verifyRemoteCommand(payload) && typeof this.onRemoteReplyCommand === 'function') {
+                      Promise.resolve(this.onRemoteReplyCommand(payload)).catch(() => {});
+                    }
+                    continue;
+                  }
+                  this.ingestRemotePayload(payload, 'ntfy');
+                }
+              } catch {}
+            }
+          });
+
+          res.on('end', () => {
+            this.ntfyConnected = false;
+            this.scheduleNtfyReconnect();
+          });
+
+          res.on('error', () => {
+            this.ntfyConnected = false;
+            this.scheduleNtfyReconnect();
+          });
+        }
+      );
+
+      req.on('timeout', () => {
+        this.disconnectNtfyStream();
+        this.scheduleNtfyReconnect(2000);
       });
 
       req.on('error', () => {
@@ -119,6 +238,10 @@ class RemoteManager {
       clearTimeout(this.ntfyReconnectTimer);
       this.ntfyReconnectTimer = null;
     }
+    if (this.ntfyWatchdogTimer) {
+      clearInterval(this.ntfyWatchdogTimer);
+      this.ntfyWatchdogTimer = null;
+    }
     if (this.ntfyReq) {
       try {
         this.ntfyReq.destroy();
@@ -128,13 +251,13 @@ class RemoteManager {
     this.ntfyConnected = false;
   }
 
-  scheduleNtfyReconnect() {
+  scheduleNtfyReconnect(delayMs = 8000) {
     if (this.ntfyReconnectTimer) return;
     if (this.config.ntfyEnabled === false) return;
     this.ntfyReconnectTimer = setTimeout(() => {
       this.ntfyReconnectTimer = null;
       this.connectNtfyStream();
-    }, 8000);
+    }, delayMs);
   }
 
   /**
@@ -143,9 +266,9 @@ class RemoteManager {
   ingestRemotePayload(payload, transport = 'http') {
     if (!payload || typeof payload !== 'object') return null;
 
-    const host = String(payload.host || payload.hostname || 'remoto').trim();
-    const provider = String(payload.provider || 'claude').toLowerCase();
-    const rawSessionId = String(payload.sessionId || payload.id || payload.project || 'default').trim();
+    const host = cleanStr(payload.host || payload.hostname || 'remoto', 64) || 'remoto';
+    const provider = cleanStr(payload.provider || 'claude', 16).toLowerCase();
+    const rawSessionId = cleanStr(payload.sessionId || payload.id || payload.project || 'default', 128) || 'default';
     const fullId = `remote:${host}:${provider}:${rawSessionId}`;
 
     // Mapear evento o estado
@@ -167,33 +290,35 @@ class RemoteManager {
     ) {
       state = 'running';
     }
+    if (!ALLOWED_STATES.includes(state)) state = 'waiting_input';
 
     const existing = this.remoteSessions.get(fullId);
-    const workspace = String(payload.cwd || payload.workspace || (existing && existing.workspace) || '');
+    const workspace = cleanStr(payload.cwd || payload.workspace || (existing && existing.workspace) || '', 260);
     const projectName =
-      payload.projectName ||
+      cleanStr(payload.projectName, 80) ||
       (workspace ? workspace.split(/[\\/]/).filter(Boolean).pop() : '') ||
       (existing && existing.projectName) ||
       host;
 
     const title =
-      payload.title ||
-      payload.name ||
+      cleanStr(payload.title || payload.name, 120) ||
       (existing && existing.title) ||
       `${provider.toUpperCase()} @ ${host}`;
 
-    const inTok = Number((payload.tokens && payload.tokens.input) || payload.inputTokens || (existing && existing.tokens.input) || 0);
-    const crTok = Number((payload.tokens && payload.tokens.cacheRead) || payload.cacheReadTokens || (existing && existing.tokens.cacheRead) || 0);
-    const cwTok = Number((payload.tokens && payload.tokens.cacheWrite) || payload.cacheWriteTokens || (existing && existing.tokens.cacheWrite) || 0);
-    const outTok = Number((payload.tokens && payload.tokens.output) || payload.outputTokens || (existing && existing.tokens.output) || 0);
-    const totalTok = Number(
+    const inTok = cleanCount((payload.tokens && payload.tokens.input) || payload.inputTokens || (existing && existing.tokens.input) || 0);
+    const crTok = cleanCount((payload.tokens && payload.tokens.cacheRead) || payload.cacheReadTokens || (existing && existing.tokens.cacheRead) || 0);
+    const cwTok = cleanCount((payload.tokens && payload.tokens.cacheWrite) || payload.cacheWriteTokens || (existing && existing.tokens.cacheWrite) || 0);
+    const outTok = cleanCount((payload.tokens && payload.tokens.output) || payload.outputTokens || (existing && existing.tokens.output) || 0);
+    const totalTok = cleanCount(
       (payload.tokens && payload.tokens.total) ||
       payload.totalTokens ||
       inTok + crTok + cwTok + outTok
     );
     const effTok = Math.round(inTok + crTok * 0.1 + cwTok * 2 + outTok * 5);
 
-    const updatedAt = Number(payload.updatedAt) || Date.now();
+    // updatedAt no puede venir en el futuro ni ser arbitrario: se acota a ahora
+    const nowMs = Date.now();
+    const updatedAt = Math.min(Number(payload.updatedAt) || nowMs, nowMs);
     const sessionObj = {
       id: fullId,
       sessionId: rawSessionId,
@@ -210,15 +335,17 @@ class RemoteManager {
       projectName,
       workspace,
       updatedAt,
+      lastSeen: nowMs, // expiración por última recepción (no por updatedAt del payload)
       turns: Number(payload.turns || (existing ? existing.turns + 1 : 1)),
-      lastMessage: String(
+      lastMessage: cleanStr(
         payload.message ||
         payload.lastMessage ||
         payload.last_assistant_message ||
         (existing && existing.lastMessage) ||
-        ''
-      ).slice(0, 260),
-      currentAction: String(payload.currentAction || '').slice(0, 120),
+        '',
+        260
+      ),
+      currentAction: cleanStr(payload.currentAction, 120),
       tokens: {
         input: inTok,
         cacheRead: crTok,
@@ -230,6 +357,18 @@ class RemoteManager {
       }
     };
 
+    if (!existing && this.remoteSessions.size >= MAX_REMOTE_SESSIONS) {
+      // Tope: se descarta la sesión menos vista para no crecer sin límite
+      let oldestId = null;
+      let oldestSeen = Infinity;
+      for (const [id, sess] of this.remoteSessions) {
+        if (sess.lastSeen < oldestSeen) {
+          oldestSeen = sess.lastSeen;
+          oldestId = id;
+        }
+      }
+      if (oldestId) this.remoteSessions.delete(oldestId);
+    }
     this.remoteSessions.set(fullId, sessionObj);
     if (typeof this.onRemoteEvent === 'function') {
       this.onRemoteEvent(sessionObj, existing);
@@ -273,6 +412,12 @@ class RemoteManager {
       hostCfg.lastError = 'Formato de host/usuario SSH inválido';
       return;
     }
+    const keyCheck = resolveSshKeyPath(hostCfg.keyPath);
+    if (!keyCheck.ok) {
+      hostCfg.lastStatus = 'error';
+      hostCfg.lastError = keyCheck.error;
+      return;
+    }
 
     const now = Date.now();
     const bState = this.sshBackoff.get(target) || { failures: 0, nextCheckAt: 0, inFlight: false };
@@ -284,16 +429,7 @@ class RemoteManager {
 
     const portNum = Number(hostCfg.port);
     const portArg = Number.isInteger(portNum) && portNum > 0 && portNum <= 65535 ? ['-p', String(portNum)] : [];
-    const keyArg = [];
-    if (hostCfg.keyPath && String(hostCfg.keyPath).trim()) {
-      let kp = String(hostCfg.keyPath).trim().replace(/^["']|["']$/g, '');
-      if (kp.startsWith('~/') || kp.startsWith('~\\')) {
-        kp = path.join(os.homedir(), kp.slice(2));
-      }
-      if (!kp.startsWith('-')) {
-        keyArg.push('-i', kp);
-      }
-    }
+    const keyArg = keyCheck.path ? ['-i', keyCheck.path] : [];
     // Script POSIX codificado en Base64 para compatibilidad total con cualquier login shell remoto (fish, bash, zsh, sh)
     // Inspecciona tanto sesiones de Claude (~/.claude/sessions) como de Antigravity CLI (~/.gemini/antigravity-cli/brain)
     const posixProbeScript = `
@@ -303,6 +439,19 @@ import os, glob, json, time, socket, subprocess, re
 
 host = socket.gethostname()
 now = time.time()
+
+def pid_alive(pid):
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except Exception:
+        return False
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as fp:
+            return b"claude" in fp.read().lower()
+    except Exception:
+        return True
 
 running_procs = ""
 try:
@@ -320,13 +469,7 @@ for f in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
         with open(f, "r", encoding="utf-8", errors="ignore") as fp:
             data = json.load(fp)
         pid = int(data.get("pid") or 0)
-        alive = False
-        if pid > 0:
-            try:
-                os.kill(pid, 0)
-                alive = True
-            except Exception:
-                alive = False
+        alive = pid_alive(pid)
         st = "closed"
         if alive:
             st = "waiting_input" if data.get("status") == "idle" else "running"
@@ -470,12 +613,15 @@ fi
       hostCfg.nextRetryAt = null;
       if (typeof this.saveConfig === 'function') this.saveConfig();
 
+      // Sondeo exitoso: las sesiones SSH previas de este host se reemplazan por las actuales
+      const sshHostName = hostCfg.label || target;
+      this.purgeSshSessions(sshHostName);
       const lines = String(stdout || '').split(/\r?\n/);
       for (const line of lines) {
         if (!line.trim().startsWith('{')) continue;
         try {
           const obj = JSON.parse(line.trim());
-          const hostName = hostCfg.label || obj.__host || target;
+          const hostName = sshHostName;
           const isAgy = obj.provider === 'agy';
           this.ingestRemotePayload(
             {
@@ -502,8 +648,8 @@ fi
     const now = Date.now();
     const list = [];
     for (const [id, sess] of this.remoteSessions.entries()) {
-      // Expirar sesiones remotas sin actividad en más de 12 horas
-      if (now - sess.updatedAt > 12 * 60 * 60 * 1000) {
+      // Expirar sesiones remotas que no se recibieron hace más de 5 minutos
+      if (now - (sess.lastSeen || 0) > REMOTE_SESSION_TTL_MS) {
         this.remoteSessions.delete(id);
         continue;
       }
@@ -514,6 +660,15 @@ fi
 
   removeRemoteSession(id) {
     return this.remoteSessions.delete(id);
+  }
+
+  // Un sondeo SSH exitoso reemplaza las sesiones previas de ese host
+  purgeSshSessions(hostName) {
+    for (const [id, sess] of this.remoteSessions.entries()) {
+      if (sess.transport === 'ssh' && sess.remoteHost === hostName) {
+        this.remoteSessions.delete(id);
+      }
+    }
   }
 
   /**
@@ -555,7 +710,9 @@ fi
    * tanto para modo sin SSH (Relay ntfy.sh) como modo directo HTTP
    */
   getRemoteSetupSnippets(port) {
-    const topic = this.config.ntfyTopic || 'ai-pulse-default';
+    // El tópico se interpola en bash/PowerShell: solo se usa si cumple TOPIC_RE (sin comillas ni '$')
+    const rawTopic = String(this.config.ntfyTopic || '');
+    const topic = TOPIC_RE.test(rawTopic) ? rawTopic : 'TU_TOPICO_NTFY';
     const ips = this.getLocalNetworkAddresses();
     const primaryIp = ips.length > 0 ? ips[0].address : 'TU_IP_LOCAL';
     const relayUrl = `https://ntfy.sh/${topic}`;
@@ -611,18 +768,26 @@ fi
   /**
    * Envía notificación push saliente por ntfy.sh al celular cuando una consola local termina o pide permiso
    */
-  sendOutboundAlertPush(alertObj, mobileBaseUrl, authToken) {
+  /**
+   * Push saliente a ntfy cuando una consola local termina o pide permiso.
+   * Por defecto solo envía el estado ("Lista"/"Permiso"/"Cuota"). Nombre de proyecto y texto
+   * solo con config.ntfyIncludeText === true. NUNCA incluye remoteAuthToken.
+   */
+  sendOutboundAlertPush(alertObj, mobileBaseUrl) {
     if (!alertObj || alertObj.isRemote) return;
     if (this.config.ntfyEnabled === false || !this.config.ntfyTopic) return;
     if (this.config.ntfyPushLocalAlerts === false) return;
 
     const topic = (this.config.ntfyTopic || '').trim();
-    if (!topic) return;
+    if (!topic || !TOPIC_RE.test(topic)) return;
 
+    const includeText = this.config.ntfyIncludeText === true;
     const isApproval = alertObj.alertType === 'waiting_approval';
     const isBonus = alertObj.alertType === 'quota_reset';
+    const statusWord = isBonus ? 'Cuota' : isApproval ? 'Permiso' : 'Lista';
     const titlePrefix = isBonus ? '🎁 Cuota' : isApproval ? '⚠️ Permiso' : '✅ Lista';
-    const rawTitle = `${titlePrefix} [${alertObj.providerLabel || alertObj.provider}] ${alertObj.projectName || ''}`.trim();
+    const label = alertObj.providerLabel || alertObj.provider || '';
+    const rawTitle = `${titlePrefix} [${label}]${includeText && alertObj.projectName ? ` ${alertObj.projectName}` : ''}`.trim();
     // Header HTTP debe ser ASCII seguro
     const safeAsciiTitle = rawTitle.replace(/[^\x20-\x7E]/g, '').trim() || 'AI Pulse Alert';
 
@@ -633,13 +798,13 @@ fi
     };
 
     if (mobileBaseUrl) {
-      const clickUrl = `${mobileBaseUrl}/?session=${encodeURIComponent(alertObj.sessionId || '')}${
-        authToken ? `&token=${encodeURIComponent(authToken)}` : ''
-      }`;
-      headers.Click = clickUrl;
+      // Link sin token: la app del celular ya tiene su clave
+      headers.Click = `${mobileBaseUrl}/?session=${encodeURIComponent(alertObj.sessionId || '')}`;
     }
 
-    const bodyText = `${rawTitle}\n${alertObj.title || ''}\n${alertObj.message || ''}`.trim();
+    const bodyText = includeText
+      ? `${rawTitle}\n${alertObj.title || ''}\n${alertObj.message || ''}`.trim()
+      : statusWord;
 
     try {
       const req = https.request(

@@ -42,7 +42,7 @@
   let lastSummarySig = '';
   let lastSessionsSig = '';
   let lastTokensSig = '';
-  let lastRemotesSig = '';
+  let lastChatSig = '';
   let lastSshListSig = '';
   let editingSshIndex = null;
 
@@ -424,6 +424,24 @@
     };
   }
 
+  // Aviso de lectura vencida de Claude (Claude Desktop dejó de escribir su historial)
+  function claudeStaleTip(q) {
+    const hace = q.updatedAt ? ` (hace ${fmtRelativeTime(q.updatedAt)})` : '';
+    return `Lectura anterior de Claude Desktop${hace}. Abrí Claude Desktop para actualizar.\nÚltimo valor: 5h ${q.lastKnownFiveHourPct ?? '--'}% · 7d ${q.lastKnownSevenDayPct ?? '--'}%`;
+  }
+
+  // Barra de cuota Claude: sin lectura vigente (null) se oculta el relleno y el track queda punteado, nunca como 0%
+  function setClaudeBar(el, value) {
+    if (!el) return;
+    const unknown = value == null;
+    el.style.display = unknown ? 'none' : '';
+    if (!unknown) {
+      el.style.width = `${Math.min(100, value)}%`;
+      el.classList.toggle('fill-danger', value >= 90);
+    }
+    el.parentElement?.classList.toggle('is-unknown', unknown);
+  }
+
   function drawSparklineSvg(svgEl, hist, color5h, color7d) {
     if (!svgEl) return;
     if (!Array.isArray(hist) || hist.length < 2) {
@@ -457,18 +475,12 @@
     `;
   }
 
-  // Sintetiza o resuelve la telemetría de cuota AGY (compatible en caliente sin reiniciar proceso)
+  // Resuelve la telemetría real de cuota AGY sin inventar porcentajes
   function resolveAgyQuota(data) {
     if (data && data.agyQuota && data.agyQuota.available) {
       return data.agyQuota;
     }
-    const cfg = (data && data.config) || {};
-    const fiveHourLimit = (Number(cfg.agyFiveHourLimitM) || 25) * 1_000_000;
-    const sevenDayLimit = (Number(cfg.agySevenDayLimitM) || 100) * 1_000_000;
-
-    const todayAgy = data?.analytics?.today?.agy || { total: 0, effective: 0, turns: 0, cacheRead: 0 };
     const weeklyAgy = data?.analytics?.weekly?.agy || { total: 0, effective: 0, turns: 0, cacheRead: 0 };
-
     const now = Date.now();
     const fiveHoursAgo = now - 5 * 3600 * 1000;
     const agySessions5h = (data?.sessions || []).filter(
@@ -483,37 +495,17 @@
       fhEffective += s.tokens?.effective || 0;
       fhTurns += s.tokens?.turns || s.turns || 0;
     }
-    if (fhTotal === 0 && todayAgy.total > 0) {
-      fhTotal = Math.round(todayAgy.total * 0.45);
-      fhEffective = Math.round(todayAgy.effective * 0.45);
-      fhTurns = Math.round((todayAgy.turns || 0) * 0.45);
-    }
-
-    const fiveHourPct = Math.min(100, Math.round((fhEffective / Math.max(1, fiveHourLimit)) * 100));
-    const sevenDayPct = Math.min(
-      100,
-      Math.round(((weeklyAgy.effective || 0) / Math.max(1, sevenDayLimit)) * 100)
-    );
 
     const cacheRead7d =
       weeklyAgy.cacheRead || Math.max(0, (weeklyAgy.total || 0) - (weeklyAgy.effective || 0));
     const cacheHitPct =
       weeklyAgy.total > 0 ? Math.round((cacheRead7d / weeklyAgy.total) * 100) : 0;
 
-    const tl = data?.analytics?.timeline || [];
-    const history = tl.map((d) => {
-      const dayEff = d.agy?.effective || 0;
-      return {
-        t: d.date,
-        fh: Math.min(100, Math.round(((dayEff / 3) / Math.max(1, fiveHourLimit)) * 100)),
-        sd: sevenDayPct
-      };
-    });
-
     return {
       available: true,
-      fiveHourPct,
-      sevenDayPct,
+      estimated: false,
+      fiveHourPct: null,
+      sevenDayPct: null,
       fiveHour: { total: fhTotal, effective: fhEffective, turns: fhTurns },
       sevenDay: {
         total: weeklyAgy.total || 0,
@@ -524,18 +516,19 @@
       cacheHitPct,
       model: 'Gemini 4 Argon (High)',
       gcpProject: 'GCP Workspace',
-      history
+      history: []
     };
   }
 
   function compactStateLabel(s) {
+    if (s && s.stateLabel) return s.stateLabel;
     const map = {
       waiting_approval: 'Permiso',
       waiting_input: 'Lista',
       running: 'Activa',
       closed: 'Cerrada'
     };
-    return map[s.state] || s.stateLabel || s.state;
+    return map[s.state] || s.state;
   }
 
   // =========================================================
@@ -557,6 +550,7 @@
       clQuota.nextFiveHourResetAt || 0,
       clQuota.nextWeeklyResetAt || 0,
       clQuota.lastBonusReset ? clQuota.lastBonusReset.timestamp : 0,
+      clQuota.stale ? `1:${clQuota.lastKnownFiveHourPct ?? ''}:${clQuota.lastKnownSevenDayPct ?? ''}:${clQuota.updatedAt || 0}` : 0,
       agyQuota.available ? 1 : 0,
       agyQuota.fiveHourPct,
       agyQuota.sevenDayPct,
@@ -564,6 +558,12 @@
       agyQuota.nextWeeklyResetAt || 0,
       agyQuota.burnRatePerHour || 0,
       agyQuota.cacheHitPct || 0,
+      agyQuota.fiveHour?.total || 0,
+      agyQuota.fiveHour?.turns || 0,
+      agyQuota.sevenDay?.total || 0,
+      agyQuota.sevenDay?.turns || 0,
+      agyQuota.providerStatus ? `${agyQuota.providerStatus.state}:${agyQuota.providerStatus.exhausted ? 1 : 0}:${agyQuota.providerStatus.resetAt || 0}` : '',
+      data.codexQuota ? `${data.codexQuota.fiveHourPct ?? ''}:${data.codexQuota.sevenDayPct ?? ''}:${data.codexQuota.updatedAt || 0}` : '',
       data.config && data.config.soundEnabled ? 1 : 0,
       data.config && data.config.alwaysOnTop !== false ? 1 : 0,
       Math.floor(Date.now() / 60000)
@@ -622,11 +622,9 @@
     const clSd = clQuota.sevenDayPct != null ? clQuota.sevenDayPct : 0;
     const clFhEl = document.getElementById('pill-cl-fh');
     const clSdEl = document.getElementById('pill-cl-sd');
-    if (clFhEl) clFhEl.style.width = `${Math.min(100, clFh)}%`;
-    if (clSdEl) {
-      clSdEl.style.width = `${Math.min(100, clSd)}%`;
-      clSdEl.classList.toggle('fill-danger', clSd >= 90);
-    }
+    setClaudeBar(clFhEl, clQuota.fiveHourPct);
+    setClaudeBar(clSdEl, clQuota.sevenDayPct);
+    const clStale = Boolean(clQuota.stale);
     document.getElementById('pill-cl-fh-txt').textContent = clQuota.fiveHourPct != null ? `${clFh}%` : '--%';
     document.getElementById('pill-cl-sd-txt').textContent = clQuota.sevenDayPct != null ? `${clSd}%` : '--%';
 
@@ -636,7 +634,10 @@
     const bonusR = clQuota.lastBonusReset;
     if (clResetTimer) {
       const primaryReset = clQuota.nextFiveHourResetAt || clQuota.nextWeeklyResetAt;
-      clResetTimer.textContent = primaryReset ? `⏳${fmtCountdownShort(primaryReset).replace(/\s+/g, '')}` : '';
+      clResetTimer.textContent = clStale
+        ? 'ant.'
+        : primaryReset ? `⏳${fmtCountdownShort(primaryReset).replace(/\s+/g, '')}` : '';
+      clResetTimer.title = clStale ? claudeStaleTip(clQuota) : 'Tiempo para el próximo reseteo de cuota';
     }
     if (clResetBadge) {
       if (bonusR) {
@@ -656,7 +657,8 @@
       const bonusStr = bonusR
         ? `\n🎁 Último Bonus Gratis: ${fmtDateTimeShort(bonusR.timestamp)} (${bonusR.fromPct}% → ${bonusR.toPct}%)`
         : '';
-      pillClBox.title = `🟠 CLAUDE (Plan Pro/Max)\n5h: ${clFh}% | Semanal (7d): ${clSd}%${next5hStr}${nextStr}${bonusStr}`;
+      const clLine = clStale ? claudeStaleTip(clQuota) : `5h: ${clFh}% | Semanal (7d): ${clSd}%`;
+      pillClBox.title = `🟠 CLAUDE (Plan Pro/Max)\n${clLine}${next5hStr}${nextStr}${bonusStr}`;
     }
 
     // Cuota AGY en Píldora
@@ -752,12 +754,15 @@
       clQuota.sevenDayPct,
       clQuota.nextFiveHourResetAt || 0,
       clQuota.nextWeeklyResetAt || 0,
+      clQuota.stale ? `1:${clQuota.lastKnownFiveHourPct ?? ''}:${clQuota.lastKnownSevenDayPct ?? ''}:${clQuota.updatedAt || 0}` : 0,
       agyQuota.available ? 1 : 0,
       agyQuota.fiveHourPct,
       agyQuota.sevenDayPct,
       agyQuota.nextFiveHourResetAt || 0,
       agyQuota.nextWeeklyResetAt || 0,
       agyQuota.model || '',
+      agyQuota.providerStatus ? `${agyQuota.providerStatus.state}:${agyQuota.providerStatus.exhausted ? 1 : 0}:${agyQuota.providerStatus.resetAt || 0}` : '',
+      data.codexQuota ? `${data.codexQuota.fiveHourPct ?? ''}:${data.codexQuota.sevenDayPct ?? ''}:${data.codexQuota.updatedAt || 0}` : '',
       analytics.weekly?.combined?.total || 0,
       analytics.weekly?.combined?.cacheRead || 0,
       analytics.today?.combined?.total || 0,
@@ -789,15 +794,16 @@
     const clSd = clQuota.sevenDayPct != null ? clQuota.sevenDayPct : 0;
     document.getElementById('kpi-fh-val').textContent = clQuota.fiveHourPct != null ? `${clFh}%` : '--%';
     document.getElementById('kpi-sd-val').textContent = clQuota.sevenDayPct != null ? `${clSd}%` : '--%';
-    document.getElementById('kpi-fh-bar').style.width = `${Math.min(100, clFh)}%`;
-    const clSdBar = document.getElementById('kpi-sd-bar');
-    clSdBar.style.width = `${Math.min(100, clSd)}%`;
-    clSdBar.classList.toggle('fill-danger', clSd >= 90);
+    const clStale = Boolean(clQuota.stale);
+    setClaudeBar(document.getElementById('kpi-fh-bar'), clQuota.fiveHourPct);
+    setClaudeBar(document.getElementById('kpi-sd-bar'), clQuota.sevenDayPct);
 
     const todayClaudeTok = analytics.today?.claude?.total || 0;
     const kpiClaudeSub = document.getElementById('kpi-claude-sub');
     if (kpiClaudeSub) {
-      if (clQuota.nextFiveHourResetAt || clQuota.nextWeeklyResetAt) {
+      if (clStale) {
+        kpiClaudeSub.textContent = `Hoy: ${fmtNumber(todayClaudeTok)} tok · ant.`;
+      } else if (clQuota.nextFiveHourResetAt || clQuota.nextWeeklyResetAt) {
         kpiClaudeSub.textContent = `⏳5h:${fmtCountdownShort(clQuota.nextFiveHourResetAt)} · 7d:${fmtCountdownShort(clQuota.nextWeeklyResetAt)}`;
       } else {
         kpiClaudeSub.textContent = `Hoy: ${fmtNumber(todayClaudeTok)} tok`;
@@ -805,7 +811,7 @@
     }
     const kpiClaudeCard = document.getElementById('kpi-claude-card');
     if (kpiClaudeCard) {
-      kpiClaudeCard.title = [
+      kpiClaudeCard.title = clStale ? claudeStaleTip(clQuota) : [
         `Cuota Plan Claude · Hoy: ${fmtNumber(todayClaudeTok)} tok`,
         clQuota.nextFiveHourResetAt ? `⏳ Reset 5h: ${fmtTimeShort(clQuota.nextFiveHourResetAt)} (${fmtCountdown(clQuota.nextFiveHourResetAt)})` : '',
         clQuota.nextWeeklyResetAt ? `📅 Reset 7d: ${fmtDateTimeShort(clQuota.nextWeeklyResetAt)} (${fmtCountdown(clQuota.nextWeeklyResetAt)})` : ''
@@ -884,6 +890,7 @@
       }
       if (activeFilter === 'claude' && s.provider !== 'claude') return false;
       if (activeFilter === 'agy' && s.provider !== 'agy') return false;
+      if (activeFilter === 'codex' && s.provider !== 'codex') return false;
       if (activeFilter === 'remote' && !s.isRemote) return false;
 
       if (q) {
@@ -913,6 +920,7 @@
       timeBucket: Math.floor(Date.now() / 30000),
       items: filtered.map((s) => [
         s.id,
+        s.sessionId,
         s.state,
         s.isOpen,
         s.hasUnreadAlert,
@@ -920,7 +928,21 @@
         s.currentAction,
         s.subagentsCount,
         s.backgroundTasksCount,
+        s.provider,
+        s.providerLabel,
+        s.surface,
+        s.isRemote,
+        s.isSubagent,
+        s.workspace,
+        s.projectName,
+        s.title,
+        s.pid,
+        s.turns,
         s.tokens && s.tokens.total,
+        s.tokens && s.tokens.effective,
+        s.tokens && s.tokens.input,
+        s.tokens && s.tokens.output,
+        s.tokens && s.tokens.cacheRead,
         s.tokens && s.tokens.turns
       ])
     });
@@ -949,7 +971,7 @@
           ? 'prov-remote'
           : s.provider === 'claude'
           ? 'prov-claude'
-          : 'prov-agy';
+          : s.provider === 'codex' ? 'prov-codex' : 'prov-agy';
 
         const shortProv = s.isRemote
           ? 'REM'
@@ -957,7 +979,7 @@
           ? s.surface === 'app'
             ? 'CL·APP'
             : 'CLAUDE'
-          : s.isSubagent
+          : s.provider === 'codex' ? 'CODEX' : s.isSubagent
           ? 'AGY·SUB'
           : 'AGY';
 
@@ -996,7 +1018,7 @@
         <article class="session-row state-${escapeHtml(s.state)} ${isPinned ? 'is-pinned' : ''} ${s.hasUnreadAlert ? 'unread-highlight' : ''}"
                  data-session-id="${escapeHtml(s.id)}"
                  data-raw-session-id="${escapeHtml(s.sessionId || s.id)}"
-                 data-pid="${s.pid || ''}"
+                 data-pid="${escapeHtml(s.pid || '')}"
                  data-provider="${escapeHtml(s.provider)}"
                  data-surface="${escapeHtml(s.surface || 'cli')}"
                  data-workspace="${escapeHtml(s.workspace || '')}"
@@ -1017,21 +1039,21 @@
               <span class="sr-time">${fmtRelativeTime(s.updatedAt)}</span>
 
               <div class="sr-actions">
-                <button class="btn-row-icon btn-chat" data-action="chat" data-id="${escapeHtml(s.id)}" title="Ver conversación en vivo y responder remotamente">💬</button>
-                <button class="btn-row-icon ${isPinned ? 'pinned-active' : ''}" data-action="pin" data-id="${escapeHtml(s.id)}" title="${isPinned ? 'Desfijar consola' : 'Fijar consola arriba'}">📌</button>
+                <button class="btn-row-icon btn-chat" data-action="chat" data-id="${escapeHtml(s.id)}" title="Ver conversación en vivo y responder remotamente" aria-label="Ver conversación en vivo">💬</button>
+                <button class="btn-row-icon ${isPinned ? 'pinned-active' : ''}" data-action="pin" data-id="${escapeHtml(s.id)}" title="${isPinned ? 'Desfijar consola' : 'Fijar consola arriba'}" aria-label="${isPinned ? 'Desfijar consola' : 'Fijar consola arriba'}">📌</button>
                 ${
                   s.hasUnreadAlert
-                    ? `<button class="btn-row-icon" data-action="ack" data-id="${escapeHtml(s.id)}" title="Marcar alerta como vista">✓</button>`
+                    ? `<button class="btn-row-icon" data-action="ack" data-id="${escapeHtml(s.id)}" title="Marcar alerta como vista" aria-label="Marcar alerta como vista">✓</button>`
                     : ''
                 }
                 ${
                   s.isRemote
-                    ? `<button class="btn-row-icon" data-action="remove-remote" data-id="${escapeHtml(s.id)}" title="Quitar sesión remota">✕</button>`
+                    ? `<button class="btn-row-icon" data-action="remove-remote" data-id="${escapeHtml(s.id)}" title="Quitar sesión remota" aria-label="Quitar sesión remota">✕</button>`
                     : s.isOpen
-                    ? `<button class="btn-row-icon btn-focus" data-action="focus" data-id="${escapeHtml(s.id)}" data-raw-session-id="${escapeHtml(s.sessionId || s.id)}" data-pid="${s.pid || ''}" data-provider="${escapeHtml(s.provider)}" data-surface="${escapeHtml(s.surface || 'cli')}" data-workspace="${escapeHtml(s.workspace || '')}" data-title="${escapeHtml(s.projectName || s.title || '')}" title="Ir a la pestaña exacta de esta consola (o doble clic en la fila)">🎯</button>`
+                    ? `<button class="btn-row-icon btn-focus" data-action="focus" data-id="${escapeHtml(s.id)}" data-raw-session-id="${escapeHtml(s.sessionId || s.id)}" data-pid="${escapeHtml(s.pid || '')}" data-provider="${escapeHtml(s.provider)}" data-surface="${escapeHtml(s.surface || 'cli')}" data-workspace="${escapeHtml(s.workspace || '')}" data-title="${escapeHtml(s.projectName || s.title || '')}" title="Ir a la pestaña exacta de esta consola (o doble clic en la fila)" aria-label="Enfocar la consola exacta">🎯</button>`
                     : ''
                 }
-                <button class="btn-row-icon" data-action="copy" data-copy="${escapeHtml(s.workspace || s.sessionId)}" title="Copiar ruta del proyecto o ID">📋</button>
+                <button class="btn-row-icon" data-action="copy" data-copy="${escapeHtml(s.workspace || s.sessionId)}" title="Copiar ruta del proyecto o ID" aria-label="Copiar ruta del proyecto o ID">📋</button>
               </div>
             </div>
           </div>
@@ -1063,17 +1085,26 @@
     const agyQuota = resolveAgyQuota(data);
     const analytics = data.analytics || {};
 
+    // Firma diferencial: el SSE llega seguido y la pestaña sólo se reconstruye si cambió algo visible
+    const tokensSig = JSON.stringify([
+      clQuota.fiveHourPct, clQuota.sevenDayPct, clQuota.stale, clQuota.lastKnownFiveHourPct,
+      clQuota.lastKnownSevenDayPct, clQuota.updatedAt || 0, clQuota.nextFiveHourResetAt || 0,
+      clQuota.nextWeeklyResetAt || 0, clQuota.resets, clQuota.history,
+      agyQuota, analytics, Math.floor(Date.now() / 60000)
+    ]);
+    if (tokensSig === lastTokensSig) return;
+    lastTokensSig = tokensSig;
+
+    const clStale = Boolean(clQuota.stale);
+
     // 1. Cuota Oficial Plan Claude
     const clFh = clQuota.fiveHourPct != null ? clQuota.fiveHourPct : 0;
     const clSd = clQuota.sevenDayPct != null ? clQuota.sevenDayPct : 0;
 
     document.getElementById('tokens-fh-pct').textContent = clQuota.fiveHourPct != null ? `${clFh}%` : '--%';
     document.getElementById('tokens-sd-pct').textContent = clQuota.sevenDayPct != null ? `${clSd}%` : '--%';
-    document.getElementById('tokens-fh-bar').style.width = `${Math.min(100, clFh)}%`;
-
-    const sdBar = document.getElementById('tokens-sd-bar');
-    sdBar.style.width = `${Math.min(100, clSd)}%`;
-    sdBar.classList.toggle('fill-danger', clSd >= 90);
+    setClaudeBar(document.getElementById('tokens-fh-bar'), clQuota.fiveHourPct);
+    setClaudeBar(document.getElementById('tokens-sd-bar'), clQuota.sevenDayPct);
 
     const sdWarn = document.getElementById('tokens-sd-warning');
     if (clSd >= 90) {
@@ -1104,7 +1135,22 @@
     }
 
     if (clQuota.updatedAt) {
-      document.getElementById('quota-updated-at').textContent = `Sincronizado hace ${fmtRelativeTime(clQuota.updatedAt)}`;
+      document.getElementById('quota-updated-at').textContent = clStale
+        ? `ant. · Lectura de hace ${fmtRelativeTime(clQuota.updatedAt)}`
+        : `Sincronizado hace ${fmtRelativeTime(clQuota.updatedAt)}`;
+    }
+
+    // Lectura de Claude vencida: tooltip en las cajas y textos de reset sin valor vigente
+    const clTokTip = clStale ? claudeStaleTip(clQuota) : '';
+    for (const id of ['tokens-fh-pct', 'tokens-sd-pct']) {
+      const box = document.getElementById(id)?.closest('.quota-box');
+      if (box) box.title = clTokTip;
+    }
+    if (clStale) {
+      for (const id of ['tokens-cl-fh-reset', 'tokens-cl-sd-reset']) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = 'ant. · Sin lectura vigente';
+      }
     }
 
     drawSparklineSvg(
@@ -1259,6 +1305,13 @@
               <td><strong>${fmtNumber(weekly.agy?.total)}</strong></td>
               <td>${fmtNumber(weekly.agy?.effective)}</td>
             </tr>
+            <tr>
+              <td><span class="leg-dot leg-codex"></span>Codex</td>
+              <td>${fmtNumber(today.codex?.total)}</td>
+              <td>${fmtNumber(today.codex?.output)}</td>
+              <td><strong>${fmtNumber(weekly.codex?.total)}</strong></td>
+              <td>${fmtNumber(weekly.codex?.effective)}</td>
+            </tr>
             <tr style="border-top: 1px solid rgba(224,159,62,0.28); color: #fff7ed;">
               <td>Combinado</td>
               <td><strong>${fmtNumber(today.combined?.total)}</strong></td>
@@ -1280,12 +1333,14 @@
         .map((d) => {
           const claudePct = ((d.claude?.total || 0) / maxDay) * 100;
           const agyPct = ((d.agy?.total || 0) / maxDay) * 100;
+          const codexPct = ((d.codex?.total || 0) / maxDay) * 100;
           return `
-            <div class="day-col" title="${d.date}\nClaude: ${fmtNumber(d.claude?.total)} tok\nAGY: ${fmtNumber(d.agy?.total)} tok">
+            <div class="day-col" title="${escapeHtml(d.date)}\nClaude: ${fmtNumber(d.claude?.total)} tok\nAGY: ${fmtNumber(d.agy?.total)} tok\nCodex: ${fmtNumber(d.codex?.total)} tok">
               <div class="day-val">${fmtNumber(d.totalTokens)}</div>
               <div class="day-bars-stack">
                 <div class="bar-seg-claude" style="height:${claudePct.toFixed(1)}%"></div>
                 <div class="bar-seg-agy" style="height:${agyPct.toFixed(1)}%"></div>
+                <div class="bar-seg-codex" style="height:${codexPct.toFixed(1)}%"></div>
               </div>
               <div class="day-lbl">${escapeHtml(d.label)}</div>
             </div>
@@ -1305,13 +1360,13 @@
         topEl.innerHTML = topProjects
           .map((p) => {
             const pct = Math.min(100, ((p.totalTokens || 0) / maxProj) * 100);
-            const color = p.provider === 'claude' ? 'var(--claude-color)' : 'var(--agy-color)';
+            const color = p.provider === 'codex' ? 'var(--codex-color)' : p.provider === 'claude' ? 'var(--claude-color)' : 'var(--agy-color)';
             return `
               <div class="proj-row">
                 <div class="proj-row-head">
                   <span>
                     <strong style="color:#fff7ed">${escapeHtml(p.projectName)}</strong>
-                    <span class="muted-xs">(${p.provider.toUpperCase()} · ${p.sessionsCount} ses.)</span>
+                    <span class="muted-xs">(${(p.provider||'').toUpperCase()} · ${p.sessionsCount} ses.)</span>
                   </span>
                   <span><strong style="color:#fed7aa">${fmtNumber(p.totalTokens)}</strong> tok</span>
                 </div>
@@ -1338,7 +1393,8 @@
     const rem = d.remoteSetup || {};
     const cfg = d.config || {};
     const port = cfg.port || window.location.port || 19876;
-    const token = cfg.remoteAuthToken || remoteAuthToken || '';
+    // Sólo el token local (URL o localStorage): config.remoteAuthToken ya no llega al cliente
+    const token = remoteAuthToken || '';
     const tokenSuffix = token ? `&token=${encodeURIComponent(token)}` : '';
 
     const lanIp =
@@ -1358,7 +1414,7 @@
     const activeWidgetUrl =
       mob.activeWidgetUrl || tunnelWidgetUrl || lanWidgetUrl;
     const activeBase = (mob.tunnel && mob.tunnel.publicUrl) || fallbackBase;
-    const activeApkUrl = `${activeBase}/ai-pulse.apk`;
+    const activeApkUrl = `${activeBase}/api/apk`;
 
     return {
       lanIp,
@@ -1445,9 +1501,11 @@
       }
     }
 
-    if (appUrlEl) appUrlEl.textContent = urls.activeAppUrl;
-    if (widUrlEl) widUrlEl.textContent = urls.activeWidgetUrl;
-    if (apkUrlEl) apkUrlEl.textContent = urls.activeApkUrl;
+    // Si el servidor no entrega una URL válida (p. ej. sin token para clientes no loopback), no imprimir "undefined"
+    const urlTxt = (u) => (typeof u === 'string' && u && !/undefined|null/.test(u) ? u : 'no disponible desde este cliente');
+    if (appUrlEl) appUrlEl.textContent = urlTxt(urls.activeAppUrl);
+    if (widUrlEl) widUrlEl.textContent = urlTxt(urls.activeWidgetUrl);
+    if (apkUrlEl) apkUrlEl.textContent = urlTxt(urls.activeApkUrl);
     updateQrBoxIfOpen(urls);
 
     const chkClaude = document.getElementById('chk-hook-claude');
@@ -1490,7 +1548,7 @@
           h.label,
           h.target,
           h.port,
-          h.keyPath,
+          h.keyName || h.keyPath,
           h.enabled,
           h.lastStatus,
           h.lastError
@@ -1504,11 +1562,10 @@
           sshList.innerHTML = hosts
             .map((h, idx) => {
               const isEditing = editingSshIndex === idx;
-              const keyName = h.keyPath
-                ? String(h.keyPath).split(/[\\/]/).filter(Boolean).pop() || h.keyPath
-                : '';
+              // El server no expone keyPath: sólo keyName (basename) y hasKeyPath
+              const keyName = h.keyName || (h.keyPath ? String(h.keyPath).split(/[\\/]/).filter(Boolean).pop() || h.keyPath : '');
               const keyBadge = keyName
-                ? `<span class="ssh-key-badge" title="Llave privada: ${escapeHtml(h.keyPath)}">🔑 ${escapeHtml(keyName)}</span>`
+                ? `<span class="ssh-key-badge" title="Llave privada: ${escapeHtml(keyName)}">🔑 ${escapeHtml(keyName)}</span>`
                 : '';
               const statusClass =
                 h.lastStatus === 'ok'
@@ -1640,8 +1697,8 @@
     const clSd = clQuota.sevenDayPct != null ? clQuota.sevenDayPct : 0;
     const awClFh = document.getElementById('aw-cl-fh');
     const awClSd = document.getElementById('aw-cl-sd');
-    if (awClFh) awClFh.style.width = `${Math.min(100, clFh)}%`;
-    if (awClSd) awClSd.style.width = `${Math.min(100, clSd)}%`;
+    setClaudeBar(awClFh, clQuota.fiveHourPct);
+    setClaudeBar(awClSd, clQuota.sevenDayPct);
     const awClFhTxt = document.getElementById('aw-cl-fh-txt');
     const awClSdTxt = document.getElementById('aw-cl-sd-txt');
     if (awClFhTxt) awClFhTxt.textContent = clQuota.fiveHourPct != null ? `${clFh}%` : '--%';
@@ -1650,7 +1707,8 @@
     const awClTimer = document.getElementById('aw-cl-timer');
     if (awClTimer) {
       const r = clQuota.nextFiveHourResetAt || clQuota.nextWeeklyResetAt;
-      awClTimer.textContent = r ? `⏳${fmtCountdownShort(r)}` : '';
+      awClTimer.textContent = clQuota.stale ? 'ant.' : r ? `⏳${fmtCountdownShort(r)}` : '';
+      awClTimer.title = clQuota.stale ? claudeStaleTip(clQuota) : '';
     }
     const awClBonus = document.getElementById('aw-cl-bonus');
     if (awClBonus) {
@@ -1744,14 +1802,14 @@
         ? 'prov-remote'
         : sessionObj.provider === 'claude'
         ? 'prov-claude'
-        : 'prov-agy';
+        : sessionObj.provider === 'codex' ? 'prov-codex' : 'prov-agy';
       const shortProv = sessionObj.isRemote
         ? 'REM'
         : sessionObj.provider === 'claude'
         ? sessionObj.surface === 'app'
           ? 'CL·APP'
           : 'CLAUDE'
-        : 'AGY';
+        : sessionObj.provider === 'codex' ? 'CODEX' : 'AGY';
       provPill.className = `provider-pill ${provClass}`;
       provPill.textContent = shortProv;
     }
@@ -1775,9 +1833,12 @@
     const listEl = document.getElementById('chat-messages-list');
     if (!listEl) return;
 
+    // Si cambió la conversación abierta durante el await, esta respuesta ya no corresponde
+    const sid = activeChatSessionId;
     const res = await apiGet(
-      `/api/sessions/messages?id=${encodeURIComponent(activeChatSessionId)}&limit=55`
+      `/api/sessions/messages?id=${encodeURIComponent(sid)}&limit=55`
     );
+    if (sid !== activeChatSessionId) return;
     if (!res || !res.ok) {
       if (scrollToBottom) {
         listEl.innerHTML = `<div class="muted-xs" style="padding:12px;text-align:center;">No se pudo cargar el historial (${escapeHtml(res?.error || 'error')})</div>`;
@@ -1786,11 +1847,21 @@
     }
 
     const msgs = Array.isArray(res.messages) ? res.messages : [];
+    // Firma por mensaje: si nada cambió no se reemplaza el DOM (se perdían clics, selección y scroll)
+    const chatSig = msgs.length === 0
+      ? 'empty'
+      : msgs
+          .map((m) => [m.id || '', m.timestamp || 0, m.role || '', (m.text || '').length, (m.text || '').slice(-24), (m.tools || []).length, JSON.stringify(m.questions || [])].join(':'))
+          .join('|');
+    if (chatSig === lastChatSig && !scrollToBottom) return;
+    lastChatSig = chatSig;
+
     if (msgs.length === 0) {
       listEl.innerHTML = `<div class="muted-xs" style="padding:16px;text-align:center;">Sin mensajes de texto legibles todavía en esta sesión. Podés usar los botones rápidos o enviar un mensaje abajo.</div>`;
       return;
     }
 
+    const prevTop = listEl.scrollTop;
     const wasNearBottom =
       scrollToBottom ||
       listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight < 90;
@@ -1856,9 +1927,8 @@
       })
       .join('');
 
-    if (wasNearBottom) {
-      listEl.scrollTop = listEl.scrollHeight;
-    }
+    // Si el usuario estaba leyendo más arriba, conservar esa posición
+    listEl.scrollTop = wasNearBottom ? listEl.scrollHeight : prevTop;
   }
 
   function openChatModalById(sessionId) {
@@ -1884,15 +1954,22 @@
       apiPost('/api/sessions/ack', { id: s.id });
     }
 
+    lastChatSig = '';
     refreshChatMessages(true);
+    startChatPoll();
+  }
+
+  // Poll de la conversación abierta; se pausa con la ventana oculta (desktop o web)
+  function startChatPoll() {
     clearInterval(chatPollTimer);
     chatPollTimer = setInterval(() => {
-      refreshChatMessages(false);
+      if (!document.hidden) refreshChatMessages(false);
     }, 3200);
   }
 
   function closeChatModal() {
     activeChatSessionId = null;
+    lastChatSig = '';
     clearInterval(chatPollTimer);
     chatPollTimer = null;
     document.getElementById('chat-modal')?.classList.add('hidden');
@@ -1935,6 +2012,176 @@
     }
   }
 
+  function renderProviderDetails(data) {
+    const text = (id, value) => { const el = document.getElementById(id); if (el) el.textContent = value; };
+    const bar = (id, value) => {
+      const el = document.getElementById(id);
+      if (el) { el.style.width = `${value ?? 0}%`; el.classList.toggle('fill-danger', value >= 90); }
+    };
+    const q = data.codexQuota || {};
+    const pct = (value) => value == null ? '--%' : `${Math.round(value)}%`;
+    for (const [key, value, reset] of [['fh', q.fiveHourPct, q.nextFiveHourResetAt], ['sd', q.sevenDayPct, q.nextWeeklyResetAt]]) {
+      text(`pill-codex-${key}-txt`, pct(value));
+      text(`aw-codex-${key}-txt`, pct(value));
+      text(`kpi-codex-${key}-val`, pct(value));
+      text(`codex-${key}-pct`, pct(value));
+      for (const id of [`pill-codex-${key}`, `aw-codex-${key}`, `kpi-codex-${key}-bar`, `codex-${key}-bar`]) bar(id, value);
+      text(`codex-${key}-reset`, reset ? `Reset: ${fmtDateTimeShort(reset)} (${fmtCountdown(reset)})` : 'Sin lectura vigente para esta ventana');
+    }
+    const reset = q.nextFiveHourResetAt || q.nextWeeklyResetAt;
+    const timer = reset ? fmtCountdownShort(reset).replace(/\s+/g, '') : '--';
+    text('pill-codex-reset-timer', q.stale ? 'ant.' : timer);
+    text('aw-codex-timer', q.stale ? 'Lectura anterior' : timer);
+    const today = data.analytics?.today?.codex || {};
+    const weekly = data.analytics?.weekly?.codex || {};
+    text('kpi-codex-sub', `Hoy: ${fmtNumber(today.total)} tok${q.stale ? ' · ant.' : ''}`);
+    text('codex-plan', q.planType || 'Sin lectura de cuota');
+    text('codex-usage-detail', `Hoy: ${fmtNumber(today.total)} tok · 7 días: ${fmtNumber(weekly.total)} tok · Caché: ${fmtNumber(weekly.cacheRead)} tok`);
+    const freshness = q.updatedAt
+      ? `Cuota informada por Codex hace ${fmtRelativeTime(q.updatedAt)}.${q.stale ? ' Lectura anterior: puede haber cambiado.' : ''} Se actualiza con la actividad local.`
+      : 'Sin lectura local de cuota. Abrí una sesión de Codex para obtener datos; no se estima a partir de tokens.';
+    text('codex-quota-status', freshness);
+    for (const id of ['pill-codex-box', 'kpi-codex-card', 'aw-codex-box']) {
+      const el = document.getElementById(id); if (el) el.title = freshness;
+    }
+
+    const agy = data.agyQuota || {};
+    const status = agy.providerStatus || {};
+    const isExhausted = Boolean(status.exhausted);
+    const isRecovered = !isExhausted && status.state === 'recovered';
+    const resetRefTs = status.lastResetAt || status.resetAt || status.observedAt;
+    const isRecentRecovery = Boolean(isRecovered && resetRefTs && Date.now() - resetRefTs < 6 * 3600 * 1000);
+    const offWeekly = agy.officialWeekly || (status.officialApi && status.officialApi.weekly) || null;
+    const offFiveHour = agy.officialFiveHour || (status.officialApi && status.officialApi.fiveHour) || null;
+
+    let message = offWeekly
+      ? `✅ Cuota Semanal Oficial Google (${agy.gcpProject || 'GCP'}): ${offWeekly.usedPctExact}% usado (${offWeekly.remainingPctExact}% libre) · Reset: ${fmtDateTimeShort(offWeekly.resetAt)}. En ventana 5h Google solo reporta estado activo o HTTP 429.`
+      : 'Consultando cuota semanal oficial en businessaicode.googleapis.com...';
+    if (isExhausted) {
+      message = `🚫 Pool de cuota AGY (${status.window === '7d' ? '7d' : '5h'}) agotado (HTTP 429). ${
+        status.resetAt
+          ? `Reset oficial anunciado: ${fmtTimeShort(status.resetAt)} (${fmtCountdown(status.resetAt)}).`
+          : 'Sin horario de reset informado.'
+      } Consumo en ventana: ${fmtNumber(agy.fiveHour?.total || 0)} tok (${fmtNumber(agy.fiveHour?.effective || 0)} ef.).`;
+    } else if (isRecentRecovery) {
+      message = `✅ Cuota 5h de AGY restablecida a las ${fmtTimeShort(resetRefTs)} (hace ${fmtRelativeTime(resetRefTs)}) tras agotamiento previo.${
+        status.verifiedAfterReset ? ' Disponibilidad verificada con respuestas activas.' : ''
+      }${offWeekly ? ` · Semanal oficial: ${offWeekly.usedPctExact}% usado (reset ${fmtDateTimeShort(offWeekly.resetAt)}).` : ''}`;
+    } else if (status.state === 'unverified') {
+      message = `AGY informó agotamiento el ${fmtDateTimeShort(status.observedAt)}. El plazo anunciado venció; disponibilidad sin verificar.`;
+    }
+    text('agy-provider-status', message);
+
+    for (const [key, value] of [['fh', agy.fiveHourPct], ['sd', agy.sevenDayPct]]) {
+      const isKeyExhausted = isExhausted && (key === 'fh' ? status.window !== '7d' : status.window === '7d');
+      let dispVal = '--%';
+      if (isKeyExhausted) {
+        dispVal = '100%';
+      } else if (value != null) {
+        dispVal = `${Math.round(value)}%`;
+      } else if (key === 'fh') {
+        dispVal = 'OK';
+      }
+      for (const id of [`pill-agy-${key}-txt`, `aw-agy-${key}-txt`, `kpi-agy-${key}-val`, `agy-${key}-pct`]) {
+        text(id, dispVal);
+        document.getElementById(id)?.classList.toggle('quota-exhausted', isKeyExhausted);
+      }
+      for (const barId of [`pill-agy-${key}`, `aw-agy-${key}`, `kpi-agy-${key}-bar`, `agy-${key}-bar`]) {
+        const barEl = document.getElementById(barId);
+        if (barEl) {
+          const pctNum = isKeyExhausted ? 100 : value != null ? Math.min(100, Math.max(0, Number(value) || 0)) : 0;
+          barEl.style.width = `${pctNum}%`;
+          barEl.classList.toggle('fill-danger', pctNum >= 90 || isKeyExhausted);
+        }
+      }
+    }
+
+    const agyFhDetail = document.getElementById('agy-fh-detail');
+    if (agyFhDetail && agy.fiveHour) {
+      const rollingExtra =
+        isRecentRecovery && agy.rollingFiveHour && agy.rollingFiveHour.total > agy.fiveHour.total
+          ? ` · 5h móvil: ${fmtNumber(agy.rollingFiveHour.total)} tok`
+          : '';
+      agyFhDetail.textContent = `${fmtNumber(agy.fiveHour.total)} tok (${fmtNumber(agy.fiveHour.effective)} ef.) · ${agy.fiveHour.turns} turnos${rollingExtra}`;
+    }
+
+    const agySdDetail = document.getElementById('agy-sd-detail');
+    if (agySdDetail && agy.sevenDay) {
+      const exactTag = offWeekly ? `Oficial: ${offWeekly.usedPctExact}% usado · ` : '';
+      agySdDetail.textContent = `${exactTag}${fmtNumber(agy.sevenDay.total)} tok (${fmtNumber(agy.sevenDay.effective)} ef.) · ${agy.sevenDay.turns} turnos`;
+    }
+
+    const primaryOfficialReset = agy.nextFiveHourResetAt || agy.nextWeeklyResetAt;
+    let pillTimer = primaryOfficialReset
+      ? `⏳${fmtCountdownShort(primaryOfficialReset).replace(/\s+/g, '')}`
+      : 'Activo';
+    let awTimer = primaryOfficialReset
+      ? `⏳${fmtCountdownShort(primaryOfficialReset)}`
+      : 'Activo';
+    let kpiSub = agy.nextWeeklyResetAt
+      ? `5h: ${isExhausted && status.window !== '7d' ? '100%' : 'OK'} · 7d reset: ${fmtCountdownShort(agy.nextWeeklyResetAt)}`
+      : `5h:${fmtNumber(agy.fiveHour?.total || 0)} · 7d:${fmtNumber(agy.sevenDay?.total || 0)}`;
+
+    if (isExhausted) {
+      const cd = status.resetAt ? fmtCountdownShort(status.resetAt) : '';
+      pillTimer = cd ? `🚫${cd.replace(/\s+/g, '')}` : '🚫Agotada';
+      awTimer = `🚫 Agotada${cd ? ' · ' + cd : ''}`;
+      kpiSub = status.resetAt
+        ? `🚫 Agotada · Reset ${fmtTimeShort(status.resetAt)} (${cd})`
+        : '🚫 Cuota 5h agotada';
+    } else if (isRecentRecovery) {
+      pillTimer = agy.nextWeeklyResetAt
+        ? `⏳${fmtCountdownShort(agy.nextWeeklyResetAt).replace(/\s+/g, '')}`
+        : `✅${fmtTimeShort(resetRefTs)}`;
+      awTimer = `✅ Reset ${fmtTimeShort(resetRefTs)}`;
+      kpiSub = `✅ Reseteada ${fmtTimeShort(resetRefTs)} (hace ${fmtRelativeTime(resetRefTs)})`;
+    } else if (status.state === 'unverified') {
+      kpiSub = 'Disponibilidad sin verificar';
+    }
+
+    text('pill-agy-reset-timer', pillTimer);
+    text('aw-agy-timer', awTimer);
+    text('kpi-agy-sub', kpiSub);
+    for (const id of ['agy-provider-status', 'pill-agy-reset-timer', 'kpi-agy-sub', 'aw-agy-timer']) {
+      document.getElementById(id)?.classList.toggle('quota-exhausted', isExhausted);
+    }
+    for (const id of ['pill-agy-box', 'kpi-agy-card']) {
+      const el = document.getElementById(id);
+      if (el) el.title = message;
+    }
+
+    if (isExhausted && status.window !== '7d') {
+      text(
+        'tokens-agy-fh-reset',
+        status.resetAt
+          ? `🚫 Cuota 5h agotada (HTTP 429) · Resetea a las ${fmtTimeShort(status.resetAt)} (${fmtCountdown(status.resetAt)})`
+          : '🚫 Cuota 5h agotada · Esperando reset del proveedor'
+      );
+    } else if (isRecentRecovery) {
+      text(
+        'tokens-agy-fh-reset',
+        `✅ Reseteada a las ${fmtTimeShort(resetRefTs)} (hace ${fmtRelativeTime(resetRefTs)}) · Pool 5h operativo`
+      );
+    } else if (offFiveHour && offFiveHour.resetAt) {
+      text(
+        'tokens-agy-fh-reset',
+        `⏳ Reset oficial 5h: ${fmtTimeShort(offFiveHour.resetAt)} (${fmtCountdown(offFiveHour.resetAt)})`
+      );
+    } else {
+      text(
+        'tokens-agy-fh-reset',
+        '✅ Pool 5h operativo (Google no expone % de 5h por API; solo informa reset exacto al llegar al 100%)'
+      );
+    }
+
+    text(
+      'tokens-agy-sd-reset',
+      agy.nextWeeklyResetAt
+        ? `⏳ Reset oficial Google: ${fmtDateTimeShort(agy.nextWeeklyResetAt)} (${fmtCountdown(agy.nextWeeklyResetAt)})`
+        : 'Sincronizando cuota semanal oficial con Google...'
+    );
+  }
+
   function renderActiveTab(data) {
     if (!data) return;
     if (activeTab === 'sessions') {
@@ -1944,6 +2191,7 @@
     } else if (activeTab === 'remotes' || activeTab === 'settings') {
       renderRemotesAndSettings(data);
     }
+    renderProviderDetails(data);
   }
 
   function renderAll(data) {
@@ -1959,10 +2207,12 @@
 
     if (isAndroidWidgetMode) {
       renderAndroidWidget(data);
+      renderProviderDetails(data);
       return;
     }
 
     renderPill(data);
+    renderProviderDetails(data);
 
     if (document.hidden) return;
 
@@ -2019,6 +2269,7 @@
 
     document.getElementById('kpi-claude-card')?.addEventListener('click', () => switchTab('tokens'));
     document.getElementById('kpi-agy-card')?.addEventListener('click', () => switchTab('tokens'));
+    document.getElementById('kpi-codex-card')?.addEventListener('click', () => switchTab('tokens'));
 
     document.getElementById('btn-hide-tray')?.addEventListener('click', () => {
       if (window.electronAPI && window.electronAPI.hideToTray) {
@@ -2326,8 +2577,8 @@
     });
 
     document.getElementById('btn-test-remote')?.addEventListener('click', async () => {
-      await apiPost('/api/remote/test', {});
-      showToast('Sesión remota de prueba simulada');
+      const res = await apiPost('/api/remote/test', {});
+      showToast(res && res.ok === false ? 'Prueba remota disponible sólo con devMode' : 'Sesión remota de prueba simulada');
     });
 
     document.querySelectorAll('.btn-copy').forEach((btn) => {
@@ -2357,7 +2608,11 @@
       if (lblInput) lblInput.value = h.label || '';
       if (tgtInput) tgtInput.value = h.target || '';
       if (prtInput) prtInput.value = h.port || 22;
-      if (keyInput) keyInput.value = h.keyPath || '';
+      if (keyInput) {
+        // Vacío conserva la llave anterior (el server no devuelve la ruta)
+        keyInput.value = h.keyPath || '';
+        if (h.keyName) keyInput.placeholder = `Llave actual: ${h.keyName} (vacío = conservar)`;
+      }
       if (addBtn) addBtn.textContent = '💾 Guardar';
       if (cancelBtn) cancelBtn.classList.remove('hidden');
       if (formEl) formEl.classList.add('is-editing');
@@ -2538,6 +2793,13 @@
     });
 
     document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        clearInterval(chatPollTimer);
+        chatPollTimer = null;
+      } else if (activeChatSessionId && !chatPollTimer) {
+        refreshChatMessages(false);
+        startChatPoll();
+      }
       if (isWebMode) {
         if (document.hidden) {
           // Ahorro total de batería en Android/Web en segundo plano: cerrar SSE y timers
@@ -2559,15 +2821,9 @@
           if (!activeEventSource) {
             connectRealtimeStream();
           }
-          if (activeChatSessionId && !chatPollTimer) {
-            refreshChatMessages(false);
-            chatPollTimer = setInterval(() => {
-              if (!document.hidden) refreshChatMessages(false);
-            }, 4000);
-          }
         }
       }
-      if (!document.hidden && currentState) {
+      if (currentState) {
         renderAll(currentState);
       }
     });
@@ -2649,7 +2905,9 @@
       try {
         const snap = JSON.parse(ev.data);
         renderAll(snap);
-      } catch {}
+      } catch (err) {
+        console.error('Error renderizando estado en vivo:', err);
+      }
     });
 
     es.addEventListener('alert', (ev) => {

@@ -1,11 +1,14 @@
 {
   "port": 19876,
+  "bindHost": "127.0.0.1",
   "soundEnabled": true,
   "soundTone": "chime",
   "desktopNotifications": true,
   "alwaysOnTop": true,
   "opacity": 0.9,
   "ntfyEnabled": true,
+  "ntfyPushLocalAlerts": true,
+  "ntfyIncludeText": false,
   "ntfyTopic": "ai-pulse-tu-topico-secreto",
   "sshHosts": []
 }

@@ -1,12 +1,26 @@
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const crypto = require('crypto');
 const { spawn, execFileSync } = require('child_process');
 
 const BIN_DIR = path.resolve(__dirname, '..', '..', 'bin');
 const LOCAL_CLOUDFLARED = path.join(BIN_DIR, 'cloudflared.exe');
-const CLOUDFLARED_DOWNLOAD_URL =
-  'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe';
+const CLOUDFLARED_ASSET = 'cloudflared-windows-amd64.exe';
+const CLOUDFLARED_DOWNLOAD_URL = `https://github.com/cloudflare/cloudflared/releases/latest/download/${CLOUDFLARED_ASSET}`;
+// Solo se siguen redirects a estos hosts por https (GitHub Releases y su CDN de assets)
+const ALLOWED_DOWNLOAD_HOSTS = new Set([
+  'github.com',
+  'objects.githubusercontent.com',
+  'release-assets.githubusercontent.com'
+]);
+const USER_AGENT = 'AI-Pulse-Widget/1.0';
+// Rutas absolutas conocidas antes que la búsqueda por PATH (evita binarios plantados en PATH)
+const KNOWN_INSTALL_PATHS = [
+  LOCAL_CLOUDFLARED,
+  path.join(process.env.ProgramFiles || 'C:\\Program Files', 'cloudflared', 'cloudflared.exe'),
+  path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'cloudflared', 'cloudflared.exe')
+];
 
 class TunnelManager {
   constructor({ config, saveConfig, onStateChange }) {
@@ -20,17 +34,25 @@ class TunnelManager {
     this.error = '';
     this.lastNotifiedUrl = '';
     this.cachedBinPath = null;
+    this.lastLookupAt = 0; // cache negativa: no re-buscar cada getStatus() si no hay binario
     this.reconnectTimer = null;
+    this.healthTimer = null;
+    this.healthFailures = 0;
+    this.ntfyRetryTimer = null;
   }
 
   resolveBinaryPath() {
     if (this.cachedBinPath && fs.existsSync(this.cachedBinPath)) {
       return this.cachedBinPath;
     }
-    if (fs.existsSync(LOCAL_CLOUDFLARED)) {
-      this.cachedBinPath = LOCAL_CLOUDFLARED;
-      return LOCAL_CLOUDFLARED;
+    for (const candidate of KNOWN_INSTALL_PATHS) {
+      if (fs.existsSync(candidate)) {
+        this.cachedBinPath = candidate;
+        return candidate;
+      }
     }
+    if (Date.now() - this.lastLookupAt < 60000) return null;
+    this.lastLookupAt = Date.now();
     try {
       const out = execFileSync('where.exe', ['cloudflared'], {
         encoding: 'utf8',
@@ -41,7 +63,13 @@ class TunnelManager {
         .split(/\r?\n/)
         .map((s) => s.trim())
         .find(Boolean);
-      if (first && fs.existsSync(first)) {
+      // Solo rutas absolutas llamadas cloudflared.exe
+      if (
+        first &&
+        path.isAbsolute(first) &&
+        path.basename(first).toLowerCase() === 'cloudflared.exe' &&
+        fs.existsSync(first)
+      ) {
         this.cachedBinPath = first;
         return first;
       }
@@ -49,59 +77,133 @@ class TunnelManager {
     return null;
   }
 
-  downloadBinary(url = CLOUDFLARED_DOWNLOAD_URL, redirects = 0) {
+  /**
+   * Obtiene el SHA256 publicado por GitHub para el asset de la última release (campo `digest` de la API).
+   * Devuelve null si no está disponible: en ese caso la descarga NO se verifica (ver TODO en downloadBinary).
+   */
+  fetchPublishedSha256() {
+    return new Promise((resolve) => {
+      const req = https.get(
+        'https://api.github.com/repos/cloudflare/cloudflared/releases/latest',
+        {
+          headers: { 'User-Agent': USER_AGENT, Accept: 'application/vnd.github+json' },
+          timeout: 8000
+        },
+        (res) => {
+          if (res.statusCode !== 200) {
+            res.resume();
+            resolve(null);
+            return;
+          }
+          let raw = '';
+          res.setEncoding('utf8');
+          res.on('data', (c) => {
+            raw += c;
+            if (raw.length > 1024 * 1024) req.destroy();
+          });
+          res.on('end', () => {
+            try {
+              const json = JSON.parse(raw);
+              const asset = (Array.isArray(json.assets) ? json.assets : []).find((a) => a && a.name === CLOUDFLARED_ASSET);
+              const m = asset && typeof asset.digest === 'string' && asset.digest.match(/^sha256:([a-f0-9]{64})$/i);
+              resolve(m ? m[1].toLowerCase() : null);
+            } catch {
+              resolve(null);
+            }
+          });
+        }
+      );
+      req.on('timeout', () => req.destroy());
+      req.on('error', () => resolve(null));
+    });
+  }
+
+  sha256File(filePath) {
+    const hash = crypto.createHash('sha256');
+    hash.update(fs.readFileSync(filePath));
+    return hash.digest('hex');
+  }
+
+  /** Descarga a `dest` siguiendo redirects solo hacia hosts permitidos por https. */
+  downloadTo(url, dest, redirects = 0) {
     return new Promise((resolve, reject) => {
       if (redirects > 6) {
         reject(new Error('Demasiadas redirecciones descargando cloudflared'));
         return;
       }
-      if (!fs.existsSync(BIN_DIR)) {
-        fs.mkdirSync(BIN_DIR, { recursive: true });
+      let target;
+      try {
+        target = new URL(url);
+      } catch {
+        reject(new Error('URL de descarga inválida'));
+        return;
       }
-      const tmpPath = `${LOCAL_CLOUDFLARED}.tmp`;
+      if (target.protocol !== 'https:' || !ALLOWED_DOWNLOAD_HOSTS.has(target.hostname)) {
+        reject(new Error(`Host de descarga no permitido: ${target.hostname}`));
+        return;
+      }
 
-      https
-        .get(url, { headers: { 'User-Agent': 'AI-Pulse-Widget/1.0' } }, (res) => {
-          if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-            res.resume();
-            this.downloadBinary(res.headers.location, redirects + 1)
-              .then(resolve)
-              .catch(reject);
-            return;
-          }
-          if (res.statusCode !== 200) {
-            res.resume();
-            reject(new Error(`HTTP ${res.statusCode} al descargar cloudflared`));
-            return;
-          }
+      const req = https.get(target, { headers: { 'User-Agent': USER_AGENT }, timeout: 30000 }, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          res.resume();
+          const next = new URL(res.headers.location, target).toString();
+          this.downloadTo(next, dest, redirects + 1).then(resolve, reject);
+          return;
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          reject(new Error(`HTTP ${res.statusCode} al descargar cloudflared`));
+          return;
+        }
 
-          const file = fs.createWriteStream(tmpPath);
-          res.pipe(file);
-          file.on('finish', () => {
-            file.close(() => {
-              try {
-                if (fs.existsSync(LOCAL_CLOUDFLARED)) fs.unlinkSync(LOCAL_CLOUDFLARED);
-                fs.renameSync(tmpPath, LOCAL_CLOUDFLARED);
-                resolve(LOCAL_CLOUDFLARED);
-              } catch (err) {
-                reject(err);
-              }
-            });
-          });
-          file.on('error', (err) => {
-            try {
-              fs.unlinkSync(tmpPath);
-            } catch {}
-            reject(err);
-          });
-        })
-        .on('error', (err) => {
+        const file = fs.createWriteStream(dest);
+        res.pipe(file);
+        res.on('error', (err) => {
+          file.destroy();
+          reject(err);
+        });
+        file.on('finish', () => file.close(() => resolve(dest)));
+        file.on('error', (err) => {
           try {
-            if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+            fs.unlinkSync(dest);
           } catch {}
           reject(err);
         });
+      });
+      req.on('timeout', () => req.destroy(new Error('timeout descargando cloudflared')));
+      req.on('error', (err) => {
+        try {
+          if (fs.existsSync(dest)) fs.unlinkSync(dest);
+        } catch {}
+        reject(err);
+      });
     });
+  }
+
+  async downloadBinary() {
+    if (!fs.existsSync(BIN_DIR)) {
+      fs.mkdirSync(BIN_DIR, { recursive: true });
+    }
+    const tmpPath = `${LOCAL_CLOUDFLARED}.tmp`;
+    const expected = await this.fetchPublishedSha256();
+    if (!expected) {
+      // TODO: sin digest publicado no hay verificación; revisar si la API de GitHub deja de exponerlo
+      console.warn('[tunnel] No se obtuvo SHA256 publicado para cloudflared: descarga SIN verificar');
+    }
+    await this.downloadTo(CLOUDFLARED_DOWNLOAD_URL, tmpPath);
+    if (expected) {
+      const actual = this.sha256File(tmpPath);
+      if (actual !== expected) {
+        try {
+          fs.unlinkSync(tmpPath);
+        } catch {}
+        throw new Error('El SHA256 de cloudflared descargado no coincide con el publicado por GitHub');
+      }
+    }
+    if (fs.existsSync(LOCAL_CLOUDFLARED)) fs.unlinkSync(LOCAL_CLOUDFLARED);
+    fs.renameSync(tmpPath, LOCAL_CLOUDFLARED);
+    this.cachedBinPath = LOCAL_CLOUDFLARED;
+    return LOCAL_CLOUDFLARED;
   }
 
   emitChange() {
@@ -144,6 +246,7 @@ class TunnelManager {
     this.emitChange();
 
     const port = this.config.port || 19876;
+    // El túnel apunta siempre a loopback: no depende de bindHost
     const args = ['tunnel', '--url', `http://127.0.0.1:${port}`, '--no-autoupdate'];
 
     try {
@@ -160,8 +263,17 @@ class TunnelManager {
           this.publicUrl = match[0];
           this.status = 'connected';
           this.error = '';
+          this.healthFailures = 0;
           this.emitChange();
           this.notifyTunnelUrlViaNtfy(this.publicUrl);
+          this.startHealthCheck();
+        }
+        // Si cloudflared pierde todas las conexiones al edge tras un corte de internet y no logra re-registrar
+        if (
+          this.status === 'connected' &&
+          /Unregistered tunnel connection|Serve tunnel error|failed to serve tunnel/i.test(text)
+        ) {
+          this.scheduleImmediateHealthProbe();
         }
       };
 
@@ -177,6 +289,7 @@ class TunnelManager {
 
       child.on('exit', (code) => {
         this.proc = null;
+        this.stopHealthCheck();
         if (this.status !== 'stopped') {
           this.status = 'stopped';
           this.publicUrl = '';
@@ -191,7 +304,7 @@ class TunnelManager {
               if (this.config.tunnelEnabled && !this.proc) {
                 this.start();
               }
-            }, 8000);
+            }, 6000);
           }
         }
       });
@@ -205,7 +318,130 @@ class TunnelManager {
     return this.getStatus();
   }
 
+  startHealthCheck() {
+    this.stopHealthCheck();
+    this.healthFailures = 0;
+    this.healthTimer = setInterval(() => {
+      this.probePublicTunnel();
+    }, 30000);
+  }
+
+  stopHealthCheck() {
+    if (this.healthTimer) {
+      clearInterval(this.healthTimer);
+      this.healthTimer = null;
+    }
+    if (this._probeDelayTimer) {
+      clearTimeout(this._probeDelayTimer);
+      this._probeDelayTimer = null;
+    }
+    this.healthFailures = 0;
+  }
+
+  scheduleImmediateHealthProbe() {
+    if (this._probeDelayTimer) return;
+    this._probeDelayTimer = setTimeout(() => {
+      this._probeDelayTimer = null;
+      this.probePublicTunnel();
+    }, 8000);
+  }
+
+  probePublicTunnel() {
+    if (!this.proc || this.status !== 'connected' || !this.publicUrl) return;
+    const token = this.config.remoteAuthToken || '';
+    // Token por cabecera Authorization (nunca en query: queda en logs de acceso)
+    const checkUrl = `${this.publicUrl}/api/widget/compact`;
+    try {
+      const req = https.get(
+        checkUrl,
+        {
+          headers: { 'User-Agent': 'AI-Pulse-Tunnel-Watchdog/1.0', Authorization: `Bearer ${token}` },
+          timeout: 10000
+        },
+        (res) => {
+          res.resume();
+          if (res.statusCode === 200 || res.statusCode === 401) {
+            this.healthFailures = 0;
+            if (this.lastNotifiedUrl !== this.publicUrl) {
+              this.notifyTunnelUrlViaNtfy(this.publicUrl);
+            }
+          } else if (res.statusCode === 530 || res.statusCode === 502 || res.statusCode === 404) {
+            // 530 / 502 en Cloudflare Quick Tunnel indica que el hostname perdió su origen tras corte de red
+            this.handleHealthFailure(`HTTP ${res.statusCode} en túnel público`, res.statusCode === 530);
+          } else {
+            this.handleHealthFailure(`HTTP ${res.statusCode}`, false);
+          }
+        }
+      );
+      req.on('timeout', () => {
+        try {
+          req.destroy(new Error('timeout'));
+        } catch {}
+      });
+      req.on('error', (err) => {
+        const code = String((err && err.code) || '');
+        // ENOTFOUND significa que Cloudflare dio de baja el subdominio trycloudflare.com tras el corte
+        const isDeadDns = code === 'ENOTFOUND' || code === 'EAI_AGAIN';
+        this.handleHealthFailure(code || err.message || 'error de red', isDeadDns);
+      });
+    } catch {}
+  }
+
+  handleHealthFailure(reason, immediateIfInternetUp = false) {
+    this.healthFailures = (this.healthFailures || 0) + 1;
+    // Si el DNS del túnel murió (ENOTFOUND / HTTP 530) o acumuló 2 fallos seguidos (60s),
+    // verificamos que haya internet hacia Cloudflare antes de reciclar el proceso para obtener una URL nueva.
+    const threshold = immediateIfInternetUp ? 1 : 2;
+    if (this.healthFailures < threshold) return;
+
+    const probeReq = https.get(
+      'https://1.1.1.1/cdn-cgi/trace',
+      { timeout: 5000 },
+      (res) => {
+        res.resume();
+        // Hay internet real pero el túnel trycloudflare quedó zombie tras el corte -> reiniciar túnel
+        this.restartZombieTunnel(reason);
+      }
+    );
+    probeReq.on('timeout', () => {
+      try {
+        probeReq.destroy();
+      } catch {}
+    });
+    probeReq.on('error', () => {
+      // Sigue sin internet general; esperar a que vuelva la conexión para recrear el túnel
+    });
+  }
+
+  restartZombieTunnel(reason) {
+    if (!this.config.tunnelEnabled) return;
+    this.stopHealthCheck();
+    this.error = `Reconectando túnel tras corte de red (${reason})...`;
+    this.publicUrl = '';
+    this.status = 'starting';
+    if (this.proc) {
+      const oldProc = this.proc;
+      this.proc = null;
+      try {
+        oldProc.kill();
+      } catch {}
+    }
+    this.emitChange();
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.config.tunnelEnabled && !this.proc) {
+        this.start();
+      }
+    }, 2500);
+  }
+
   stop() {
+    this.stopHealthCheck();
+    if (this.ntfyRetryTimer) {
+      clearTimeout(this.ntfyRetryTimer);
+      this.ntfyRetryTimer = null;
+    }
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -223,34 +459,65 @@ class TunnelManager {
     return this.getStatus();
   }
 
-  notifyTunnelUrlViaNtfy(publicUrl) {
+  /**
+   * Avisa por ntfy que el túnel está activo. NO incluye el token: solo la URL pública,
+   * la app del celular ya tiene su clave guardada (o la pide en el modal de acceso).
+   */
+  notifyTunnelUrlViaNtfy(publicUrl, attempt = 0) {
     if (!publicUrl || this.lastNotifiedUrl === publicUrl) return;
     if (this.config.ntfyEnabled === false || !this.config.ntfyTopic) return;
 
-    this.lastNotifiedUrl = publicUrl;
-    const token = this.config.remoteAuthToken || '';
-    const appLink = `${publicUrl}/?token=${encodeURIComponent(token)}`;
-    const widgetLink = `${publicUrl}/?mode=widget&token=${encodeURIComponent(token)}`;
+    if (this.ntfyRetryTimer) {
+      clearTimeout(this.ntfyRetryTimer);
+      this.ntfyRetryTimer = null;
+    }
 
-    const body = `Túnel 4G activo (sin VPN).\n📱 App / Responder: ${appLink}\n🧩 Widget Android: ${widgetLink}`;
+    const body = `Túnel 4G activo (sin VPN).\n📱 Abrí la app desde: ${publicUrl}/\n(Necesitás tu clave de acceso remoto en la app)`;
+    const scheduleRetry = () => {
+      if (attempt >= 8 || this.publicUrl !== publicUrl) return;
+      this.ntfyRetryTimer = setTimeout(() => {
+        this.ntfyRetryTimer = null;
+        if (this.publicUrl === publicUrl && this.lastNotifiedUrl !== publicUrl) {
+          this.notifyTunnelUrlViaNtfy(publicUrl, attempt + 1);
+        }
+      }, Math.min(30000, 5000 * (attempt + 1)));
+    };
+
     try {
       const req = https.request(
         `https://ntfy.sh/${encodeURIComponent(this.config.ntfyTopic)}`,
         {
           method: 'POST',
+          timeout: 8000,
           headers: {
             Title: 'AI Pulse 4G Listo',
             Priority: 'default',
             Tags: 'iphone,satellite',
-            Click: appLink
+            Click: `${publicUrl}/`
           }
         },
-        (res) => res.resume()
+        (res) => {
+          res.resume();
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            this.lastNotifiedUrl = publicUrl;
+          } else {
+            scheduleRetry();
+          }
+        }
       );
-      req.on('error', () => {});
+      req.on('timeout', () => {
+        try {
+          req.destroy();
+        } catch {}
+      });
+      req.on('error', () => {
+        scheduleRetry();
+      });
       req.write(body);
       req.end();
-    } catch {}
+    } catch {
+      scheduleRetry();
+    }
   }
 }
 

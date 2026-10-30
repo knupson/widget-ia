@@ -16,6 +16,14 @@ const { createWidgetServer } = require('./src/server');
 const { focusSessionWindow } = require('./src/services/windowFocuser');
 const { startFullscreenWatcher } = require('./src/services/fullscreenWatcher');
 
+// Errores no capturados: se loguean sin tumbar el proceso principal
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err);
+});
+
 let mainWindow = null;
 let tray = null;
 let widgetServer = null;
@@ -30,7 +38,7 @@ let lastAppliedOpacity = 1;
 let lastForegroundHwnd = null;
 let updateTrayMenuFn = null;
 
-const WIDGET_WIDTH = 586;
+const WIDGET_WIDTH = 736;
 const PILL_WIDTH = WIDGET_WIDTH;
 const PILL_HEIGHT = 56;
 const EXPANDED_WIDTH = WIDGET_WIDTH;
@@ -555,7 +563,8 @@ async function initApp() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      sandbox: true
     }
   });
 
@@ -619,7 +628,18 @@ async function initApp() {
     persistWindowPosition(true);
   });
 
-  mainWindow.loadURL(`http://127.0.0.1:${port}/`);
+  // Sólo el servidor local puede navegar la ventana; ventanas nuevas se niegan (externos van por openExternal)
+  const localOrigin = `http://127.0.0.1:${port}`;
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    let origin = '';
+    try {
+      origin = new URL(url).origin;
+    } catch {}
+    if (origin !== localOrigin) event.preventDefault();
+  });
+
+  mainWindow.loadURL(`${localOrigin}/`);
   setupTray(port);
 
   fullscreenWatcher = startFullscreenWatcher({

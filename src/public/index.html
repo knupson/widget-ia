@@ -2,12 +2,12 @@
 <html lang="es">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0," />
   <meta name="theme-color" content="#070504" />
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <title>AI Pulse Widget · Claude & AGY Monitor</title>
+  <title>AI Pulse Widget · Claude, AGY y Codex</title>
   <link rel="manifest" href="/manifest.json" />
   <link rel="icon" href="/icon.svg" type="image/svg+xml" />
   <link rel="stylesheet" href="/styles.css" />
@@ -85,6 +85,13 @@
       </div>
     </div>
 
+    <div class="aw-q-card aw-codex-card" id="aw-codex-box">
+      <div class="aw-q-head"><span class="brand-codex">CODEX</span><span class="aw-q-meta" id="aw-codex-timer">--</span></div>
+      <div class="aw-q-bars">
+        <div class="aw-q-line"><span>5h</span><div class="pq-bar"><div id="aw-codex-fh" class="pq-fill fill-codex" style="width:0%"></div></div><strong id="aw-codex-fh-txt">--%</strong></div>
+        <div class="aw-q-line"><span>7d</span><div class="pq-bar"><div id="aw-codex-sd" class="pq-fill fill-codex" style="width:0%"></div></div><strong id="aw-codex-sd-txt">--%</strong></div>
+      </div>
+    </div>
     <div class="aw-urgent-strip" id="aw-urgent-strip">
       <div class="aw-urgent-info" id="aw-urgent-info">
         <span class="aw-urgent-dot dot dot-ready" id="aw-urgent-dot"></span>
@@ -169,14 +176,21 @@
             </div>
           </div>
         </div>
+        <div class="pill-q-col" id="pill-codex-box">
+          <div class="pq-header"><span class="pq-brand brand-codex"><i class="pq-dot dot-codex"></i>CODEX</span><span id="pill-codex-reset-timer" class="pq-reset-timer">--</span></div>
+          <div class="pq-bars-stack">
+            <div class="pq-line"><span class="pq-sub">5h</span><div class="pq-bar"><div id="pill-codex-fh" class="pq-fill fill-codex" style="width:0%"></div></div><span id="pill-codex-fh-txt" class="pq-val">--%</span></div>
+            <div class="pq-line"><span class="pq-sub">7d</span><div class="pq-bar"><div id="pill-codex-sd" class="pq-fill fill-codex" style="width:0%"></div></div><span id="pill-codex-sd-txt" class="pq-val">--%</span></div>
+          </div>
+        </div>
       </div>
     </div>
 
     <div class="pill-actions">
-      <button id="pill-btn-jump" class="icon-btn-sm hidden" title="⚡ Saltar directo a la consola que espera tu respuesta">🎯</button>
-      <button id="pill-btn-pin" class="icon-btn-sm pin-on" title="Siempre encima (Always on Top: ACTIVO) · Clic para desactivar">📌</button>
-      <button id="pill-btn-sound" class="icon-btn-sm" title="Activar/Silenciar sonido de alertas">🔊</button>
-      <button id="pill-btn-expand" class="icon-btn-expand" title="Expandir panel completo">▾</button>
+      <button id="pill-btn-jump" aria-label="Saltar a la consola que espera respuesta" class="icon-btn-sm hidden" title="⚡ Saltar directo a la consola que espera tu respuesta">🎯</button>
+      <button id="pill-btn-pin" aria-label="Alternar siempre encima" class="icon-btn-sm pin-on" title="Siempre encima (Always on Top: ACTIVO) · Clic para desactivar">📌</button>
+      <button id="pill-btn-sound" aria-label="Alternar sonido de alertas" class="icon-btn-sm" title="Activar/Silenciar sonido de alertas">🔊</button>
+      <button id="pill-btn-expand" aria-label="Expandir panel" class="icon-btn-expand" title="Expandir panel completo">▾</button>
     </div>
   </div>
 
@@ -194,18 +208,18 @@
             <span class="header-chip" id="header-burn-chip" title="Velocidad de consumo combinada y eficiencia de caché">🔥 -- tok/h</span>
           </div>
           <div class="header-subtitle">
-            <span id="header-live-status">Claude + AGY + Remotos</span>
+            <span id="header-live-status">Claude + AGY + Codex + Remotos</span>
           </div>
         </div>
       </div>
       <div class="header-controls">
         <button id="btn-jump-ready" class="hdr-btn hdr-btn-magic hidden" title="Enfocar la siguiente consola lista para responder">🎯 Lista</button>
         <button id="btn-ack-all" class="hdr-btn hidden" title="Marcar todas las alertas como vistas">✓ Visto</button>
-        <button id="btn-toggle-pin" class="hdr-btn pin-on" title="Siempre encima (Always on Top: ACTIVO) · Clic para desactivar">📌</button>
-        <button id="btn-toggle-sound" class="hdr-btn" title="Sonido de alerta">🔊</button>
-        <button id="btn-open-web" class="hdr-btn" title="Abrir en navegador completo">🌐</button>
+        <button id="btn-toggle-pin" aria-label="Alternar siempre encima" class="hdr-btn pin-on" title="Siempre encima (Always on Top: ACTIVO) · Clic para desactivar">📌</button>
+        <button id="btn-toggle-sound" aria-label="Alternar sonido de alertas" class="hdr-btn" title="Sonido de alerta">🔊</button>
+        <button id="btn-open-web" aria-label="Abrir en navegador" class="hdr-btn" title="Abrir en navegador completo">🌐</button>
         <button id="btn-collapse-pill" class="hdr-btn hdr-btn-pill" title="Reducir a Píldora Flotante (Esc)">— Píldora</button>
-        <button id="btn-hide-tray" class="hdr-btn" title="Minimizar a la bandeja del sistema">✕</button>
+        <button id="btn-hide-tray" aria-label="Minimizar a la bandeja" class="hdr-btn" title="Minimizar a la bandeja del sistema">✕</button>
       </div>
     </header>
 
@@ -265,6 +279,15 @@
       </div>
 
       <!-- KPI 4: Tokens Combinados & Eficiencia -->
+      <div class="kpi-card kpi-codex" id="kpi-codex-card" title="Última cuota informada por Codex en los registros locales">
+        <div class="kpi-top"><span class="kpi-label">CODEX</span><span class="kpi-tag">OpenAI</span></div>
+        <div class="kpi-quota-row"><span>5h <strong id="kpi-codex-fh-val">--%</strong></span><span>7d <strong id="kpi-codex-sd-val">--%</strong></span></div>
+        <div class="dual-mini-bars">
+          <div class="dmb-track"><div id="kpi-codex-fh-bar" class="dmb-fill fill-codex" style="width:0%"></div></div>
+          <div class="dmb-track"><div id="kpi-codex-sd-bar" class="dmb-fill fill-codex" style="width:0%"></div></div>
+        </div>
+        <div class="kpi-sub" id="kpi-codex-sub">Sin datos locales</div>
+      </div>
       <div class="kpi-card kpi-tokens">
         <div class="kpi-top">
           <span class="kpi-label">7 Días</span>
@@ -297,11 +320,12 @@
             <button class="filter-chip" data-filter="waiting">Listas</button>
             <button class="filter-chip" data-filter="claude">Claude</button>
             <button class="filter-chip" data-filter="agy">AGY</button>
+            <button class="filter-chip" data-filter="codex">Codex</button>
             <button class="filter-chip" data-filter="remote">Remotas</button>
             <button class="filter-chip" data-filter="all">24h</button>
           </div>
           <div class="search-mini-wrap">
-            <input type="text" id="session-search" class="search-mini-input" placeholder="🔍 Filtrar..." title="Filtrar por proyecto, título o herramienta (Atajo: /)" />
+            <input type="text" id="session-search" aria-label="Filtrar sesiones" class="search-mini-input" placeholder="🔍 Filtrar..." title="Filtrar por proyecto, título o herramienta (Atajo: /)" />
           </div>
         </div>
 
@@ -369,7 +393,7 @@
           <div class="section-header">
             <div class="sh-left">
               <span class="provider-pill prov-agy">AGY</span>
-              <h3>Cuota &amp; Telemetría Antigravity</h3>
+              <h3>Consumo estimado AGY</h3>
             </div>
             <span id="agy-meta-badge" class="badge-pill badge-ochre">Gemini 4 Argon</span>
           </div>
@@ -393,18 +417,37 @@
               <div class="qb-reset" id="tokens-agy-sd-reset">⏳ Libera 7d: ventana móvil</div>
             </div>
           </div>
+          <div id="agy-provider-status" class="provider-status" role="status">Porcentajes estimados contra límites configurables; no son la cuota oficial.</div>
           <div class="agy-telemetry-strip" id="agy-telemetry-strip">
             <span>Proyecto GCP: <strong id="agy-gcp-proj">--</strong></span>
             <span>Ritmo: <strong id="agy-burn-rate">-- tok/h</strong></span>
             <span>Caché Hit: <strong id="agy-cache-hit">--%</strong></span>
           </div>
           <div class="sparkline-wrap">
-            <div class="muted-xs" style="margin-bottom:3px">Curva de carga AGY últimas 24h (5h oro · 7d ámbar):</div>
+            <div class="muted-xs" style="margin-bottom:3px">Carga estimada AGY últimas 24h (5h oro · 7d ámbar):</div>
             <svg id="agy-sparkline" viewBox="0 0 400 46" preserveAspectRatio="none"></svg>
           </div>
         </div>
 
-        <!-- Comparativa Hoy vs Semanal (Claude vs AGY) -->
+        <div class="section-card card-accent-codex">
+          <div class="section-header"><div class="sh-left"><span class="provider-pill prov-codex">CODEX</span><h3>Uso y límites de Codex</h3></div><span id="codex-plan" class="badge-pill">--</span></div>
+          <div class="quota-gauges-grid">
+            <div class="quota-box">
+              <div class="qb-top"><span>Ventana 5 horas</span><strong id="codex-fh-pct" class="qb-pct brand-codex">--%</strong></div>
+              <div class="qb-bar"><div id="codex-fh-bar" class="qb-fill fill-codex" style="width:0%"></div></div>
+              <div class="qb-reset" id="codex-fh-reset">Sin datos</div>
+            </div>
+            <div class="quota-box">
+              <div class="qb-top"><span>Semanal (7 días)</span><strong id="codex-sd-pct" class="qb-pct brand-codex">--%</strong></div>
+              <div class="qb-bar"><div id="codex-sd-bar" class="qb-fill fill-codex" style="width:0%"></div></div>
+              <div class="qb-reset" id="codex-sd-reset">Sin datos</div>
+            </div>
+          </div>
+          <div id="codex-usage-detail" class="provider-status">Sin registros locales.</div>
+          <div id="codex-quota-status" class="muted-xs">Última lectura local; no consulta tu cuenta en segundo plano.</div>
+        </div>
+
+        <!-- Comparativa Hoy vs Semanal (Claude, AGY y Codex) -->
         <div class="section-card">
           <div class="section-header">
             <h3>Consumo de Tokens: Hoy vs Últimos 7 Días</h3>
@@ -420,6 +463,7 @@
             <div class="legend-inline">
               <span><i class="leg-dot leg-claude"></i>Claude</span>
               <span><i class="leg-dot leg-agy"></i>AGY</span>
+              <span><i class="leg-dot leg-codex"></i>Codex</span>
             </div>
           </div>
           <div id="weekly-chart" class="weekly-chart"></div>
@@ -476,7 +520,7 @@
                 <span class="snippet-title"><strong>📦 App + Widget Nativo Android (`AI-Pulse.apk`):</strong></span>
                 <div class="snippet-actions">
                   <button class="btn-copy" id="btn-qr-apk" type="button">📷 QR Descarga</button>
-                  <a class="btn-copy" id="btn-dl-apk" href="/ai-pulse.apk" download="AI-Pulse.apk" style="text-decoration:none">⬇️ Bajar APK</a>
+                  <a class="btn-copy" id="btn-dl-apk" href="/api/apk" download="AI-Pulse.apk" style="text-decoration:none">⬇️ Bajar APK</a>
                 </div>
               </div>
               <pre id="mobile-apk-url" class="code-box">Cargando URL del APK...</pre>
@@ -507,7 +551,7 @@
             <div id="mobile-qr-container" class="mobile-qr-container hidden">
               <div class="mobile-qr-header">
                 <span id="mobile-qr-title" class="toggle-title">Escaneá con la cámara de tu Android</span>
-                <button id="btn-close-qr" class="btn-icon-sm" type="button">✕</button>
+                <button id="btn-close-qr" aria-label="Cerrar código QR" class="btn-icon-sm" type="button">✕</button>
               </div>
               <img id="mobile-qr-img" class="mobile-qr-img" alt="QR Android" />
               <div class="muted-xs" id="mobile-qr-caption">Incluye tu token de acceso seguro</div>
@@ -558,7 +602,7 @@
           </p>
 
           <div class="input-group-row">
-            <input type="text" id="input-ntfy-topic" class="text-input" placeholder="Canal secreto ntfy" />
+            <input type="text" id="input-ntfy-topic" aria-label="Canal secreto de ntfy" class="text-input" placeholder="Canal secreto ntfy" />
             <button id="btn-save-topic" class="btn-secondary">Guardar</button>
             <button id="btn-test-remote" class="btn-primary">Probar Alerta</button>
           </div>
@@ -596,12 +640,12 @@
           </div>
           <div class="ssh-add-form" id="ssh-add-form">
             <div class="ssh-add-row">
-              <input type="text" id="ssh-label" class="text-input" placeholder="Alias (ej. VPS Prod)" style="flex:1" />
-              <input type="text" id="ssh-target" class="text-input" placeholder="usuario@host" style="flex:1.4" />
-              <input type="number" id="ssh-port" class="text-input" placeholder="22" style="width:58px; flex:none" />
+              <input type="text" id="ssh-label" aria-label="Alias del host SSH" class="text-input" placeholder="Alias (ej. VPS Prod)" style="flex:1" />
+              <input type="text" id="ssh-target" aria-label="Destino SSH usuario@host" class="text-input" placeholder="usuario@host" style="flex:1.4" />
+              <input type="number" id="ssh-port" aria-label="Puerto SSH" class="text-input" placeholder="22" style="width:58px; flex:none" />
             </div>
             <div class="ssh-add-row">
-              <input type="text" id="ssh-key" class="text-input" placeholder="🔑 Ruta a llave privada opcional (ej. ~/.ssh/id_ed25519 o C:\llaves\prod.pem)" style="flex:1" />
+              <input type="text" id="ssh-key" aria-label="Ruta a la llave privada SSH (opcional)" class="text-input" placeholder="🔑 Ruta a llave privada opcional (ej. ~/.ssh/id_ed25519 o C:\llaves\prod.pem)" style="flex:1" />
               <button id="btn-add-ssh" class="btn-primary">+ Agregar Host</button>
               <button id="btn-cancel-ssh" class="btn-secondary hidden" title="Cancelar edición (Esc)">Cancelar</button>
             </div>
@@ -631,7 +675,7 @@
                 <div class="toggle-title">Tono de Alerta</div>
               </div>
               <div style="display:flex; gap:6px; align-items:center">
-                <select id="cfg-sound-tone" class="select-input">
+                <select id="cfg-sound-tone" aria-label="Tono de alerta" class="select-input">
                   <option value="chime">Acorde Cristal</option>
                   <option value="bell">Campana Bronce</option>
                   <option value="radar">Pulso Radar</option>
@@ -661,10 +705,10 @@
           </p>
           <div class="input-group-row">
             <label class="muted-xs" style="flex:1">Límite 5h (M tok efect.):
-              <input type="number" id="cfg-agy-5h" class="text-input" min="1" max="500" value="25" style="margin-top:3px; width:100%" />
+              <input type="number" id="cfg-agy-5h" aria-label="Límite AGY ventana 5h" class="text-input" min="1" max="500" value="25" style="margin-top:3px; width:100%" />
             </label>
             <label class="muted-xs" style="flex:1">Límite 7d (M tok efect.):
-              <input type="number" id="cfg-agy-7d" class="text-input" min="5" max="2000" value="100" style="margin-top:3px; width:100%" />
+              <input type="number" id="cfg-agy-7d" aria-label="Límite AGY ventana 7d" class="text-input" min="5" max="2000" value="100" style="margin-top:3px; width:100%" />
             </label>
             <button id="btn-save-agy-limits" class="btn-primary" style="margin-top:15px">Guardar</button>
           </div>
@@ -710,7 +754,7 @@
               <div>
                 <div class="toggle-title">Opacidad del Widget (<span id="lbl-opacity">100%</span>)</div>
               </div>
-              <input type="range" id="cfg-opacity" min="0.5" max="1" step="0.02" value="1" />
+              <input type="range" id="cfg-opacity" aria-label="Opacidad de la ventana" min="0.5" max="1" step="0.02" value="1" />
             </div>
           </div>
         </div>
@@ -741,9 +785,9 @@
           <div id="chat-session-title" class="chat-session-title">Cargando conversación...</div>
         </div>
         <div class="chat-modal-header-actions">
-          <button id="btn-chat-focus-pc" class="btn-icon-sm" title="Enfocar ventana en la PC">↗</button>
-          <button id="btn-chat-refresh" class="btn-icon-sm" title="Recargar mensajes">↻</button>
-          <button id="btn-chat-close" class="btn-icon-sm" title="Cerrar (Esc)">✕</button>
+          <button id="btn-chat-focus-pc" aria-label="Enfocar ventana en la PC" class="btn-icon-sm" title="Enfocar ventana en la PC">↗</button>
+          <button id="btn-chat-refresh" aria-label="Recargar mensajes" class="btn-icon-sm" title="Recargar mensajes">↻</button>
+          <button id="btn-chat-close" aria-label="Cerrar conversación" class="btn-icon-sm" title="Cerrar (Esc)">✕</button>
         </div>
       </div>
 
@@ -765,7 +809,7 @@
 
       <!-- Barra para escribir y enviar un prompt o respuesta remota -->
       <form id="chat-reply-form" class="chat-reply-bar">
-        <textarea id="chat-reply-input" class="chat-reply-input" rows="2" placeholder="Escribí tu respuesta o instrucción para enviar a la sesión..."></textarea>
+        <textarea id="chat-reply-input" aria-label="Respuesta para la sesión" class="chat-reply-input" rows="2" placeholder="Escribí tu respuesta o instrucción para enviar a la sesión..."></textarea>
         <button type="submit" id="btn-chat-send" class="btn-chat-send">Enviar ➤</button>
       </form>
     </div>
@@ -777,7 +821,7 @@
       <h3>🔒 Acceso Remoto AI Pulse</h3>
       <p class="card-desc">Ingresá el Token de Acceso Remoto (o abrí el enlace con QR desde la pestaña Remotos en tu PC).</p>
       <form id="auth-token-form" class="input-group-row" style="margin-top:8px">
-        <input type="password" id="auth-token-input" class="text-input" placeholder="Token de acceso..." autocomplete="off" />
+        <input type="password" id="auth-token-input" aria-label="Token de acceso remoto" class="text-input" placeholder="Token de acceso..." autocomplete="off" />
         <button type="submit" class="btn-primary">Conectar</button>
       </form>
     </div>

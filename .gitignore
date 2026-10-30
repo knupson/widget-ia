@@ -5,6 +5,8 @@ bin/
 # User local configuration (contains personal ntfyTopic / SSH hosts / pre-configured APK)
 config.json
 src/public/ai-pulse.apk
+# APK firmado con credenciales (token y tópico): salida de scripts/build-android-apk.js
+apk/
 *.idsig
 
 # Logs & OS files

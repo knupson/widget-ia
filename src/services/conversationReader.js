@@ -2,41 +2,30 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const v8 = require('v8');
-
-/**
- * Desempaqueta bloques físicos de 32KB del Write-Ahead Log (.log) de LevelDB
- */
-function unpackLevelDbWal(buf) {
-  const BLOCK_SIZE = 32768;
-  const records = [];
-  let current = [];
-  let offset = 0;
-  while (offset < buf.length) {
-    const blockEnd = Math.min(offset + BLOCK_SIZE, buf.length);
-    let pos = offset;
-    while (pos + 7 <= blockEnd) {
-      const len = buf.readUInt16LE(pos + 4);
-      const type = buf[pos + 6];
-      if (type === 0 || type > 4 || pos + 7 + len > blockEnd) break;
-      const chunk = buf.subarray(pos + 7, pos + 7 + len);
-      if (type === 1) {
-        records.push(chunk);
-        current = [];
-      } else if (type === 2) {
-        current = [chunk];
-      } else if (type === 3 && current.length > 0) {
-        current.push(chunk);
-      } else if (type === 4 && current.length > 0) {
-        current.push(chunk);
-        records.push(Buffer.concat(current));
-        current = [];
-      }
-      pos += 7 + len;
-    }
-    offset += BLOCK_SIZE;
-  }
-  return records;
+const { unpackLevelDbWal } = require('./leveldbWal');
+const conversationCache = new Map();
+const desktopWalCache = new Map();
+// Cache acotada: al pasar CACHE_MAX se descarta la entrada más vieja (orden de escritura).
+const CACHE_MAX = 50;
+function cacheSet(cache, key, value) {
+  cache.delete(key);
+  cache.set(key, value);
+  while (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value);
 }
+
+function fileSignature(file) {
+  try {
+    const stat = fs.statSync(file);
+    return `${file}:${stat.mtimeMs}:${stat.size}:${stat.ino}:${stat.birthtimeMs}`;
+  } catch { return `${file}:missing`; }
+}
+
+function timestampMs(value) {
+  return Number(value) || Date.parse(value) || 0;
+}
+
+
+
 
 function cleanAgyUserPrompt(rawContent) {
   if (!rawContent || typeof rawContent !== 'string') return '';
@@ -86,6 +75,9 @@ function readAgyConversation(convId, limit = 60) {
 
   if (!fs.existsSync(compactPath)) return [];
 
+  const cacheKey = `${fileSignature(compactPath)}|${fileSignature(fullPath)}|${limit}`;
+  const cached = conversationCache.get(compactPath);
+  if (cached && cached.key === cacheKey) return cached.messages;
   let lines = [];
   let fullLines = null;
   try {
@@ -139,6 +131,9 @@ function readAgyConversation(convId, limit = 60) {
       });
     } else if (step.type === 'PLANNER_RESPONSE') {
       const text = typeof step.content === 'string' ? step.content.trim() : '';
+      // El 429 queda resumido en el estado del proveedor del widget, no como
+      // una respuesta conversacional repetida ante cada solicitud.
+      if (isAgyQuotaError(text)) continue;
       const rawTools = Array.isArray(step.tool_calls) ? step.tool_calls : [];
       const tools = [];
       let question = null;
@@ -184,7 +179,13 @@ function readAgyConversation(convId, limit = 60) {
     }
   }
 
-  return messages.slice(-limit);
+  const result = messages.slice(-limit);
+  cacheSet(conversationCache, compactPath, { key: cacheKey, messages: result });
+  return result;
+}
+
+function isAgyQuotaError(text) {
+  return /(?:RESOURCE_EXHAUSTED|Quota pool exhausted|quota.{0,32}(?:exhausted|limit reached)|(?:exhausted|limit reached).{0,32}quota)/i.test(String(text || ''));
 }
 
 /**
@@ -260,6 +261,9 @@ function readClaudeCliConversation(sessionId, limit = 60) {
   const jsonlPath = findClaudeSessionJsonl(sessionId);
   if (!jsonlPath) return [];
 
+  const cacheKey = `${fileSignature(jsonlPath)}|${limit}`;
+  const cached = conversationCache.get(jsonlPath);
+  if (cached && cached.key === cacheKey) return cached.messages;
   let lines = [];
   try {
     lines = fs.readFileSync(jsonlPath, 'utf8').split(/\r?\n/).filter(Boolean);
@@ -315,7 +319,9 @@ function readClaudeCliConversation(sessionId, limit = 60) {
     }
   }
 
-  return messages.slice(-limit);
+  const result = messages.slice(-limit);
+  cacheSet(conversationCache, jsonlPath, { key: cacheKey, messages: result });
+  return result;
 }
 
 /**
@@ -343,35 +349,46 @@ function readClaudeDesktopConversation(uuid, limit = 60) {
       .map((f) => path.join(idbDir, f));
 
     for (const logPath of files) {
-      const buf = fs.readFileSync(logPath);
-      const records = unpackLevelDbWal(buf);
-      for (const rec of records) {
-        let searchFrom = 0;
-        while (searchFrom < rec.length) {
-          const idx = rec.indexOf(pat, searchFrom);
-          if (idx === -1) break;
-          searchFrom = idx + pat.length;
-          try {
-            const payload = Buffer.concat([Buffer.from([0xff, nodeV8Ver]), rec.subarray(idx)]);
-            const val = v8.deserialize(payload);
-            if (val && val.conversationUuid === cleanUuid) {
+      const key = fileSignature(logPath);
+      let decoded = desktopWalCache.get(logPath);
+      if (!decoded || decoded.key !== key) {
+        const conversations = new Map();
+        for (const rec of unpackLevelDbWal(fs.readFileSync(logPath))) {
+          let searchFrom = 0;
+          while (searchFrom < rec.length) {
+            const idx = rec.indexOf(pat, searchFrom);
+            if (idx === -1) break;
+            searchFrom = idx + pat.length;
+            try {
+              const val = v8.deserialize(Buffer.concat([Buffer.from([0xff, nodeV8Ver]), rec.subarray(idx)]));
+              if (!val || !val.conversationUuid) continue;
               const tree = val.tree && typeof val.tree === 'object' ? val.tree : val;
-              const rawMsgs = Array.isArray(tree.chat_messages)
-                ? tree.chat_messages
-                : Array.isArray(val.messages)
-                  ? val.messages
-                  : [];
-              const upd = Math.max(
-                Number(val.writtenAt) || 0,
-                Number(val.fetchedAt) || 0,
-                rawMsgs.length
-              );
-              if (rawMsgs.length > 0 && upd >= bestUpdatedAt) {
-                bestUpdatedAt = upd;
-                bestMessages = rawMsgs;
-              }
-            }
-          } catch {}
+              const messages = Array.isArray(tree.chat_messages) ? tree.chat_messages : Array.isArray(val.messages) ? val.messages : [];
+              const updatedAt = Math.max(timestampMs(val.writtenAt), timestampMs(val.fetchedAt),
+                ...messages.map((message) => timestampMs(message.updated_at || message.created_at)));
+              const prev = conversations.get(val.conversationUuid);
+              if (!prev || updatedAt >= prev.updatedAt) conversations.set(val.conversationUuid, { val, updatedAt });
+            } catch {}
+          }
+        }
+        decoded = { key, conversations };
+        cacheSet(desktopWalCache, logPath, decoded);
+      }
+      const newest = decoded.conversations.get(cleanUuid);
+      if (newest) {
+        const val = newest.val;
+        if (val && val.conversationUuid === cleanUuid) {
+          const tree = val.tree && typeof val.tree === 'object' ? val.tree : val;
+          const rawMsgs = Array.isArray(tree.chat_messages)
+            ? tree.chat_messages
+            : Array.isArray(val.messages)
+              ? val.messages
+              : [];
+          const upd = newest.updatedAt;
+          if (upd >= bestUpdatedAt) {
+            bestUpdatedAt = upd;
+            bestMessages = rawMsgs;
+          }
         }
       }
     }

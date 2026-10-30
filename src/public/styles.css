@@ -13,7 +13,7 @@
 
   --text-main: #faf4ed;
   --text-muted: #b8a38c;
-  --text-dim: #7a6855;
+  --text-dim: #9a8670;
 
   /* Acentos Naranja y Ocre */
   --orange-vivid: #ff6b1a;
@@ -35,6 +35,7 @@
   --danger: #ef4444;
   --claude-color: #ff6b1a;
   --agy-color: #e09f3e;
+  --codex-color: #5ee0c2;
 }
 
 * {
@@ -60,6 +61,13 @@ body {
 .text-ochre { color: #eab308; }
 .text-gold { color: #facc15; }
 .text-amber { color: #f59e0b; }
+.brand-codex { color: var(--codex-color); }
+.fill-codex, .dot-codex, .leg-codex, .bar-seg-codex { background: var(--codex-color); }
+.prov-codex { color: var(--codex-color); background: rgba(94,224,194,.12); border: 1px solid rgba(94,224,194,.25); }
+.card-accent-codex { border-left: 2px solid var(--codex-color); }
+.provider-status { margin: 8px 0; color: var(--text-muted); font-size: 11px; line-height: 1.4; }
+.quota-exhausted { color: var(--danger) !important; }
+.aw-codex-card { margin-top: 6px; }
 
 /* =========================================================
    MODO 1: PÍLDORA COMPACTA FLOTANTE (HUD / DYNAMIC ISLAND)
@@ -76,6 +84,7 @@ body.mode-web #pill-view {
 .pill-container {
   width: 100vw;
   height: 100vh;
+  height: 100dvh;
   padding: 3px 8px;
   gap: 8px;
   display: flex;
@@ -406,6 +415,7 @@ body.mode-web #pill-view {
 .panel-container {
   width: 100vw;
   height: 100vh;
+  height: 100dvh;
   background:
     radial-gradient(circle at 15% 0%, rgba(255, 107, 26, 0.12), rgba(224, 159, 62, 0.04) 42%, transparent 72%),
     var(--bg-panel);
@@ -425,6 +435,7 @@ body.mode-web {
 body.mode-web .panel-container {
   max-width: 900px;
   height: calc(100vh - 24px);
+  height: calc(100dvh - 24px);
   margin: 12px auto;
 }
 
@@ -543,7 +554,7 @@ body.mode-web .panel-container {
    ========================================================= */
 .summary-strip {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 5px;
   padding: 6px 8px;
   background: rgba(14, 10, 7, 0.85);
@@ -2643,5 +2654,22 @@ body.mode-android-widget #panel-view {
 
   body.mode-web .btn-quick {
     flex-shrink: 0;
+  }
+}
+
+/* Cuota de Claude sin lectura vigente: track punteado, sin relleno (no es un 0% real) */
+.is-unknown {
+  background-image: repeating-linear-gradient(90deg, rgba(224, 159, 62, 0.22) 0 4px, transparent 4px 8px);
+}
+
+/* Accesibilidad: sin animaciones ni transiciones para quien pidió reducir movimiento */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }

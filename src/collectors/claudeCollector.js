@@ -1,19 +1,29 @@
 const fs = require('fs');
+const { TOKEN_WEIGHTS } = require('./tokenWeights');
 const path = require('path');
 const os = require('os');
 const v8 = require('v8');
+const { unpackLevelDbWal } = require('../services/leveldbWal');
 
 // Cache incremental por archivo JSONL y bases de Claude Desktop App
 const jsonlCache = new Map();
+const desktopBlobCache = new Map();
+const desktopWalCache = new Map();
 const sessionFileCache = new Map();
 const projectFolderCache = new Map();
 let projectsRootCache = { mtimeMs: 0, folders: [] };
 let claudeJsonMetaCache = { key: '', data: null };
 let planUsageCache = { mtimeMs: '', data: null };
+const PLAN_USAGE_STALE_MS = 45 * 60 * 1000;
 let desktopScanCache = { checkedAt: 0, isAppOpen: false, ssFiles: [], idbLogFiles: [], rqBlobFiles: [], fileCacheKey: '' };
 let desktopIdbCache = { fileKey: '', allConvs: [], projectsMap: new Map(), resultKey: '', data: null };
 let sessionsDirCache = { mtimeMs: 0, files: [] };
 let claudeResultCache = { key: '', data: null };
+
+function localDayKey(value) {
+  const date = new Date(value);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
 
 function getClaudeDir() {
   return path.join(os.homedir(), '.claude');
@@ -49,92 +59,60 @@ function isClaudeDesktopAppOpen(appDataDir) {
  */
 function snappyUncompress(buf) {
   let pos = 0;
+  const requireBytes = (count) => {
+    if (pos + count > buf.length) throw new Error('Snappy truncado');
+  };
   let uncompressedLength = 0;
   let shift = 0;
-  while (pos < buf.length) {
-    const b = buf[pos++];
-    uncompressedLength |= (b & 0x7f) << shift;
-    if ((b & 0x80) === 0) break;
+  while (true) {
+    requireBytes(1);
+    const byte = buf[pos++];
+    uncompressedLength += (byte & 0x7f) * 2 ** shift;
+    if (uncompressedLength > 64 * 1024 * 1024) throw new Error('Snappy excede 64 MB');
+    if (!(byte & 0x80)) break;
     shift += 7;
-    if (shift > 35) throw new Error('Invalid Snappy header');
+    if (shift > 28) throw new Error('Cabecera Snappy invalida');
   }
   const out = Buffer.alloc(uncompressedLength);
   let outPos = 0;
-  while (pos < buf.length && outPos < uncompressedLength) {
+  while (outPos < uncompressedLength) {
+    requireBytes(1);
     const tag = buf[pos++];
-    const type = tag & 0x03;
+    const type = tag & 3;
+    let len;
+    let offset;
     if (type === 0) {
-      let len = (tag >> 2) + 1;
+      len = (tag >> 2) + 1;
       if (len > 60) {
-        const extraBytes = len - 60;
-        len = 0;
-        for (let i = 0; i < extraBytes; i++) {
-          len |= buf[pos++] << (8 * i);
-        }
-        len += 1;
+        const extra = len - 60;
+        requireBytes(extra);
+        len = 1;
+        for (let i = 0; i < extra; i++) len += buf[pos++] * 2 ** (8 * i);
       }
+      requireBytes(len);
+      if (outPos + len > out.length) throw new Error('Literal Snappy invalido');
       buf.copy(out, outPos, pos, pos + len);
       pos += len;
       outPos += len;
-    } else {
-      let len = 0;
-      let offset = 0;
-      if (type === 1) {
-        len = ((tag >> 2) & 0x07) + 4;
-        offset = ((tag & 0xe0) << 3) | buf[pos++];
-      } else if (type === 2) {
-        len = (tag >> 2) + 1;
-        offset = buf.readUInt16LE(pos);
-        pos += 2;
-      } else {
-        len = (tag >> 2) + 1;
-        offset = buf.readUInt32LE(pos);
-        pos += 4;
-      }
-      if (offset <= 0 || outPos - offset < 0) throw new Error('Invalid Snappy offset');
-      for (let i = 0; i < len; i++) {
-        out[outPos] = out[outPos - offset];
-        outPos++;
-      }
+      continue;
     }
+    const extra = type === 1 ? 1 : type === 2 ? 2 : 4;
+    requireBytes(extra);
+    if (type === 1) {
+      len = ((tag >> 2) & 7) + 4;
+      offset = ((tag & 0xe0) << 3) | buf[pos];
+    } else {
+      len = (tag >> 2) + 1;
+      offset = type === 2 ? buf.readUInt16LE(pos) : buf.readUInt32LE(pos);
+    }
+    pos += extra;
+    if (offset <= 0 || offset > outPos || outPos + len > out.length) throw new Error('Copia Snappy invalida');
+    for (let i = 0; i < len; i++, outPos++) out[outPos] = out[outPos - offset];
   }
   return out;
 }
 
-/**
- * Desempaqueta bloques físicos de 32KB del Write-Ahead Log (.log) de LevelDB
- */
-function unpackLevelDbWal(buf) {
-  const BLOCK_SIZE = 32768;
-  const records = [];
-  let current = [];
-  let offset = 0;
-  while (offset < buf.length) {
-    const blockEnd = Math.min(offset + BLOCK_SIZE, buf.length);
-    let pos = offset;
-    while (pos + 7 <= blockEnd) {
-      const len = buf.readUInt16LE(pos + 4);
-      const type = buf[pos + 6];
-      if (type === 0 || type > 4 || pos + 7 + len > blockEnd) break;
-      const chunk = buf.subarray(pos + 7, pos + 7 + len);
-      if (type === 1) {
-        records.push(chunk);
-        current = [];
-      } else if (type === 2) {
-        current = [chunk];
-      } else if (type === 3 && current.length > 0) {
-        current.push(chunk);
-      } else if (type === 4 && current.length > 0) {
-        current.push(chunk);
-        records.push(Buffer.concat(current));
-        current = [];
-      }
-      pos += 7 + len;
-    }
-    offset += BLOCK_SIZE;
-  }
-  return records;
-}
+
 
 /**
  * Extrae las conversaciones abiertas y recientes de la App de Escritorio de Claude (%APPDATA%\Claude)
@@ -332,13 +310,21 @@ function collectClaudeDesktopSessions(appDataDir) {
   rqBlobFiles.sort((a, b) => b.mtimeMs - a.mtimeMs);
   for (const bInfo of rqBlobFiles) {
     try {
-      const raw = fs.readFileSync(bInfo.full);
-      if (raw.length < 10) continue;
-      const decomp = snappyUncompress(raw.subarray(3));
-      const idxO = decomp.indexOf(patObjStart);
-      if (idxO === -1) continue;
-      const v8Buf = Buffer.concat([Buffer.from([0xff, nodeV8Ver]), decomp.subarray(idxO)]);
-      const obj = v8.deserialize(v8Buf);
+      const st = fs.statSync(bInfo.full);
+      const key = `${st.mtimeMs}:${st.size}`;
+      let decoded = desktopBlobCache.get(bInfo.full);
+      if (!decoded || decoded.key !== key) {
+        const raw = fs.readFileSync(bInfo.full);
+        let obj = null;
+        if (raw.length >= 10) {
+          const decomp = snappyUncompress(raw.subarray(3));
+          const idxO = decomp.indexOf(patObjStart);
+          if (idxO !== -1) obj = v8.deserialize(Buffer.concat([Buffer.from([0xff, nodeV8Ver]), decomp.subarray(idxO)]));
+        }
+        decoded = { key, obj };
+        desktopBlobCache.set(bInfo.full, decoded);
+      }
+      const obj = decoded.obj;
       const queries = obj?.clientState?.queries;
       if (!Array.isArray(queries)) continue;
 
@@ -387,17 +373,25 @@ function collectClaudeDesktopSessions(appDataDir) {
   const pat = Buffer.from('o"\x10conversationUuid');
   for (const logPath of idbLogFiles) {
     try {
-      const buf = fs.readFileSync(logPath);
-      const records = unpackLevelDbWal(buf);
-      for (const rec of records) {
-        let searchFrom = 0;
-        while (searchFrom < rec.length) {
-          const idx = rec.indexOf(pat, searchFrom);
-          if (idx === -1) break;
-          searchFrom = idx + pat.length;
-          try {
-            const payload = Buffer.concat([Buffer.from([0xff, nodeV8Ver]), rec.subarray(idx)]);
-            const val = v8.deserialize(payload);
+      const st = fs.statSync(logPath);
+      const key = `${st.mtimeMs}:${st.size}`;
+      let decoded = desktopWalCache.get(logPath);
+      if (!decoded || decoded.key !== key) {
+        const values = [];
+        for (const rec of unpackLevelDbWal(fs.readFileSync(logPath))) {
+          let searchFrom = 0;
+          while (searchFrom < rec.length) {
+            const idx = rec.indexOf(pat, searchFrom);
+            if (idx === -1) break;
+            searchFrom = idx + pat.length;
+            try { values.push(v8.deserialize(Buffer.concat([Buffer.from([0xff, nodeV8Ver]), rec.subarray(idx)]))); } catch {}
+          }
+        }
+        decoded = { key, values };
+        desktopWalCache.set(logPath, decoded);
+      }
+      for (const val of decoded.values) {
+        try {
             if (val && val.conversationUuid) {
               const uuid = val.conversationUuid;
               const tree = val.tree && typeof val.tree === 'object' ? val.tree : val;
@@ -456,7 +450,7 @@ function collectClaudeDesktopSessions(appDataDir) {
                 }
                 const lastMsg = msgs[msgs.length - 1];
                 prev.lastSender = lastMsg.sender || 'assistant';
-                prev.lastStopReason = lastMsg.stop_reason || 'end_turn';
+                prev.lastStopReason = lastMsg.stop_reason || null;
                 prev.lastMsgUpdatedAt = lastMsg.updated_at ? Date.parse(lastMsg.updated_at) || 0 : 0;
                 prev.lastUserText = lastUserText || prev.lastUserText || '';
                 prev.lastAssistantText = lastAssistantText || prev.lastAssistantText || '';
@@ -466,8 +460,7 @@ function collectClaudeDesktopSessions(appDataDir) {
               }
               convMap.set(uuid, prev);
             }
-          } catch {}
-        }
+        } catch {}
       }
     } catch {}
   }
@@ -489,7 +482,7 @@ function collectClaudeDesktopSessions(appDataDir) {
     const lastTs = Math.max(c.lastStartTs || 0, c.lastEndTs || 0, c.lastMsgUpdatedAt || 0);
     return lastTs > 0 && now - lastTs < 6 * 60 * 1000;
   });
-  const resultKey = `${fileCacheKey}:${isAppOpen ? '1' : '0'}:${hasRecentLiveActivity ? Math.floor(now / 15000) : 'stable'}`;
+  const resultKey = `${fileCacheKey}:${isAppOpen ? '1' : '0'}:${hasRecentLiveActivity ? Math.floor(now / 15000) : Math.floor(now / 60000)}`;
   if (desktopIdbCache.data && desktopIdbCache.resultKey === resultKey) {
     return desktopIdbCache.data;
   }
@@ -556,7 +549,7 @@ function collectClaudeDesktopSessions(appDataDir) {
       crTok = Math.round(baseTok * 0.5);
     }
     const totTok = inTok + outTok + crTok;
-    const effTok = Math.round(inTok + crTok * 0.1 + outTok * 5);
+    const effTok = Math.round(inTok + crTok * TOKEN_WEIGHTS.cacheRead + outTok * TOKEN_WEIGHTS.output);
 
     desktopSessions.push({
       id: `claude-app:${c.uuid}`,
@@ -579,9 +572,11 @@ function collectClaudeDesktopSessions(appDataDir) {
       workspace: `https://claude.ai/chat/${c.uuid}`,
       updatedAt: lastActiveMs || now,
       turns,
+      estimated: true,
       lastMessage: c.lastAssistantText || c.lastUserText || '',
       currentAction: state === 'running' ? 'Generando respuesta en Claude App...' : '',
       tokens: {
+        estimated: true,
         input: inTok,
         cacheRead: crTok,
         cacheWrite: 0,
@@ -672,7 +667,7 @@ function readClaudeUtilizationMeta() {
  * y detectar reseteos semanales (programados y bonus gratis de Anthropic)
  * fh = Five-Hour window %, sd = Seven-Day (Weekly) window %
  */
-function readPlanQuotaUsage() {
+function readDesktopPlanQuotaUsage() {
   const appData = getClaudeAppDataDir();
   const planPath = path.join(appData, 'plan-usage-history.json');
   const utilMeta = readClaudeUtilizationMeta();
@@ -693,7 +688,7 @@ function readPlanQuotaUsage() {
 
   try {
     const stat = fs.statSync(planPath);
-    const cacheBucket = `${stat.mtimeMs}:${stat.size}:${utilMeta.nextWeeklyResetAt || 0}:${utilMeta.nextFiveHourResetAt || 0}:${utilMeta.activePromo || ''}`;
+    const cacheBucket = `${stat.mtimeMs}:${stat.size}:${utilMeta.nextWeeklyResetAt || 0}:${utilMeta.nextFiveHourResetAt || 0}:${utilMeta.activePromo || ''}:${Math.floor(Date.now() / 60000)}`;
     if (planUsageCache.data && planUsageCache.mtimeMs === cacheBucket) {
       return planUsageCache.data;
     }
@@ -777,18 +772,18 @@ function readPlanQuotaUsage() {
     }
 
     const latest = entries[entries.length - 1];
-    const fiveHourPct = latest.u && typeof latest.u.fh === 'number' ? latest.u.fh : 0;
-    const sevenDayPct = latest.u && typeof latest.u.sd === 'number' ? latest.u.sd : 0;
+    const fiveHourPct = latest.u && typeof latest.u.fh === 'number' ? latest.u.fh : null;
+    const sevenDayPct = latest.u && typeof latest.u.sd === 'number' ? latest.u.sd : null;
 
     // Filtrar solo reseteos recientes (últimas 24h y cuyo ahorro no haya sido ya superado)
     // para no mostrar regalos ni cortes semanales del pasado como actuales
     const recentResets = allResets.filter(
-      (r) => now - r.timestamp < 24 * 3600 * 1000 && sevenDayPct < r.fromPct
+      (r) => now - r.timestamp < 24 * 3600 * 1000 && sevenDayPct != null && sevenDayPct < r.fromPct
     );
     const lastReset = recentResets[0] || null;
     const lastBonusReset =
       recentResets.find(
-        (r) => r.isBonus && now - r.timestamp < 12 * 3600 * 1000 && sevenDayPct < 50
+        (r) => r.isBonus && now - r.timestamp < 12 * 3600 * 1000 && sevenDayPct != null && sevenDayPct < 50
       ) || null;
 
     // Calcular cuándo resetea la cuota de 5 horas si está activa (fh > 0)
@@ -800,7 +795,7 @@ function readPlanQuotaUsage() {
         for (let i = entries.length - 1; i >= 0; i--) {
           const item = entries[i];
           const ts = item.t || 0;
-          const fhVal = item.u && typeof item.u.fh === 'number' ? item.u.fh : 0;
+          const fhVal = item.u && typeof item.u.fh === 'number' ? item.u.fh : null;
           if (ts < fiveHoursAgo) break;
           if (fhVal === 0) break;
           windowStartTs = ts;
@@ -821,21 +816,29 @@ function readPlanQuotaUsage() {
 
     const recentHistory = entries.slice(-48).map((item) => ({
       t: item.t,
-      fh: item.u && typeof item.u.fh === 'number' ? item.u.fh : 0,
-      sd: item.u && typeof item.u.sd === 'number' ? item.u.sd : 0
+      fh: item.u && typeof item.u.fh === 'number' ? item.u.fh : null,
+      sd: item.u && typeof item.u.sd === 'number' ? item.u.sd : null
     }));
+
+    // Claude Desktop escribe una muestra cada ~15 min. Si dejó de hacerlo, el último valor
+    // puede ser de una semana anterior (ej. 100% ya reseteado): se informa como desconocido.
+    const updatedAt = latest.t || stat.mtimeMs;
+    const stale = now - updatedAt > PLAN_USAGE_STALE_MS;
 
     const result = {
       available: true,
-      fiveHourPct,
-      sevenDayPct,
-      updatedAt: latest.t || stat.mtimeMs,
+      stale,
+      fiveHourPct: stale ? null : fiveHourPct,
+      sevenDayPct: stale ? null : sevenDayPct,
+      lastKnownFiveHourPct: fiveHourPct,
+      lastKnownSevenDayPct: sevenDayPct,
+      updatedAt,
       nextWeeklyResetAt,
-      nextFiveHourResetAt,
+      nextFiveHourResetAt: stale ? null : nextFiveHourResetAt,
       activePromo: utilMeta.activePromo,
-      lastReset,
-      lastBonusReset,
-      resets: recentResets.slice(0, 6),
+      lastReset: stale ? null : lastReset,
+      lastBonusReset: stale ? null : lastBonusReset,
+      resets: stale ? [] : recentResets.slice(0, 6),
       history: recentHistory
     };
 
@@ -854,6 +857,68 @@ function readPlanQuotaUsage() {
       history: []
     };
   }
+}
+
+/**
+ * Lee ~/.claude/ai-pulse/claude-rate-limits.json, que escribe src/scripts/claude-statusline.mjs
+ * con el rate_limits real que Claude Code pasa a su statusLine (cuota del CLI, sin tocar OAuth).
+ */
+let statuslineQuotaCache = { key: '', data: null };
+function readStatuslineQuota(now = Date.now()) {
+  const file = path.join(os.homedir(), '.claude', 'ai-pulse', 'claude-rate-limits.json');
+  try {
+    const st = fs.statSync(file);
+    const key = `${st.mtimeMs}:${st.size}`;
+    let raw;
+    if (statuslineQuotaCache.key === key) {
+      raw = statuslineQuotaCache.data;
+    } else {
+      raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+      statuslineQuotaCache = { key, data: raw };
+    }
+    const lastSeenAt = Number(raw.lastSeenAt) || st.mtimeMs;
+    // Una ventana ya vencida (resetsAt pasó) significa uso reiniciado: 0%, no el valor viejo
+    const pctOf = (w) => {
+      if (!w || !Number.isFinite(w.pct)) return null;
+      return w.resetsAt && w.resetsAt <= now ? 0 : w.pct;
+    };
+    return {
+      fiveHourPct: pctOf(raw.fiveHour),
+      sevenDayPct: pctOf(raw.sevenDay),
+      nextFiveHourResetAt: raw.fiveHour && raw.fiveHour.resetsAt > now ? raw.fiveHour.resetsAt : null,
+      nextWeeklyResetAt: raw.sevenDay && raw.sevenDay.resetsAt > now ? raw.sevenDay.resetsAt : null,
+      updatedAt: Number(raw.updatedAt) || lastSeenAt,
+      lastSeenAt,
+      stale: now - lastSeenAt > PLAN_USAGE_STALE_MS
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Cuota del plan de Claude: combina Claude Desktop (plan-usage-history.json) y el statusline de
+ * Claude Code. Gana la fuente con lectura vigente más reciente; si ambas están vencidas, queda stale.
+ */
+function readPlanQuotaUsage() {
+  const desktop = readDesktopPlanQuotaUsage();
+  const cli = readStatuslineQuota();
+  if (!cli || cli.stale) return desktop;
+  const desktopFresh = desktop && desktop.available && !desktop.stale;
+  if (desktopFresh && (desktop.updatedAt || 0) >= cli.lastSeenAt) return desktop;
+  return {
+    ...(desktop || {}),
+    available: true,
+    source: 'claude-code-statusline',
+    stale: false,
+    fiveHourPct: cli.fiveHourPct,
+    sevenDayPct: cli.sevenDayPct,
+    lastKnownFiveHourPct: cli.fiveHourPct,
+    lastKnownSevenDayPct: cli.sevenDayPct,
+    updatedAt: cli.lastSeenAt,
+    nextFiveHourResetAt: cli.nextFiveHourResetAt,
+    nextWeeklyResetAt: cli.nextWeeklyResetAt || (desktop && desktop.nextWeeklyResetAt) || null
+  };
 }
 
 /**
@@ -882,24 +947,6 @@ function readActiveSessionFiles(claudeDir) {
     const full = path.join(sessDir, f);
     try {
       let cached = sessionFileCache.get(full);
-      // Si el directorio no cambió y la sesión ya estaba muerta hace más de 60s, evitar statSync/kill repetidos
-      if (
-        cached &&
-        cached.dirMtimeMs === dirMtimeMs &&
-        cached.isAlive === false &&
-        now - cached.mtimeMs > 60000
-      ) {
-        const obj = cached.obj;
-        if (obj && obj.sessionId && !map.has(obj.sessionId)) {
-          map.set(obj.sessionId, {
-            ...obj,
-            isAlive: false,
-            fileMtimeMs: cached.mtimeMs
-          });
-        }
-        continue;
-      }
-
       const st = fs.statSync(full);
       let obj = null;
       let alive = false;
@@ -956,6 +1003,36 @@ function extractMessageText(content) {
 /**
  * Parsea un archivo .jsonl de proyecto de Claude Code con caché incremental
  */
+const JSONL_PROBE_BYTES = 64;
+
+function readJsonlAppend(file, stat, cached) {
+  const identity = `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
+  let resume = Boolean(cached && cached.identity === identity && stat.size >= cached.size &&
+    !(stat.size === cached.size && stat.mtimeMs !== cached.mtimeMs));
+  let offset = 0;
+  let buffer;
+  let bytes;
+  const fd = fs.openSync(file, 'r');
+  try {
+    // Truncado y vuelto a crecer: los últimos bytes ya no coinciden con el probe guardado
+    if (resume && cached.probe && cached.probe.length > 0) {
+      const probe = Buffer.alloc(cached.probe.length);
+      const got = fs.readSync(fd, probe, 0, probe.length, cached.size - probe.length);
+      if (got !== probe.length || !probe.equals(cached.probe)) resume = false;
+    }
+    offset = resume ? cached.size : 0;
+    buffer = Buffer.alloc(stat.size - offset);
+    bytes = fs.readSync(fd, buffer, 0, buffer.length, offset);
+  } finally { fs.closeSync(fd); }
+  const content = Buffer.concat([resume ? cached.rest : Buffer.alloc(0), buffer.subarray(0, bytes)]);
+  const end = content.lastIndexOf(10);
+  const lines = end < 0 ? [] : content.subarray(0, end).toString('utf8').split('\n');
+  // Copias propias: sin esto la caché retiene el buffer completo de la última lectura
+  const rest = Buffer.from(content.subarray(end + 1));
+  const probe = Buffer.from(content.subarray(Math.max(0, content.length - JSONL_PROBE_BYTES)));
+  return { identity, resume, size: offset + bytes, rest, probe, lines };
+}
+
 function parseClaudeJsonl(filePath) {
   let stat;
   try {
@@ -969,14 +1046,9 @@ function parseClaudeJsonl(filePath) {
     return cached.data;
   }
 
-  let raw = '';
-  try {
-    raw = fs.readFileSync(filePath, 'utf8');
-  } catch {
-    return cached ? cached.data : null;
-  }
-
-  const lines = raw.split(/\r?\n/);
+  let append;
+  try { append = readJsonlAppend(filePath, stat, cached); } catch { return cached ? cached.data : null; }
+  const lines = append.lines;
   let inputTokens = 0;
   let cacheWriteTokens = 0;
   let cacheReadTokens = 0;
@@ -989,15 +1061,18 @@ function parseClaudeJsonl(filePath) {
   let lastUserText = '';
   let lastAssistantText = '';
   let lastToolUse = null;
-  let lastStopReason = '';
+  let lastStopReason = null;
   let lastEventType = '';
   let lastUserIsToolResult = false;
   let activeBgCommand = null;
   let lastTimestampMs = stat.mtimeMs;
 
-  const dailyTokens = {}; // YYYY-MM-DD -> { input, cacheRead, cacheWrite, output, total, effective, turns }
-  const modelTokens = {}; // model -> { input, cacheRead, cacheWrite, output, total, effective }
-  const seenRequestIds = new Set();
+  let dailyTokens = {}; // YYYY-MM-DD -> { input, cacheRead, cacheWrite, output, total, effective, turns }
+  let modelTokens = {}; // model -> { input, cacheRead, cacheWrite, output, total, effective }
+  let seenRequestIds = new Set();
+
+  let lineCount = 0;
+  if (append.resume) ({ inputTokens, cacheWriteTokens, cacheReadTokens, outputTokens, turns, lastModel, cwd, gitBranch, customTitle, lastUserText, lastAssistantText, lastToolUse, lastStopReason, lastEventType, lastUserIsToolResult, activeBgCommand, lastTimestampMs, dailyTokens, modelTokens, seenRequestIds, lineCount } = cached.state);
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
@@ -1026,12 +1101,12 @@ function parseClaudeJsonl(filePath) {
       lastUserIsToolResult = hasToolResult;
 
       if (hasToolResult) {
-        const resultText = JSON.stringify(contentArr);
-        if (
-          /Command running in background|running in the background|backgroundTaskId|Async agent launched/i.test(
-            resultText
-          )
-        ) {
+        const result = entry.toolUseResult || {};
+        const backgroundResult = result.backgroundTaskId || result.background_task_id ||
+          result.isAsync === true || result.isBackground === true ||
+          contentArr.some((b) => b && b.type === 'tool_result' &&
+            (b.backgroundTaskId || b.background_task_id || b.isBackground === true));
+        if (backgroundResult) {
           activeBgCommand =
             (lastToolUse && lastToolUse.detail) || 'Comando o subagente en segundo plano';
         }
@@ -1090,7 +1165,7 @@ function parseClaudeJsonl(filePath) {
       }
 
       // Evitar duplicar conteo si Claude loguea múltiples fragmentos del mismo requestId/message.id
-      const reqKey = entry.requestId || msg.id || `line-${i}`;
+      const reqKey = entry.requestId || msg.id || `line-${lineCount + i}`;
       if (msg.usage && !seenRequestIds.has(reqKey)) {
         seenRequestIds.add(reqKey);
         turns++;
@@ -1106,9 +1181,9 @@ function parseClaudeJsonl(filePath) {
         outputTokens += outTok;
 
         const tot = inTok + cwTok + crTok + outTok;
-        const eff = Math.round(inTok + crTok * 0.1 + cwTok * 2 + outTok * 5);
+        const eff = Math.round(inTok + crTok * TOKEN_WEIGHTS.cacheRead + cwTok * TOKEN_WEIGHTS.cacheWrite + outTok * TOKEN_WEIGHTS.output);
 
-        const dayKey = new Date(lastTimestampMs).toISOString().slice(0, 10);
+        const dayKey = localDayKey(lastTimestampMs);
         if (!dailyTokens[dayKey]) {
           dailyTokens[dayKey] = {
             input: 0,
@@ -1142,9 +1217,12 @@ function parseClaudeJsonl(filePath) {
     }
   }
 
+  lineCount += lines.length;
+  const state = { inputTokens, cacheWriteTokens, cacheReadTokens, outputTokens, turns, lastModel, cwd, gitBranch, customTitle, lastUserText, lastAssistantText, lastToolUse, lastStopReason, lastEventType, lastUserIsToolResult, activeBgCommand, lastTimestampMs, dailyTokens, modelTokens, seenRequestIds, lineCount };
+
   const totalTokens = inputTokens + cacheWriteTokens + cacheReadTokens + outputTokens;
   const effectiveTokens = Math.round(
-    inputTokens + cacheReadTokens * 0.1 + cacheWriteTokens * 2 + outputTokens * 5
+    inputTokens + cacheReadTokens * TOKEN_WEIGHTS.cacheRead + cacheWriteTokens * TOKEN_WEIGHTS.cacheWrite + outputTokens * TOKEN_WEIGHTS.output
   );
 
   const data = {
@@ -1172,7 +1250,7 @@ function parseClaudeJsonl(filePath) {
     lastTimestampMs
   };
 
-  jsonlCache.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, data });
+  jsonlCache.set(filePath, { mtimeMs: stat.mtimeMs, size: append.size, identity: append.identity, rest: append.rest, probe: append.probe, state, data });
   return data;
 }
 
@@ -1229,6 +1307,11 @@ function collectClaudeData(hookStateOverrides = new Map()) {
       }
 
       for (const [sessId, info] of folderRecord.filesMap.entries()) {
+        try {
+          const st = fs.statSync(info.fullJsonl);
+          info.mtimeMs = st.mtimeMs;
+          info.size = st.size;
+        } catch { continue; }
         if (info.mtimeMs >= sevenDaysAgo || activeSessionsMap.has(sessId)) {
           jsonlFilesBySessionId.set(sessId, info.fullJsonl);
         }
@@ -1271,6 +1354,7 @@ function collectClaudeData(hookStateOverrides = new Map()) {
     planUsageCache.mtimeMs,
     desktopIdbCache.resultKey,
     aliveSigParts.join(','),
+    [...projectFolderCache.values()].flatMap((r) => [...r.filesMap.values()].map((f) => `${f.mtimeMs}:${f.size}`)).join(','),
     hookSigParts.join(','),
     hasRecentAliveActivity ? Math.floor(now / 3000) : Math.floor(now / 60000)
   ].join('|');
@@ -1346,22 +1430,18 @@ function collectClaudeData(hookStateOverrides = new Map()) {
     const hookOverride = hookStateOverrides.get(sessId);
 
     if (isOpen) {
-      if (hookOverride && Date.now() - hookOverride.timestamp < 5 * 60 * 1000) {
+      if (hookOverride && Date.now() - hookOverride.timestamp < 5 * 60 * 1000 &&
+        (!parsed || parsed.lastTimestampMs <= hookOverride.timestamp)) {
         state = hookOverride.state;
       } else if (activeMeta.status && activeMeta.status !== 'idle') {
-        state = 'running';
+        state = activeMeta.status === 'waiting_approval' ? 'waiting_approval' : 'running';
       } else if (
         parsed &&
         parsed.lastStopReason === 'tool_use' &&
         parsed.lastEventType === 'assistant' &&
         Date.now() - parsed.lastTimestampMs < 180000
       ) {
-        const elapsed = Date.now() - parsed.lastTimestampMs;
-        if (parsed.lastToolUse && parsed.lastToolUse.isBackground) {
-          state = 'running';
-        } else {
-          state = elapsed > 6000 ? 'waiting_approval' : 'running';
-        }
+        state = 'running';
       } else if (
         parsed &&
         parsed.lastEventType === 'user' &&
@@ -1444,8 +1524,8 @@ function collectClaudeData(hookStateOverrides = new Map()) {
   // Incorporar las conversaciones activas y recientes de la App de Escritorio de Claude (%APPDATA%\Claude)
   for (const ds of desktopSessions) {
     sessions.push(ds);
-    if (ds.updatedAt >= sevenDaysAgo && ds.tokens && ds.tokens.total > 0) {
-      const dayKey = new Date(ds.updatedAt).toISOString().slice(0, 10);
+    if (!ds.estimated && ds.updatedAt >= sevenDaysAgo && ds.tokens && ds.tokens.total > 0) {
+      const dayKey = localDayKey(ds.updatedAt);
       if (!dailyAgg[dayKey]) {
         dailyAgg[dayKey] = {
           input: 0,
@@ -1486,5 +1566,5 @@ function collectClaudeData(hookStateOverrides = new Map()) {
 }
 
 module.exports = {
-  collectClaudeData
+  collectClaudeData, readPlanQuotaUsage, parseClaudeJsonl, snappyUncompress, localDayKey
 };

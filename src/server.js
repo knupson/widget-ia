@@ -4,6 +4,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { collectAgyData } = require('./collectors/agyCollector');
 const { collectClaudeData } = require('./collectors/claudeCollector');
+const { collectCodexData } = require('./collectors/codexCollector');
 const { RemoteManager } = require('./collectors/remoteManager');
 const { getHooksStatus, setClaudeHookEnabled, setAgyHookEnabled } = require('./services/hooksManager');
 const { focusSessionWindow } = require('./services/windowFocuser');
@@ -13,16 +14,50 @@ const { TunnelManager } = require('./services/tunnelManager');
 
 const CONFIG_PATH = path.resolve(__dirname, '..', 'config.json');
 const PUBLIC_DIR = path.resolve(__dirname, 'public');
+// APK fuera de la raíz estática: se sirve solo por /api/apk (autenticado)
+const APK_DIR = path.resolve(__dirname, '..', 'apk');
+const LEGACY_APK_PATH = path.join(PUBLIC_DIR, 'ai-pulse.apk');
+const NTFY_TOPIC_RE = /^[A-Za-z0-9_-]{8,64}$/;
+const LOOPBACK_HOSTS = ['127.0.0.1', 'localhost', '::1'];
+const AUTH_WINDOW_MS = 10 * 60 * 1000;
+const AUTH_MAX_FAILS = 10;
+const BODY_MAX_BYTES = 1024 * 256;
+
+function isLoopbackHost(host) {
+  return LOOPBACK_HOSTS.includes(String(host || ''));
+}
+
+function tokenCookie(token) {
+  return `ai_pulse_token=${encodeURIComponent(token)}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Strict`;
+}
+
+function stripTokenFromUrl(url) {
+  return String(url || '')
+    .replace(/\?token=[^&]*&?/, '?')
+    .replace(/&token=[^&]*/, '')
+    .replace(/\?$/, '');
+}
+
+function resolveApkPath() {
+  for (const candidate of [path.join(APK_DIR, 'ai-pulse.apk'), LEGACY_APK_PATH]) {
+    try {
+      if (fs.statSync(candidate).isFile()) return candidate;
+    } catch {}
+  }
+  return null;
+}
 
 function loadConfig() {
   const defaultTopic = `ai-pulse-${crypto.randomBytes(5).toString('hex')}`;
-  const defaultAuthToken = crypto.randomBytes(8).toString('hex');
+  const defaultAuthToken = crypto.randomBytes(16).toString('hex');
   const defaults = {
     port: 19876,
-    bindHost: '0.0.0.0',
+    // Loopback por defecto. LAN solo si el usuario escribe bindHost explícito (p. ej. 0.0.0.0)
+    bindHost: '127.0.0.1',
     remoteAuthToken: defaultAuthToken,
     tunnelEnabled: false,
     ntfyPushLocalAlerts: true,
+    ntfyIncludeText: false,
     soundEnabled: true,
     soundTone: 'chime',
     desktopNotifications: true,
@@ -56,9 +91,11 @@ function loadConfig() {
       merged.remoteAuthToken = defaultAuthToken;
       needsSave = true;
     }
-    if (!merged.bindHost || merged.bindHost === '127.0.0.1') {
-      merged.bindHost = '0.0.0.0';
-      needsSave = true;
+    if (!merged.bindHost) {
+      merged.bindHost = '127.0.0.1';
+    }
+    if (!isLoopbackHost(merged.bindHost)) {
+      console.warn(`[AI Pulse] bindHost=${merged.bindHost}: el servidor acepta conexiones de la LAN (requiere token)`);
     }
     if (needsSave) {
       try {
@@ -77,12 +114,17 @@ function saveConfig(cfg) {
   } catch {}
 }
 
+// Clave de día en FECHA LOCAL (toISOString usa UTC y corre el día en Argentina)
+function localDayKey(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
 function getLast7DaysKeys() {
   const days = [];
   const now = new Date();
   for (let i = 6; i >= 0; i--) {
-    const d = new Date(now.getTime() - i * 24 * 60 * 60 * 1000);
-    days.push(d.toISOString().slice(0, 10));
+    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i);
+    days.push(localDayKey(d));
   }
   return days;
 }
@@ -105,11 +147,35 @@ function addTokenBucket(target, src) {
 
 function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRendererVisible } = {}) {
   const config = loadConfig();
-  const sseClients = new Set();
+  const sseClients = new Map(); // res -> { loopback }
   const hookOverrides = new Map(); // sessionId -> { state, message, timestamp }
   const prevStates = new Map(); // session.id -> state
   const unreadAlerts = new Set(); // session.id con alerta pendiente de leer
+  const unreadSince = new Map(); // session.id -> ts de alta (para purgar alertas viejas)
   const recentAlerts = []; // últimas 25 alertas
+  const authFailures = new Map(); // ip -> { count, since } (rate limit de token)
+  const lanExposed = !isLoopbackHost(config.bindHost);
+
+  function markUnread(id) {
+    unreadAlerts.add(id);
+    if (!unreadSince.has(id)) unreadSince.set(id, Date.now());
+  }
+
+  // Quita alertas de sesiones que ya no existen; los reset: duran 10 min
+  function pruneUnreadAlerts(liveIds) {
+    const nowMs = Date.now();
+    for (const id of [...unreadAlerts]) {
+      const isReset = /reset/i.test(String(id));
+      const expired = nowMs - (unreadSince.get(id) || 0) > 10 * 60 * 1000;
+      if ((!isReset && !liveIds.has(id)) || (isReset && expired)) {
+        unreadAlerts.delete(id);
+        unreadSince.delete(id);
+      }
+    }
+    for (const id of [...unreadSince.keys()]) {
+      if (!unreadAlerts.has(id)) unreadSince.delete(id);
+    }
+  }
 
   let latestSnapshot = null;
   let lastBroadcastSig = '';
@@ -147,6 +213,8 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
       agyFh: snap.agyQuota && snap.agyQuota.fiveHourPct,
       agySd: snap.agyQuota && snap.agyQuota.sevenDayPct,
       agyBurn: snap.agyQuota && snap.agyQuota.burnRatePerHour,
+      agyStatus: snap.agyQuota && snap.agyQuota.providerStatus,
+      codexQuota: snap.codexQuota,
       hooksStatus: snap.hooksStatus,
       ntfyConnected: snap.remoteSetup && snap.remoteSetup.ntfyConnected,
       tunnelStatus: snap.mobileAccess && snap.mobileAccess.tunnel,
@@ -178,33 +246,36 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
       refreshSnapshot(true);
     },
     onRemoteReplyCommand: async (cmdPayload) => {
+      // El comando ya llegó firmado y verificado (remoteManager.verifyRemoteCommand)
       if (!cmdPayload || (!cmdPayload.text && !cmdPayload.quickAction)) return;
-      const targetId = cmdPayload.sessionId || cmdPayload.id;
+      const targetId = String(cmdPayload.sessionId || '');
       const sessions = (latestSnapshot && latestSnapshot.sessions) || [];
-      const targetSession =
-        sessions.find((s) => s.id === targetId || s.sessionId === targetId) ||
-        sessions.find((s) => s.isOpen && (s.state === 'waiting_approval' || s.state === 'waiting_input'));
-      if (targetSession) {
-        await sendSessionReply({
-          ...targetSession,
-          text: cmdPayload.text,
-          quickAction: cmdPayload.quickAction
-        });
-        unreadAlerts.delete(targetSession.id);
-        setTimeout(() => refreshSnapshot(true), 500);
-      }
+      // Sin fallback: solo se responde a la sesión exacta y abierta
+      const targetSession = sessions.find(
+        (s) => (s.id === targetId || s.sessionId === targetId) && s.isOpen
+      );
+      if (!targetSession) return;
+      await sendSessionReply({
+        ...targetSession,
+        text: cmdPayload.text,
+        quickAction: cmdPayload.quickAction
+      });
+      unreadAlerts.delete(targetSession.id);
+      unreadSince.delete(targetSession.id);
+      setTimeout(() => refreshSnapshot(true), 500);
     }
   });
 
   function getMobileBaseUrl() {
     if (tunnelManager.publicUrl) return tunnelManager.publicUrl;
+    if (!lanExposed) return '';
     const ips = remoteManager.getLocalNetworkAddresses();
     if (ips.length > 0) return `http://${ips[0].address}:${config.port}`;
     return '';
   }
 
   function triggerAlert(session, alertType, customMessage) {
-    unreadAlerts.add(session.id);
+    markUnread(session.id);
     const alertObj = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
       sessionId: session.id,
@@ -232,7 +303,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
     if (typeof onAlert === 'function') {
       onAlert(alertObj, config);
     }
-    remoteManager.sendOutboundAlertPush(alertObj, getMobileBaseUrl(), config.remoteAuthToken);
+    remoteManager.sendOutboundAlertPush(alertObj, getMobileBaseUrl());
   }
 
   function triggerQuotaResetAlert(resetObj) {
@@ -255,7 +326,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
       timestamp: Date.now()
     };
 
-    unreadAlerts.add(alertObj.sessionId);
+    markUnread(alertObj.sessionId);
     recentAlerts.unshift(alertObj);
     if (recentAlerts.length > 25) recentAlerts.length = 25;
 
@@ -263,34 +334,39 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
     if (typeof onAlert === 'function') {
       onAlert(alertObj, config);
     }
-    remoteManager.sendOutboundAlertPush(alertObj, getMobileBaseUrl(), config.remoteAuthToken);
+    remoteManager.sendOutboundAlertPush(alertObj, getMobileBaseUrl());
     return alertObj;
   }
 
-  function buildAnalytics(agyData, claudeData, allSessions) {
+  function buildAnalytics(agyData, claudeData, codexData, allSessions) {
     const dayKeys = getLast7DaysKeys();
     const todayKey = dayKeys[dayKeys.length - 1];
 
     const timeline = dayKeys.map((day) => {
       const agyDay = agyData.dailyTokens[day] || createZeroTokenBucket();
       const claudeDay = claudeData.dailyTokens[day] || createZeroTokenBucket();
+      const codexDay = codexData.dailyTokens[day] || createZeroTokenBucket();
       return {
         date: day,
         label: day.slice(5), // MM-DD
         agy: agyDay,
         claude: claudeDay,
-        totalTokens: (agyDay.total || 0) + (claudeDay.total || 0),
-        effectiveTokens: (agyDay.effective || 0) + (claudeDay.effective || 0)
+        codex: codexDay,
+        totalTokens: (agyDay.total || 0) + (claudeDay.total || 0) + codexDay.total,
+        effectiveTokens: (agyDay.effective || 0) + (claudeDay.effective || 0) + codexDay.effective
       };
     });
 
     const weekly = {
+      codex: createZeroTokenBucket(),
       agy: createZeroTokenBucket(),
       claude: createZeroTokenBucket(),
       combined: createZeroTokenBucket()
     };
 
     for (const item of timeline) {
+      addTokenBucket(weekly.codex, item.codex);
+      addTokenBucket(weekly.combined, item.codex);
       addTokenBucket(weekly.agy, item.agy);
       addTokenBucket(weekly.claude, item.claude);
       addTokenBucket(weekly.combined, item.agy);
@@ -302,9 +378,10 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
       claude: createZeroTokenBucket()
     };
     const today = {
+      codex: todayEntry.codex || createZeroTokenBucket(),
       agy: todayEntry.agy,
       claude: todayEntry.claude,
-      combined: addTokenBucket(addTokenBucket(createZeroTokenBucket(), todayEntry.agy), todayEntry.claude)
+      combined: addTokenBucket(addTokenBucket(addTokenBucket(createZeroTokenBucket(), todayEntry.agy), todayEntry.claude), todayEntry.codex)
     };
 
     // Ranking de proyectos por consumo en sesiones recientes/activas
@@ -346,6 +423,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
     lastPollAt = now;
     const agyData = collectAgyData(config);
     const claudeData = collectClaudeData(hookOverrides);
+    const codexData = collectCodexData();
     const remoteSessions = remoteManager.getActiveRemoteSessions();
 
     // Detectar automáticamente nuevos reseteos de cuota semanal Claude (Gratis / Bonus o Programados)
@@ -361,7 +439,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
       }
     }
 
-    const allSessions = [...claudeData.sessions, ...agyData.sessions, ...remoteSessions];
+    const allSessions = [...claudeData.sessions, ...agyData.sessions, ...codexData.sessions, ...remoteSessions];
 
     // Evaluar transiciones de estado para disparar alertas automáticas
     for (const s of allSessions) {
@@ -381,6 +459,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
       prevStates.set(s.id, s.state);
       s.hasUnreadAlert = unreadAlerts.has(s.id);
     }
+    pruneUnreadAlerts(new Set(allSessions.map((s) => s.id)));
 
     const statePriority = { waiting_approval: 0, waiting_input: 1, running: 2, closed: 3 };
     allSessions.sort((a, b) => {
@@ -405,10 +484,11 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
       activeSessionTokens: openSessions.reduce((acc, s) => acc + ((s.tokens && s.tokens.total) || 0), 0)
     };
 
-    const analytics = buildAnalytics(agyData, claudeData, allSessions);
+    const analytics = buildAnalytics(agyData, claudeData, codexData, allSessions);
     const snippets = remoteManager.getRemoteSetupSnippets(config.port);
+    // Sin LAN expuesta no se ofrecen URLs LAN (el puerto no escucha fuera del loopback)
     const primaryLanIp =
-      snippets.localIps && snippets.localIps.length > 0 ? snippets.localIps[0].address : '';
+      lanExposed && snippets.localIps && snippets.localIps.length > 0 ? snippets.localIps[0].address : '';
     const token = config.remoteAuthToken || '';
     const tunnelStatus = tunnelManager.getStatus();
     const lanBase = primaryLanIp ? `http://${primaryLanIp}:${config.port}` : '';
@@ -444,6 +524,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
       sessions: allSessions,
       planQuota: claudeData.planQuota,
       agyQuota: agyData.agyQuota,
+      codexQuota: codexData.codexQuota,
       analytics,
       hooksStatus: getCachedHooksStatus(),
       remoteSetup: {
@@ -470,11 +551,43 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
     return latestSnapshot;
   }
 
+  // Vista del snapshot para un cliente: sin remoteAuthToken ni keyPath de SSH.
+  // Las URLs con token solo se entregan al loopback (la ventana local muestra el QR).
+  function sanitizeSnapshot(snap, loopback) {
+    if (!snap) return snap;
+    const cfg = { ...(snap.config || {}) };
+    delete cfg.remoteAuthToken;
+    if (Array.isArray(cfg.sshHosts)) {
+      cfg.sshHosts = cfg.sshHosts.map((h) => {
+        if (!h || typeof h !== 'object') return h;
+        const { keyPath, ...rest } = h;
+        return {
+          ...rest,
+          hasKeyPath: Boolean(keyPath),
+          keyName: keyPath ? path.basename(String(keyPath)) : ''
+        };
+      });
+    }
+    let mobileAccess = snap.mobileAccess || {};
+    if (!loopback) {
+      mobileAccess = { ...mobileAccess };
+      for (const k of Object.keys(mobileAccess)) {
+        if (typeof mobileAccess[k] === 'string') mobileAccess[k] = stripTokenFromUrl(mobileAccess[k]);
+      }
+    }
+    return { ...snap, config: cfg, mobileAccess };
+  }
+
   function broadcastSse(eventName, data) {
-    const msg = `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
-    for (const res of sseClients) {
+    const isState = eventName === 'state';
+    const fullMsg = `event: ${eventName}\ndata: ${JSON.stringify(isState ? sanitizeSnapshot(data, true) : data)}\n\n`;
+    let remoteMsg = fullMsg;
+    if (isState) {
+      remoteMsg = `event: ${eventName}\ndata: ${JSON.stringify(sanitizeSnapshot(data, false))}\n\n`;
+    }
+    for (const [res, client] of sseClients) {
       try {
-        res.write(msg);
+        res.write(client.loopback ? fullMsg : remoteMsg);
       } catch {
         sseClients.delete(res);
       }
@@ -521,21 +634,36 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
     }
   }
 
+  // Rechaza con statusCode 413 si el cuerpo supera BODY_MAX_BYTES (antes quedaba colgado)
   function parseJsonBody(req) {
-    return new Promise((resolve) => {
-      let body = '';
+    return new Promise((resolve, reject) => {
+      const chunks = [];
+      let size = 0;
+      let tooLarge = false;
       req.on('data', (chunk) => {
-        body += chunk.toString('utf8');
-        if (body.length > 1024 * 256) req.destroy();
+        if (tooLarge) return;
+        size += chunk.length;
+        if (size > BODY_MAX_BYTES) {
+          tooLarge = true;
+          const err = new Error('Cuerpo de la petición demasiado grande');
+          err.statusCode = 413;
+          reject(err);
+          return;
+        }
+        chunks.push(chunk);
       });
       req.on('end', () => {
+        if (tooLarge) return;
+        const body = Buffer.concat(chunks).toString('utf8');
         try {
           resolve(body.trim() ? JSON.parse(body) : {});
         } catch {
           resolve({});
         }
       });
-      req.on('error', () => resolve({}));
+      req.on('error', () => {
+        if (!tooLarge) resolve({});
+      });
     });
   }
 
@@ -550,23 +678,17 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
     return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
   }
 
+  // Origen exacto del propio servidor (mismo puerto). Otro puerto o host se rechaza.
   function isAllowedLocalOrigin(originHeader) {
     if (!originHeader) return true; // Peticiones directas de proceso local / CLI sin header Origin
-    try {
-      const u = new URL(originHeader);
-      return (
-        (u.protocol === 'http:' || u.protocol === 'https:') &&
-        (u.hostname === '127.0.0.1' || u.hostname === 'localhost')
-      );
-    } catch {
-      return false;
-    }
+    const origin = String(originHeader).trim().toLowerCase();
+    return origin === `http://127.0.0.1:${config.port}` || origin === `http://localhost:${config.port}`;
   }
 
   function isAllowedHostHeader(hostHeader) {
     if (!hostHeader) return true;
-    const hostname = String(hostHeader).split(':')[0].trim().toLowerCase();
-    return hostname === '127.0.0.1' || hostname === 'localhost';
+    const host = String(hostHeader).trim().toLowerCase();
+    return host === `127.0.0.1:${config.port}` || host === `localhost:${config.port}`;
   }
 
   function extractRequestToken(req, urlObj) {
@@ -593,7 +715,35 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
   function isValidRemoteToken(tokenCandidate) {
     const expected = String(config.remoteAuthToken || '').trim();
     if (!expected || !tokenCandidate) return false;
-    return tokenCandidate === expected;
+    const a = Buffer.from(String(tokenCandidate), 'utf8');
+    const b = Buffer.from(expected, 'utf8');
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  }
+
+  // Rate limit de intentos fallidos por IP (por túnel la IP real viene en cf-connecting-ip)
+  function clientIpOf(req) {
+    return String(req.headers['cf-connecting-ip'] || (req.socket && req.socket.remoteAddress) || 'unknown');
+  }
+
+  function isAuthRateLimited(ip) {
+    const entry = authFailures.get(ip);
+    if (!entry) return false;
+    if (Date.now() - entry.since > AUTH_WINDOW_MS) {
+      authFailures.delete(ip);
+      return false;
+    }
+    return entry.count >= AUTH_MAX_FAILS;
+  }
+
+  function recordAuthFailure(ip) {
+    const now = Date.now();
+    const entry = authFailures.get(ip);
+    if (!entry || now - entry.since > AUTH_WINDOW_MS) {
+      if (authFailures.size > 500) authFailures.clear();
+      authFailures.set(ip, { count: 1, since: now });
+    } else {
+      entry.count += 1;
+    }
   }
 
   function getCorsHeaders(req) {
@@ -619,7 +769,28 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
     res.end(payload);
   }
 
-  const server = http.createServer(async (req, res) => {
+  function failRequest(res, err) {
+    if (res.headersSent) {
+      try {
+        res.end();
+      } catch {}
+      return;
+    }
+    if (err && err.statusCode === 413) {
+      res.writeHead(413, { 'Content-Type': 'application/json; charset=utf-8', Connection: 'close' });
+      res.end(JSON.stringify({ ok: false, error: 'Cuerpo demasiado grande' }));
+      return;
+    }
+    console.error('[AI Pulse Server] Error en petición:', err && err.message);
+    res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ ok: false, error: 'Error interno del servidor' }));
+  }
+
+  const server = http.createServer((req, res) => {
+    handleRequest(req, res).catch((err) => failRequest(res, err));
+  });
+
+  async function handleRequest(req, res) {
     const urlObj = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`);
     const pathname = urlObj.pathname;
     const isLocalLoopback = isLocalLoopbackSocket(req);
@@ -639,29 +810,58 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
       return;
     }
 
-    // Autenticación por token para clientes remotos (Celular Android por Wi-Fi LAN o Túnel 4G Cloudflare)
+    // Autenticación: loopback sin Origin (CLI, hooks) no requiere token.
+    // Resto (LAN, túnel, y loopback con Origin = UI del navegador/Electron) requiere token.
+    const isOriginRequest = Boolean(req.headers.origin);
+    const requiresToken = !isLocalLoopback || isOriginRequest;
+    const isPublicPath = !pathname.startsWith('/api/');
+    const clientIp = clientIpOf(req);
+    const rateLimited = isAuthRateLimited(clientIp);
     const reqToken = extractRequestToken(req, urlObj);
-    const hasValidToken = isValidRemoteToken(reqToken);
+    const hasValidToken = !rateLimited && isValidRemoteToken(reqToken);
     const cookieHeaders = {};
     if (hasValidToken && urlObj.searchParams.get('token')) {
-      cookieHeaders['Set-Cookie'] = `ai_pulse_token=${encodeURIComponent(reqToken)}; Path=/; Max-Age=31536000; SameSite=Lax`;
+      cookieHeaders['Set-Cookie'] = tokenCookie(reqToken);
+    } else if (isLocalLoopback && req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
+      // La ventana local recibe la cookie HttpOnly (JS no la puede leer; el fetch same-origin la envía)
+      cookieHeaders['Set-Cookie'] = tokenCookie(config.remoteAuthToken || '');
     }
 
-    if (!isLocalLoopback) {
-      const isPublicEndpoint = pathname === '/api/remote/report' || !pathname.startsWith('/api/');
-      if (!isPublicEndpoint && !hasValidToken) {
-        sendJson(res, 401, {
-          ok: false,
-          requiresAuth: true,
-          error: 'Clave de acceso remoto requerida. Escanea el código QR desde la pestaña Remotos en tu PC.'
-        }, req);
-        return;
-      }
+    if (requiresToken && !isPublicPath && !hasValidToken) {
+      if (!rateLimited) recordAuthFailure(clientIp);
+      sendJson(res, rateLimited ? 429 : 401, {
+        ok: false,
+        requiresAuth: true,
+        error: rateLimited
+          ? 'Demasiados intentos fallidos. Esperá unos minutos.'
+          : 'Clave de acceso remoto requerida. Escanea el código QR desde la pestaña Remotos en tu PC.'
+      }, req);
+      return;
     }
 
     if (req.method === 'GET' && pathname === '/api/state') {
       if (!latestSnapshot) refreshSnapshot();
-      sendJson(res, 200, latestSnapshot, req, cookieHeaders);
+      sendJson(res, 200, sanitizeSnapshot(latestSnapshot, isLocalLoopback), req, cookieHeaders);
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/api/apk') {
+      const apkPath = hasValidToken ? resolveApkPath() : null;
+      if (!hasValidToken) {
+        sendJson(res, 401, { ok: false, requiresAuth: true, error: 'Clave de acceso remoto requerida' }, req);
+        return;
+      }
+      if (!apkPath) {
+        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('APK no disponible');
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': 'application/vnd.android.package-archive',
+        'Content-Disposition': 'attachment; filename="AI-Pulse.apk"',
+        'Cache-Control': 'no-cache'
+      });
+      fs.createReadStream(apkPath).pipe(res);
       return;
     }
 
@@ -671,11 +871,12 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
       const sum = snap.summary || {};
       const pq = snap.planQuota || {};
       const aq = snap.agyQuota || {};
+      const cq = snap.codexQuota || {};
       const ma = snap.mobileAccess || {};
       const openSessions = ((snap.sessions || []).filter((s) => s.isOpen) || []).slice(0, 5).map((s) => ({
         id: s.id,
         provider: s.provider,
-        providerLabel: s.provider === 'agy' ? 'AGY' : 'CLAUDE',
+        providerLabel: s.providerLabel || s.provider.toUpperCase(),
         projectName: s.projectName || s.title || 'Consola',
         title: s.title || s.projectName || '',
         state: s.state || 'idle',
@@ -704,10 +905,18 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
             approvalCount: sum.waitingApproval || 0
           },
           quotas: {
-            claude5hPct: Math.round(Number(pq.fiveHourPct) || 0),
-            claude7dPct: Math.round(Number(pq.sevenDayPct) || 0),
-            agy5hPct: Math.round(Number(aq.fiveHourPct) || 0),
-            agy7dPct: Math.round(Number(aq.sevenDayPct) || 0),
+            claude5hPct: pq.fiveHourPct != null ? Math.round(Number(pq.fiveHourPct)) : null,
+            claude7dPct: pq.sevenDayPct != null ? Math.round(Number(pq.sevenDayPct)) : null,
+            claudeStale: Boolean(pq.stale),
+            agy5hPct: aq.fiveHourPct != null ? Math.round(Number(aq.fiveHourPct)) : null,
+            agy7dPct: aq.sevenDayPct != null ? Math.round(Number(aq.sevenDayPct)) : null,
+            agy7dPctExact: aq.sevenDayPctExact != null ? Number(aq.sevenDayPctExact) : null,
+            agyEstimated: Boolean(aq.estimated),
+            agyStatus: aq.providerStatus || null,
+            codex5hPct: cq.fiveHourPct ?? null,
+            codex7dPct: cq.sevenDayPct ?? null,
+            codexUpdatedAt: cq.updatedAt || null,
+            codexStale: cq.stale || false,
             claudeResetId: (pq.lastReset && pq.lastReset.id) || '',
             claudeResetMsg:
               pq.lastReset && pq.lastReset.isBonus
@@ -732,8 +941,8 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
         ...getCorsHeaders(req),
         ...cookieHeaders
       });
-      res.write(`event: state\ndata: ${JSON.stringify(latestSnapshot || refreshSnapshot())}\n\n`);
-      sseClients.add(res);
+      res.write(`event: state\ndata: ${JSON.stringify(sanitizeSnapshot(latestSnapshot || refreshSnapshot(), isLocalLoopback))}\n\n`);
+      sseClients.set(res, { loopback: isLocalLoopback });
       req.on('close', () => sseClients.delete(res));
       return;
     }
@@ -857,6 +1066,11 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
     }
 
     if (req.method === 'POST' && pathname === '/api/remote/test') {
+      // Solo para desarrollo: datos de demo hardcodeados, no existen en producción
+      if (config.devMode !== true) {
+        sendJson(res, 404, { ok: false, error: 'No disponible (devMode desactivado)' }, req);
+        return;
+      }
       const body = await parseJsonBody(req);
       const sess = remoteManager.ingestRemotePayload(
         {
@@ -966,6 +1180,25 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
       const prevTopic = config.ntfyTopic;
       const prevNtfyEnabled = config.ntfyEnabled;
 
+      if (Object.prototype.hasOwnProperty.call(body, 'ntfyTopic')) {
+        body.ntfyTopic = String(body.ntfyTopic || '').trim();
+        if (!NTFY_TOPIC_RE.test(body.ntfyTopic)) {
+          sendJson(res, 400, { ok: false, error: 'ntfyTopic inválido: 8-64 caracteres [A-Za-z0-9_-]' }, req);
+          return;
+        }
+      }
+      if (Array.isArray(body.sshHosts)) {
+        // La UI no recibe keyPath (solo keyName): si no viene una ruta nueva, se conserva la anterior del mismo target
+        const prevHosts = Array.isArray(config.sshHosts) ? config.sshHosts : [];
+        body.sshHosts = body.sshHosts.map((h) => {
+          if (!h || typeof h !== 'object') return h;
+          const { hasKeyPath, keyName, ...rest } = h;
+          if (typeof rest.keyPath === 'string' && rest.keyPath.trim()) return rest;
+          const old = prevHosts.find((p) => p && p.target === rest.target);
+          return old && old.keyPath ? { ...rest, keyPath: old.keyPath } : rest;
+        });
+      }
+
       const allowedKeys = [
         'soundEnabled',
         'soundTone',
@@ -1017,6 +1250,10 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
     }
 
     if (req.method === 'POST' && pathname === '/api/admin/handover') {
+      if (!hasValidToken) {
+        sendJson(res, 401, { ok: false, requiresAuth: true, error: 'Token requerido para handover' }, req);
+        return;
+      }
       sendJson(res, 200, { ok: true, standalone: require.main === module }, req);
       if (require.main === module) {
         setTimeout(() => {
@@ -1074,6 +1311,15 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
       return;
     }
 
+    // Nunca se sirven dotfiles, config*.json ni APK desde la raíz estática
+    const baseName = path.basename(filePath);
+    const hiddenSegment = safeRelPath.split(/[\\/]/).some((seg) => seg.startsWith('.'));
+    if (hiddenSegment || /^config.*\.json$/i.test(baseName) || /\.apk$/i.test(baseName)) {
+      res.writeHead(404);
+      res.end('Not found');
+      return;
+    }
+
     if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
       const ext = path.extname(filePath).toLowerCase();
       const mimeMap = {
@@ -1100,10 +1346,10 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
       res.writeHead(404);
       res.end('Not found');
     }
-  });
+  }
 
   let pollTimer = null;
-  const bindHost = config.bindHost || '0.0.0.0';
+  const bindHost = config.bindHost || '127.0.0.1';
 
   function start() {
     return new Promise((resolve, reject) => {
@@ -1140,6 +1386,7 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
               port: config.port,
               path: '/api/admin/handover',
               method: 'POST',
+              headers: { Authorization: `Bearer ${config.remoteAuthToken || ''}` },
               timeout: 1000
             },
             () => {

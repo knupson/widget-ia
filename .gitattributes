@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.bat text eol=crlf
+*.exe binary
+*.ico binary
+*.apk binary
+*.png binary

@@ -32,7 +32,7 @@ public class PulseWidgetProvider extends AppWidgetProvider {
     public static final String EXTRA_SESSION_ID = "session_id";
     public static final String EXTRA_PROVIDER = "provider";
     private static final String NOTIF_CHANNEL_ID = "ai_pulse_alerts";
-    private static final ExecutorService EXECUTOR = Executors.newSingleThreadExecutor();
+    static final ExecutorService EXECUTOR = Executors.newSingleThreadExecutor();
 
     @Override
     public void onEnabled(Context context) {
@@ -63,64 +63,34 @@ public class PulseWidgetProvider extends AppWidgetProvider {
         });
     }
 
+    /**
+     * Solo llega APPWIDGET_UPDATE (receiver exportado). Las acciones internas (aprobar, refrescar)
+     * van por ActionReceiver, que no está exportado.
+     */
     @Override
     public void onReceive(Context context, Intent intent) {
         super.onReceive(context, intent);
-        if (intent == null || intent.getAction() == null) return;
-        String action = intent.getAction();
-
-        if (ACTION_QUICK_APPROVE.equals(action)) {
-            final Context appCtx = context.getApplicationContext();
-            final String sid = intent.getStringExtra(EXTRA_SESSION_ID);
-            final String prov = intent.getStringExtra(EXTRA_PROVIDER);
-            showStatusIndicator(appCtx, "✅ Aprobando permiso...");
-            try {
-                NotificationManager nm = (NotificationManager) appCtx.getSystemService(Context.NOTIFICATION_SERVICE);
-                if (nm != null && sid != null) {
-                    nm.cancel(Math.abs(sid.hashCode()));
-                }
-            } catch (Exception ignored) {}
-            final PendingResult pendingResult = goAsync();
-            EXECUTOR.execute(() -> {
-                try {
-                    if (sid != null && !sid.isEmpty()) {
-                        ConfigStore.sendQuickActionWithFallback(appCtx, sid, prov != null ? prov : "claude", "approve");
-                        try { Thread.sleep(600); } catch (Exception ignored) {}
-                    }
-                    updateAllWidgetsBlocking(appCtx);
-                } finally {
-                    try {
-                        pendingResult.finish();
-                    } catch (Exception ignored) {}
-                }
-            });
-            return;
-        }
-
-        if (ACTION_REFRESH.equals(action) || Intent.ACTION_USER_PRESENT.equals(action)) {
-            schedulePeriodicRefresh(context);
-            boolean isManual = intent.getBooleanExtra(EXTRA_MANUAL, false);
-            if (!isManual && !isScreenInteractive(context)) {
-                return;
-            }
-            final Context appCtx = context.getApplicationContext();
-            if (isManual) {
-                showStatusIndicator(appCtx, "Actualizando...");
-            }
-            final PendingResult pendingResult = goAsync();
-            EXECUTOR.execute(() -> {
-                try {
-                    updateAllWidgetsBlocking(appCtx);
-                } finally {
-                    try {
-                        pendingResult.finish();
-                    } catch (Exception ignored) {}
-                }
-            });
-        }
     }
 
-    private static boolean isScreenInteractive(Context ctx) {
+    /** Intent explícito a ActionReceiver para una acción interna (no exportada). */
+    static Intent internalIntent(Context ctx, String action) {
+        Intent i = new Intent(ctx, ActionReceiver.class);
+        i.setAction(action);
+        return i;
+    }
+
+    /** Lee un porcentaje del compact; null si falta, es JSON null o no es numérico. */
+    static Integer readPct(JSONObject quotas, String key) {
+        if (quotas == null || quotas.isNull(key)) return null;
+        Object v = quotas.opt(key);
+        return v instanceof Number ? Integer.valueOf(((Number) v).intValue()) : null;
+    }
+
+    static String fmtPct(Integer v) {
+        return v == null ? "--" : String.valueOf(v.intValue());
+    }
+
+    static boolean isScreenInteractive(Context ctx) {
         try {
             PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
             return pm == null || pm.isInteractive();
@@ -135,7 +105,7 @@ public class PulseWidgetProvider extends AppWidgetProvider {
         EXECUTOR.execute(() -> updateAllWidgetsBlocking(appCtx));
     }
 
-    private static void showStatusIndicator(Context ctx, String text) {
+    static void showStatusIndicator(Context ctx, String text) {
         try {
             AppWidgetManager mgr = AppWidgetManager.getInstance(ctx);
             int[] ids = mgr.getAppWidgetIds(new ComponentName(ctx, PulseWidgetProvider.class));
@@ -148,7 +118,7 @@ public class PulseWidgetProvider extends AppWidgetProvider {
         } catch (Exception ignored) {}
     }
 
-    private static void updateAllWidgetsBlocking(Context ctx) {
+    static void updateAllWidgetsBlocking(Context ctx) {
         AppWidgetManager mgr = AppWidgetManager.getInstance(ctx);
         int[] ids = mgr.getAppWidgetIds(new ComponentName(ctx, PulseWidgetProvider.class));
 
@@ -185,8 +155,7 @@ public class PulseWidgetProvider extends AppWidgetProvider {
         rv.setOnClickPendingIntent(R.id.widget_root, openAppPi);
 
         // Intent para el botón ↻ Refrescar (manual = true)
-        Intent refreshIntent = new Intent(ctx, PulseWidgetProvider.class);
-        refreshIntent.setAction(ACTION_REFRESH);
+        Intent refreshIntent = internalIntent(ctx, ACTION_REFRESH);
         refreshIntent.putExtra(EXTRA_MANUAL, true);
         PendingIntent refreshPi = PendingIntent.getBroadcast(
                 ctx,
@@ -255,16 +224,26 @@ public class PulseWidgetProvider extends AppWidgetProvider {
             }
             rv.setTextViewText(R.id.tv_summary, summaryText);
 
+            // Porcentajes: null/ausente = "--" (dato no disponible, p.ej. plan de Claude Desktop vencido).
+            // Nunca mostrar 0% por un null.
             JSONObject quotas = root.optJSONObject("quotas");
-            int cl5h = quotas != null ? quotas.optInt("claude5hPct", 0) : 0;
-            int cl7d = quotas != null ? quotas.optInt("claude7dPct", 0) : 0;
-            int agy5h = quotas != null ? quotas.optInt("agy5hPct", 0) : 0;
-            int agy7d = quotas != null ? quotas.optInt("agy7dPct", 0) : 0;
+            Integer cl5h = readPct(quotas, "claude5hPct");
+            Integer cl7d = readPct(quotas, "claude7dPct");
+            Integer agy5h = readPct(quotas, "agy5hPct");
+            Integer agy7d = readPct(quotas, "agy7dPct");
+            boolean clStale = quotas != null && quotas.optBoolean("claudeStale", false);
             rv.setTextViewText(
                     R.id.tv_quotas,
-                    "CL " + cl5h + "/" + cl7d + "% · AGY " + agy5h + "/" + agy7d + "%");
-            int maxPct = Math.max(Math.max(cl5h, cl7d), Math.max(agy5h, agy7d));
-            if (maxPct >= 100) {
+                    (clStale ? "CL~ " : "CL ") + fmtPct(cl5h) + "/" + fmtPct(cl7d) + "% · AGY "
+                            + fmtPct(agy5h) + "/" + fmtPct(agy7d) + "%");
+            int maxPct = -1;
+            for (Integer v : new Integer[] { cl5h, cl7d, agy5h, agy7d }) {
+                if (v != null && v > maxPct) maxPct = v;
+            }
+            if (maxPct < 0 || (clStale && maxPct < 85)) {
+                // Sin datos, o Claude viejo y sin alerta: color neutro (apagado)
+                rv.setTextColor(R.id.tv_quotas, Color.parseColor("#7A6A5C"));
+            } else if (maxPct >= 100) {
                 rv.setTextColor(R.id.tv_quotas, Color.parseColor("#F87171"));
             } else if (maxPct >= 85) {
                 rv.setTextColor(R.id.tv_quotas, Color.parseColor("#FBBF24"));
@@ -306,8 +285,7 @@ public class PulseWidgetProvider extends AppWidgetProvider {
 
                 if ("waiting_approval".equals(state)) {
                     rv.setViewVisibility(approveIds[i], View.VISIBLE);
-                    Intent appIntent = new Intent(ctx, PulseWidgetProvider.class);
-                    appIntent.setAction(ACTION_QUICK_APPROVE);
+                    Intent appIntent = internalIntent(ctx, ACTION_QUICK_APPROVE);
                     appIntent.putExtra(EXTRA_SESSION_ID, sid);
                     appIntent.putExtra(EXTRA_PROVIDER, prov);
                     PendingIntent appPi = PendingIntent.getBroadcast(
@@ -345,12 +323,11 @@ public class PulseWidgetProvider extends AppWidgetProvider {
         return rv;
     }
 
-    private static void schedulePeriodicRefresh(Context ctx) {
+    static void schedulePeriodicRefresh(Context ctx) {
         try {
             AlarmManager am = (AlarmManager) ctx.getSystemService(Context.ALARM_SERVICE);
             if (am == null) return;
-            Intent intent = new Intent(ctx, PulseWidgetProvider.class);
-            intent.setAction(ACTION_REFRESH);
+            Intent intent = internalIntent(ctx, ACTION_REFRESH);
             intent.putExtra(EXTRA_MANUAL, false);
             PendingIntent pi = PendingIntent.getBroadcast(
                     ctx,
@@ -371,8 +348,7 @@ public class PulseWidgetProvider extends AppWidgetProvider {
         try {
             AlarmManager am = (AlarmManager) ctx.getSystemService(Context.ALARM_SERVICE);
             if (am == null) return;
-            Intent intent = new Intent(ctx, PulseWidgetProvider.class);
-            intent.setAction(ACTION_REFRESH);
+            Intent intent = internalIntent(ctx, ACTION_REFRESH);
             PendingIntent pi = PendingIntent.getBroadcast(
                     ctx,
                     901,
@@ -505,8 +481,7 @@ public class PulseWidgetProvider extends AppWidgetProvider {
                     .setContentIntent(contentPi);
 
             if (includeApproveAction) {
-                Intent appIntent = new Intent(ctx, PulseWidgetProvider.class);
-                appIntent.setAction(ACTION_QUICK_APPROVE);
+                Intent appIntent = internalIntent(ctx, ACTION_QUICK_APPROVE);
                 appIntent.putExtra(EXTRA_SESSION_ID, sid);
                 appIntent.putExtra(EXTRA_PROVIDER, prov);
                 PendingIntent appPi = PendingIntent.getBroadcast(

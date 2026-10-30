@@ -219,66 +219,109 @@ const SHELL_CLASSES = new Set([
   'ForegroundStaging'
 ]);
 
+const RESTART_MIN_MS = 1000;
+const RESTART_MAX_MS = 60000;
+// Un proceso que corrió más de este tiempo se considera sano: el backoff vuelve al mínimo
+const STABLE_RUN_MS = 30000;
+
 function startFullscreenWatcher({ onForegroundWindow }) {
   const exe = ensureWatcherBinary();
   if (!exe) return { stop: () => {} };
 
   let child = null;
-  try {
-    child = spawn(exe, [String(process.pid)], {
-      windowsHide: true,
-      stdio: ['ignore', 'pipe', 'ignore']
-    });
-  } catch {
-    return { stop: () => {} };
-  }
+  let stopped = false;
+  let restartTimer = null;
+  let backoffMs = RESTART_MIN_MS;
 
-  let buf = '';
-  child.stdout.on('data', (chunk) => {
-    buf += chunk.toString('utf8');
-    const lines = buf.split(/\r?\n/);
-    buf = lines.pop() || '';
-    for (const raw of lines) {
-      const line = raw.trim();
-      if (!line) continue;
-      if (line === 'NONE') {
-        onForegroundWindow(null);
-        continue;
-      }
-      const parts = line.split('|');
-      if (parts.length < 12) continue;
-      const info = {
-        hwnd: parts[0],
-        x: Number(parts[1]) || 0,
-        y: Number(parts[2]) || 0,
-        width: Number(parts[3]) || 0,
-        height: Number(parts[4]) || 0,
-        pid: Number(parts[5]) || 0,
-        isFullscreen: parts[6] === '1',
-        monX: Number(parts[7]) || 0,
-        monY: Number(parts[8]) || 0,
-        monWidth: Number(parts[9]) || 0,
-        monHeight: Number(parts[10]) || 0,
-        className: parts.slice(11).join('|')
-      };
-      if (SHELL_CLASSES.has(info.className)) {
-        onForegroundWindow(null);
-      } else {
-        onForegroundWindow(info);
-      }
+  const scheduleRestart = () => {
+    if (stopped) return;
+    restartTimer = setTimeout(() => {
+      restartTimer = null;
+      spawnWatcher();
+    }, backoffMs);
+    backoffMs = Math.min(backoffMs * 2, RESTART_MAX_MS);
+  };
+
+  const spawnWatcher = () => {
+    if (stopped) return;
+    const startedAt = Date.now();
+    let proc = null;
+    try {
+      proc = spawn(exe, [String(process.pid)], {
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'ignore']
+      });
+    } catch {
+      scheduleRestart();
+      return;
     }
-  });
+    child = proc;
 
-  child.on('error', () => {});
+    let buf = '';
+    let gone = false;
+    const onGone = () => {
+      if (gone) return;
+      gone = true;
+      if (child === proc) child = null;
+      if (stopped) return;
+      if (Date.now() - startedAt > STABLE_RUN_MS) backoffMs = RESTART_MIN_MS;
+      scheduleRestart();
+    };
+
+    proc.stdout.on('data', (chunk) => {
+      buf += chunk.toString('utf8');
+      const lines = buf.split(/\r?\n/);
+      buf = lines.pop() || '';
+      for (const raw of lines) {
+        const line = raw.trim();
+        if (!line) continue;
+        if (line === 'NONE') {
+          onForegroundWindow(null);
+          continue;
+        }
+        const parts = line.split('|');
+        if (parts.length < 12) continue;
+        const info = {
+          hwnd: parts[0],
+          x: Number(parts[1]) || 0,
+          y: Number(parts[2]) || 0,
+          width: Number(parts[3]) || 0,
+          height: Number(parts[4]) || 0,
+          pid: Number(parts[5]) || 0,
+          isFullscreen: parts[6] === '1',
+          monX: Number(parts[7]) || 0,
+          monY: Number(parts[8]) || 0,
+          monWidth: Number(parts[9]) || 0,
+          monHeight: Number(parts[10]) || 0,
+          className: parts.slice(11).join('|')
+        };
+        if (SHELL_CLASSES.has(info.className)) {
+          onForegroundWindow(null);
+        } else {
+          onForegroundWindow(info);
+        }
+      }
+    });
+
+    proc.on('error', onGone);
+    proc.on('exit', onGone);
+  };
+
+  spawnWatcher();
 
   return {
     stop: () => {
-      if (child && !child.killed) {
+      stopped = true;
+      if (restartTimer) {
+        clearTimeout(restartTimer);
+        restartTimer = null;
+      }
+      if (child) {
         try {
           child.kill();
         } catch {}
+        child = null;
       }
-      child = null;
     }
   };
 }

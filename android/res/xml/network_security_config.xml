@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Cleartext (http) queda permitido porque el flujo LAN usa http://<IP privada>:19876.
+  Android no puede acotar cleartext por CIDR ni por IP dinámica, así que la restricción real
+  está en ConfigStore.isAllowedBase(): http solo hacia IP privada / localhost, https para el resto
+  (túnel Cloudflare). El token nunca se envía por http a un host público.
+  Trade-off: un http a una IP privada ajena a la LAN no queda bloqueado por el sistema.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

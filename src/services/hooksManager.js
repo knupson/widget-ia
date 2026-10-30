@@ -16,33 +16,68 @@ function getAgyHooksPath() {
   return path.join(os.homedir(), '.gemini', 'config', 'hooks.json');
 }
 
+// Extrae la ruta del script de un comando `node "<ruta>" ...`
+function scriptPathFromCommand(cmd) {
+  const m = typeof cmd === 'string' ? cmd.match(/"([^"]*local-hook\.mjs)"/) : null;
+  return m ? m[1] : null;
+}
+
 /**
- * Verifica si los hooks del Widget están instalados en Claude y AGY
+ * Estado de los hooks de Claude: 'installed' | 'outdated' (formato viejo o script inexistente) | 'missing'
+ */
+function claudeHookStatus(settings) {
+  const hooks = settings && settings.hooks && typeof settings.hooks === 'object' ? settings.hooks : {};
+  let status = 'missing';
+  for (const arr of Object.values(hooks)) {
+    if (!Array.isArray(arr)) continue;
+    for (const group of arr) {
+      const entries = Array.isArray(group && group.hooks) ? group.hooks : [];
+      for (const h of entries) {
+        const cmd = typeof h.command === 'string' ? h.command : '';
+        const legacy = Array.isArray(h.args) && JSON.stringify(h.args).includes(HOOK_MARKER);
+        if (!legacy && !cmd.includes(HOOK_MARKER)) continue;
+        const script = scriptPathFromCommand(cmd);
+        if (legacy || !script || !fs.existsSync(script)) return 'outdated';
+        status = 'installed';
+      }
+    }
+  }
+  return status;
+}
+
+/**
+ * Estado del hook de AGY: 'installed' | 'outdated' | 'missing'
+ */
+function agyHookStatus(hooksObj) {
+  const entry = hooksObj && hooksObj['ai-pulse-widget'];
+  if (!entry) return 'missing';
+  const cmd = entry.Stop && entry.Stop[0] ? entry.Stop[0].command : '';
+  const script = scriptPathFromCommand(cmd);
+  return script && fs.existsSync(script) ? 'installed' : 'outdated';
+}
+
+function readJsonSafe(filePath) {
+  if (!fs.existsSync(filePath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Verifica si los hooks del Widget están instalados en Claude y AGY.
+ * Si el script al que apunta el hook ya no existe, o el hook usa el formato viejo, el estado es 'outdated'.
  */
 function getHooksStatus() {
-  const claudePath = getClaudeSettingsPath();
-  const agyPath = getAgyHooksPath();
-
-  let claudeInstalled = false;
-  let agyInstalled = false;
-
-  if (fs.existsSync(claudePath)) {
-    try {
-      const raw = fs.readFileSync(claudePath, 'utf8');
-      claudeInstalled = raw.includes(HOOK_MARKER);
-    } catch {}
-  }
-
-  if (fs.existsSync(agyPath)) {
-    try {
-      const raw = fs.readFileSync(agyPath, 'utf8');
-      agyInstalled = raw.includes(HOOK_MARKER);
-    } catch {}
-  }
+  const claudeStatus = claudeHookStatus(readJsonSafe(getClaudeSettingsPath()));
+  const agyStatus = agyHookStatus(readJsonSafe(getAgyHooksPath()));
 
   return {
-    claudeInstalled,
-    agyInstalled,
+    claudeInstalled: claudeStatus === 'installed',
+    agyInstalled: agyStatus === 'installed',
+    claudeStatus,
+    agyStatus,
     hookScriptPath: getHookScriptPath()
   };
 }
@@ -78,12 +113,12 @@ function setClaudeHookEnabled(enabled) {
     });
 
     if (enabled) {
+      // Claude Code espera un único string `command`; el formato con args se migra quitándolo arriba
       filtered.push({
         hooks: [
           {
             type: 'command',
-            command: 'node',
-            args: [scriptPath, 'claude', evt],
+            command: `node "${scriptPath.replace(/\\/g, '/')}" claude ${evt}`,
             timeout: 5
           }
         ]

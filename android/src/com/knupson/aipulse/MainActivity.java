@@ -211,10 +211,16 @@ public class MainActivity extends Activity {
             }
             final String activeBase = ConfigStore.getLastActiveBase(MainActivity.this);
             final String targetUrl = ConfigStore.buildAppWebUrl(MainActivity.this, activeBase, sessionId);
+            final java.util.Map<String, String> webHeaders = ConfigStore.primeWebAuth(MainActivity.this, activeBase);
             final String statusLabel = ConfigStore.getConnectionStatusLabel(MainActivity.this);
             final boolean isOk = raw != null;
 
             runOnUiThread(() -> {
+                if (targetUrl.isEmpty()) {
+                    statusBadge.setText("⛔ Base no permitida (usá https o IP privada)");
+                    statusBadge.setTextColor(Color.parseColor("#F87171"));
+                    return;
+                }
                 if (isOk) {
                     statusBadge.setText(statusLabel);
                     statusBadge.setTextColor(Color.parseColor("#10B981"));
@@ -225,7 +231,7 @@ public class MainActivity extends Activity {
                 boolean baseChanged = !activeBase.equals(loadedBaseUrl);
                 if (forceReloadWeb || baseChanged || (sessionId != null && !sessionId.isEmpty())) {
                     loadedBaseUrl = activeBase;
-                    webView.loadUrl(targetUrl);
+                    webView.loadUrl(targetUrl, webHeaders);
                 }
             });
         });

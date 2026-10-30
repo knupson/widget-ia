@@ -1,6 +1,9 @@
 const fs = require('fs');
+const { TOKEN_WEIGHTS } = require('./tokenWeights');
 const path = require('path');
 const os = require('os');
+const { createAgyQuotaStatusReader } = require('./agyQuotaStatus');
+const readAgyQuotaStatus = createAgyQuotaStatusReader();
 
 // Cache incremental por conversación para no re-parsear archivos JSONL ni SQLite sin cambios
 const transcriptCache = new Map();
@@ -9,7 +12,13 @@ let dbSummariesCache = { key: '', rows: [] };
 let historyMapCache = { key: '', map: new Map() };
 let brainScanCache = { mtimeMs: 0, checkedAt: 0, recentIds: [] };
 let agyResultCache = { key: '', data: null };
-const unlockedPresenceCache = new Map(); // file -> mtimeMs
+const DEFAULT_FIVE_HOUR_LIMIT_M = 25;
+const DEFAULT_SEVEN_DAY_LIMIT_M = 100;
+const lockedPresencePolls = new Map();
+const quotaSamples = new Map();
+let summariesSourceError = false;
+let summariesWarnedAt = -Infinity;
+const unlockedPresenceCache = new Map(); // file -> { mtimeMs, checkedAt }
 
 function getAgyBaseDir() {
   return path.join(os.homedir(), '.gemini', 'antigravity-cli');
@@ -21,7 +30,7 @@ function getAgyBaseDir() {
 function readAgySettings(baseDir) {
   const settingsPath = path.join(baseDir, 'settings.json');
   const defaults = {
-    model: 'Gemini 4 Argon (High)',
+    model: 'Gemini 4 Argon (Low)',
     gcpProject: 'GCP Workspace',
     gcpLocation: 'global'
   };
@@ -53,7 +62,7 @@ function getActiveLockedConversations(baseDir) {
   const presenceDir = path.join(baseDir, 'presence');
   const activeMap = new Map(); // conversationId -> { lockMtimeMs }
 
-  if (!fs.existsSync(presenceDir)) return activeMap;
+  if (!fs.existsSync(presenceDir)) { lockedPresencePolls.clear(); return activeMap; }
 
   let files = [];
   try {
@@ -62,6 +71,7 @@ function getActiveLockedConversations(baseDir) {
     return activeMap;
   }
 
+  for (const file of lockedPresencePolls.keys()) if (!files.includes(file)) lockedPresencePolls.delete(file);
   const now = Date.now();
   const buf = Buffer.alloc(1);
   for (const file of files) {
@@ -75,9 +85,17 @@ function getActiveLockedConversations(baseDir) {
       continue;
     }
 
-    // Si en el ciclo anterior no estaba bloqueado y su mtime tiene más de 60s sin cambios, no abrir descriptor
-    const prevUnlockedMtime = unlockedPresenceCache.get(file);
-    if (prevUnlockedMtime === fileMtimeMs && now - fileMtimeMs > 60000) {
+    // Nota: en Windows, LockFileEx sobre un archivo .lock existente NO modifica su mtimeMs.
+    // Por lo tanto, no podemos asumir que si mtimeMs no cambió nunca volverá a bloquearse;
+    // usamos un TTL corto (3s) para archivos antiguos desbloqueados.
+    const prevUnlocked = unlockedPresenceCache.get(file);
+    if (
+      prevUnlocked &&
+      prevUnlocked.mtimeMs === fileMtimeMs &&
+      now - fileMtimeMs > 60000 &&
+      now - prevUnlocked.checkedAt < 3000
+    ) {
+      lockedPresencePolls.delete(file);
       continue;
     }
 
@@ -100,9 +118,13 @@ function getActiveLockedConversations(baseDir) {
 
     if (isLocked) {
       unlockedPresenceCache.delete(file);
-      activeMap.set(convId, { lockMtimeMs: fileMtimeMs || now });
+      const prior = lockedPresencePolls.get(file);
+      const polls = prior && prior.mtimeMs === fileMtimeMs ? prior.polls + 1 : 1;
+      lockedPresencePolls.set(file, { mtimeMs: fileMtimeMs, polls });
+      if (polls >= 2) activeMap.set(convId, { lockMtimeMs: fileMtimeMs || now });
     } else {
-      unlockedPresenceCache.set(file, fileMtimeMs);
+      lockedPresencePolls.delete(file);
+      unlockedPresenceCache.set(file, { mtimeMs: fileMtimeMs, checkedAt: now });
     }
   }
 
@@ -114,7 +136,7 @@ function getActiveLockedConversations(baseDir) {
  */
 function readConversationSummaries(baseDir) {
   const dbPath = path.join(baseDir, 'conversation_summaries.db');
-  if (!fs.existsSync(dbPath)) return [];
+  if (!fs.existsSync(dbPath)) { summariesSourceError = false; return []; }
 
   let cacheKey = '';
   try {
@@ -156,11 +178,17 @@ function readConversationSummaries(baseDir) {
       LIMIT 80
     `);
     const rows = stmt.all();
+    summariesSourceError = false;
     if (cacheKey) {
       dbSummariesCache = { key: cacheKey, rows };
     }
     return rows;
   } catch (err) {
+    summariesSourceError = true;
+    if (Date.now() - summariesWarnedAt >= 60000) {
+      console.warn('[AGY] No se pudo leer el resumen de conversaciones:', err.code || err.message);
+      summariesWarnedAt = Date.now();
+    }
     return dbSummariesCache.rows || [];
   } finally {
     if (db) {
@@ -211,9 +239,30 @@ function readHistoryMap(baseDir) {
 
 const SLOT_MS = 15 * 60 * 1000; // Buckets de 15 minutos para ventanas móviles exactas (5h y 7d)
 
+// Clave de día en FECHA LOCAL (toISOString usa UTC y corre el día en Argentina)
+function localDayKey(ms) {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
 /**
  * Parsea transcript.jsonl de una conversación de AGY (con caché por mtime/size)
  */
+function readJsonlAppend(file, stat, cached) {
+  const identity = `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
+  const resume = Boolean(cached && cached.identity === identity && stat.size >= cached.size &&
+    !(stat.size === cached.size && stat.mtimeMs !== cached.mtimeMs));
+  const offset = resume ? cached.size : 0;
+  const buffer = Buffer.alloc(stat.size - offset);
+  const fd = fs.openSync(file, 'r');
+  let bytes;
+  try { bytes = fs.readSync(fd, buffer, 0, buffer.length, offset); } finally { fs.closeSync(fd); }
+  const content = Buffer.concat([resume ? cached.rest : Buffer.alloc(0), buffer.subarray(0, bytes)]);
+  const end = content.lastIndexOf(10);
+  const lines = end < 0 ? [] : content.subarray(0, end).toString('utf8').split('\n');
+  return { identity, resume, size: offset + bytes, rest: content.subarray(end + 1), lines };
+}
+
 function parseTranscript(baseDir, convId) {
   const trPath = path.join(baseDir, 'brain', convId, '.system_generated', 'logs', 'transcript.jsonl');
   if (!fs.existsSync(trPath)) {
@@ -228,34 +277,35 @@ function parseTranscript(baseDir, convId) {
   }
 
   const cached = transcriptCache.get(convId);
-  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size && cached.identity === `${stat.dev}:${stat.ino}:${stat.birthtimeMs}` &&
+    cached.evaluatedMinute === Math.floor(Date.now() / 60000)) {
     return cached.data;
   }
 
-  let raw = '';
-  try {
-    raw = fs.readFileSync(trPath, 'utf8');
-  } catch {
-    return cached ? cached.data : null;
-  }
-
-  const lines = raw.split(/\r?\n/);
+  let append;
+  try { append = readJsonlAppend(trPath, stat, cached); } catch { return cached ? cached.data : null; }
+  const lines = append.lines;
   let inputTokens = 0;
   let cacheReadTokens = 0;
   let outputTokens = 0;
   let turns = 0;
-  const dailyTokens = {}; // YYYY-MM-DD -> { input, cacheRead, output, effective, total, turns }
-  const slotTokens = {}; // slotIndex (15min) -> { input, cacheRead, output, effective, total, turns }
+  let dailyTokens = {}; // YYYY-MM-DD -> { input, cacheRead, output, effective, total, turns }
+  let slotTokens = {}; // slotIndex (15min) -> { input, cacheRead, output, effective, total, turns }
 
   let lastStep = null;
   let lastUserPrompt = '';
   let lastAssistantText = '';
+  let lastThinkingTitle = '';
   let currentToolCall = null;
   let pendingQuestion = null;
+  let lastErrorText = '';
   let lastActivityAt = stat.mtimeMs;
   let lastPlannedCommandDaemon = false;
-  const activeBgTasks = new Map(); // taskId -> { taskId, detail, isDaemon, startedAt }
-  const eightDaysAgo = Date.now() - 8 * 24 * 60 * 60 * 1000;
+  let activeBgTasks = new Map(); // taskId -> { taskId, detail, isDaemon, startedAt }
+  let eightDaysAgo = Date.now() - 8 * 24 * 60 * 60 * 1000;
+
+  let lineCount = 0;
+  if (append.resume) ({ inputTokens, cacheReadTokens, outputTokens, turns, dailyTokens, slotTokens, lastStep, lastUserPrompt, lastAssistantText, lastThinkingTitle, currentToolCall, pendingQuestion, lastErrorText, lastActivityAt, lastPlannedCommandDaemon, activeBgTasks, lineCount } = cached.state);
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
@@ -282,6 +332,12 @@ function parseTranscript(baseDir, convId) {
       const cleanUser = (match ? match[1] : step.content).trim();
       if (cleanUser) lastUserPrompt = cleanUser.slice(0, 220);
       pendingQuestion = null;
+      lastErrorText = '';
+    }
+
+    if (step.type === 'ERROR_MESSAGE') {
+      const rawErr = (step.error || step.content || '').trim();
+      lastErrorText = rawErr.replace(/^Error:\s*/i, '').slice(0, 140) || 'Stream o llamada interrumpida';
     }
 
     if (step.type === 'GENERIC' && typeof step.content === 'string') {
@@ -355,9 +411,9 @@ function parseTranscript(baseDir, convId) {
       outputTokens += outTok;
 
       const tot = inTok + cacheTok + outTok;
-      const eff = Math.round(inTok + cacheTok * 0.1 + outTok * 5);
+      const eff = Math.round(inTok + cacheTok * TOKEN_WEIGHTS.cacheRead + outTok * TOKEN_WEIGHTS.output);
 
-      const dayKey = step.created_at ? step.created_at.slice(0, 10) : new Date(stat.mtimeMs).toISOString().slice(0, 10);
+      const dayKey = localDayKey(stepTs);
       if (!dailyTokens[dayKey]) {
         dailyTokens[dayKey] = { input: 0, cacheRead: 0, output: 0, total: 0, effective: 0, turns: 0 };
       }
@@ -383,6 +439,22 @@ function parseTranscript(baseDir, convId) {
 
       if (typeof step.content === 'string' && step.content.trim()) {
         lastAssistantText = step.content.trim().replace(/\s+/g, ' ').slice(0, 260);
+      }
+
+      if (typeof step.thinking === 'string' && step.thinking.trim()) {
+        const headingMatches = [...step.thinking.matchAll(/\*\*([^*]+)\*\*/g)];
+        if (headingMatches.length > 0) {
+          lastThinkingTitle = headingMatches[headingMatches.length - 1][1].trim().slice(0, 90);
+        }
+      }
+
+      if (
+        (typeof step.content === 'string' && step.content.trim()) ||
+        (Array.isArray(step.tool_calls) && step.tool_calls.length > 0) ||
+        step.input_tokens != null ||
+        step.output_tokens != null
+      ) {
+        lastErrorText = '';
       }
 
       if (Array.isArray(step.tool_calls) && step.tool_calls.length > 0) {
@@ -439,15 +511,34 @@ function parseTranscript(baseDir, convId) {
     }
   }
 
+  lineCount += lines.length;
+  const state = { inputTokens, cacheReadTokens, outputTokens, turns, dailyTokens, slotTokens, lastStep, lastUserPrompt, lastAssistantText, lastThinkingTitle, currentToolCall, pendingQuestion, lastErrorText, lastActivityAt, lastPlannedCommandDaemon, activeBgTasks, lineCount };
+
   const runningBgTasks = [...activeBgTasks.values()].filter((t) => !t.isDaemon);
   const activeBgTask = runningBgTasks.length > 0 ? runningBgTasks[runningBgTasks.length - 1] : null;
 
   // Determinar estado detallado según los últimos pasos del transcript
   let transcriptState = 'idle'; // 'running' | 'waiting_approval' | 'waiting_input' | 'idle'
+  let isStreamingIncomplete = false;
   if (lastStep) {
+    // En AGY, mientras el modelo está pensando/generando una llamada a herramienta en vivo,
+    // escribe un PLANNER_RESPONSE parcial con status: "DONE", thinking != "", pero sin content,
+    // sin tool_calls y sin input_tokens/output_tokens aún.
+    const isThinkingOnlyStep =
+      lastStep.type === 'PLANNER_RESPONSE' &&
+      (!Array.isArray(lastStep.tool_calls) || lastStep.tool_calls.length === 0) &&
+      (!lastStep.content || !lastStep.content.trim()) &&
+      Boolean(lastStep.thinking && lastStep.thinking.trim()) &&
+      lastStep.input_tokens == null &&
+      lastStep.output_tokens == null;
+
+    if (isThinkingOnlyStep && Date.now() - lastActivityAt < 10 * 60 * 1000) {
+      isStreamingIncomplete = true;
+    }
+
     if (pendingQuestion && lastStep.type === 'PLANNER_RESPONSE') {
       transcriptState = 'waiting_approval';
-    } else if (lastStep.status === 'RUNNING' || lastStep.status === 'PENDING') {
+    } else if (lastStep.status === 'RUNNING' || lastStep.status === 'PENDING' || isStreamingIncomplete) {
       if (pendingQuestion) {
         transcriptState = 'waiting_approval';
       } else {
@@ -471,11 +562,13 @@ function parseTranscript(baseDir, convId) {
     } else if (lastStep.type === 'USER_INPUT' || lastStep.type === 'SYSTEM_MESSAGE') {
       const ageMs = Date.now() - lastActivityAt;
       transcriptState = ageMs < 60000 || activeBgTask ? 'running' : 'waiting_input';
+    } else if (lastStep.type === 'ERROR_MESSAGE') {
+      transcriptState = activeBgTask ? 'running' : 'waiting_input';
     }
   }
 
   const totalTokens = inputTokens + cacheReadTokens + outputTokens;
-  const effectiveTokens = Math.round(inputTokens + cacheReadTokens * 0.1 + outputTokens * 5);
+  const effectiveTokens = Math.round(inputTokens + cacheReadTokens * TOKEN_WEIGHTS.cacheRead + outputTokens * TOKEN_WEIGHTS.output);
 
   const data = {
     inputTokens,
@@ -487,6 +580,9 @@ function parseTranscript(baseDir, convId) {
     dailyTokens,
     slotTokens,
     transcriptState,
+    isStreamingIncomplete,
+    lastThinkingTitle,
+    lastErrorText,
     lastUserPrompt,
     lastAssistantText,
     currentToolCall,
@@ -494,10 +590,10 @@ function parseTranscript(baseDir, convId) {
     activeBgTask,
     pendingQuestion,
     lastActivityAt,
-    stepCount: lines.filter(Boolean).length
+    stepCount: lineCount
   };
 
-  transcriptCache.set(convId, { mtimeMs: stat.mtimeMs, size: stat.size, data });
+  transcriptCache.set(convId, { mtimeMs: stat.mtimeMs, size: append.size, identity: append.identity, rest: append.rest, state, evaluatedMinute: Math.floor(Date.now() / 60000), data });
   return data;
 }
 
@@ -520,9 +616,9 @@ function parseWorkspaceUri(workspaceUrisStr, fallbackWorkspace) {
 }
 
 /**
- * Construye el objeto de cuota y telemetría de AGY (ventanas móviles de 5h y 7d + historial + burn rate)
+ * Construye el objeto de cuota y telemetría de AGY (ventanas móviles de 5h y 7d + historial + burn rate + estado real 429)
  */
-function buildAgyQuota(slotAgg, settings, config = {}) {
+function buildAgyQuota(slotAgg, settings, config = {}, providerStatus = null) {
   const now = Date.now();
   const currentSlot = Math.floor(now / SLOT_MS);
   const slots5h = 20; // 5 horas = 20 bloques de 15m
@@ -530,14 +626,35 @@ function buildAgyQuota(slotAgg, settings, config = {}) {
   const slots7d = 7 * 24 * 4; // 7 días = 672 bloques de 15m
 
   // Límites de referencia configurables (en tokens efectivos ponderados)
-  const limit5hEff = (Number(config.agyFiveHourLimitM) || 25) * 1_000_000;
-  const limit7dEff = (Number(config.agySevenDayLimitM) || 100) * 1_000_000;
+  const configuredLimit5hEff = (Number(config.agyFiveHourLimitM ?? config.fiveHourLimitM) || DEFAULT_FIVE_HOUR_LIMIT_M) * 1_000_000;
+  const limit7dEff = (Number(config.agySevenDayLimitM ?? config.sevenDayLimitM) || DEFAULT_SEVEN_DAY_LIMIT_M) * 1_000_000;
+
+  // Si hubo un agotamiento real de 5h confirmado en logs y ya se reseteó en las últimas 5h,
+  // contabilizamos el porcentaje del ciclo nuevo desde lastResetAt contra el techo configurado (25M).
+  const confirmedResetAt =
+    providerStatus &&
+    (providerStatus.lastResetAt || providerStatus.resetAt) &&
+    providerStatus.window === '5h'
+      ? providerStatus.lastResetAt || providerStatus.resetAt
+      : null;
+
+  let resetSlot5h = null;
+  if (confirmedResetAt) {
+    const endSlot = Math.floor(confirmedResetAt / SLOT_MS);
+    if (!providerStatus.exhausted && now >= confirmedResetAt && now - confirmedResetAt < 5 * 3600 * 1000) {
+      resetSlot5h = endSlot;
+    }
+  }
+
+  const limit5hEff = configuredLimit5hEff;
 
   const fiveHour = { input: 0, cacheRead: 0, output: 0, total: 0, effective: 0, turns: 0 };
+  const sinceReset5h = { input: 0, cacheRead: 0, output: 0, total: 0, effective: 0, turns: 0 };
   const oneHour = { input: 0, cacheRead: 0, output: 0, total: 0, effective: 0, turns: 0 };
   const sevenDay = { input: 0, cacheRead: 0, output: 0, total: 0, effective: 0, turns: 0 };
 
   let oldestSlot5h = null;
+  let oldestSlotSinceReset5h = null;
   let oldestSlot7d = null;
 
   for (const [slotStr, b] of Object.entries(slotAgg)) {
@@ -565,6 +682,17 @@ function buildAgyQuota(slotAgg, settings, config = {}) {
       if (b.total > 0 && (oldestSlot5h === null || s < oldestSlot5h)) {
         oldestSlot5h = s;
       }
+      if (resetSlot5h !== null && s >= resetSlot5h) {
+        sinceReset5h.input += b.input;
+        sinceReset5h.cacheRead += b.cacheRead;
+        sinceReset5h.output += b.output;
+        sinceReset5h.total += b.total;
+        sinceReset5h.effective += b.effective;
+        sinceReset5h.turns += b.turns;
+        if (b.total > 0 && (oldestSlotSinceReset5h === null || s < oldestSlotSinceReset5h)) {
+          oldestSlotSinceReset5h = s;
+        }
+      }
     }
     if (diff <= slots1h) {
       oneHour.input += b.input;
@@ -576,33 +704,71 @@ function buildAgyQuota(slotAgg, settings, config = {}) {
     }
   }
 
-  const nextFiveHourResetAt =
-    oldestSlot5h !== null ? (oldestSlot5h + slots5h + 1) * SLOT_MS : null;
-  const nextWeeklyResetAt =
-    oldestSlot7d !== null ? (oldestSlot7d + slots7d + 1) * SLOT_MS : null;
+  const activeFiveHour = resetSlot5h !== null ? sinceReset5h : fiveHour;
 
-  const fiveHourPct = Math.min(100, Math.round((fiveHour.effective / Math.max(1, limit5hEff)) * 100));
-  const sevenDayPct = Math.min(100, Math.round((sevenDay.effective / Math.max(1, limit7dEff)) * 100));
+  // Datos 100% reales del backend de Google (businessaicode.googleapis.com:fetchQuotaStatus)
+  const officialApi = (providerStatus && providerStatus.officialApi) || null;
+  const officialWeekly = (officialApi && officialApi.weekly) || null;
+  const officialFiveHour = (officialApi && officialApi.fiveHour) || null;
+
+  let fiveHourPct = null;
+  let sevenDayPct = null;
+  let sevenDayPctExact = null;
+  let nextFiveHourResetAt = null;
+  let nextWeeklyResetAt = null;
+
+  if (officialWeekly) {
+    sevenDayPct = officialWeekly.usedPctRounded;
+    sevenDayPctExact = officialWeekly.usedPctExact;
+    nextWeeklyResetAt = officialWeekly.resetAt || null;
+  }
+
+  if (officialFiveHour) {
+    fiveHourPct = officialFiveHour.usedPctRounded;
+    nextFiveHourResetAt = officialFiveHour.resetAt || null;
+  }
+
+  // Si AGY reporta agotamiento activo (HTTP 429 RESOURCE_EXHAUSTED en cli.log), reflejar 100% y el horario oficial de reset
+  if (providerStatus && providerStatus.exhausted) {
+    if (providerStatus.window === '7d') {
+      sevenDayPct = 100;
+      if (providerStatus.resetAt) nextWeeklyResetAt = providerStatus.resetAt;
+    } else if (providerStatus.window === '5h') {
+      fiveHourPct = 100;
+      if (providerStatus.resetAt) nextFiveHourResetAt = providerStatus.resetAt;
+    }
+  }
+
+  const estimatedFiveHourPct = Math.min(
+    100,
+    Math.round((activeFiveHour.effective / Math.max(1, limit5hEff)) * 100)
+  );
+  const estimatedSevenDayPct = Math.min(
+    100,
+    Math.round((sevenDay.effective / Math.max(1, limit7dEff)) * 100)
+  );
 
   // Construir curva histórica de las últimas 24 horas (24 puntos, cada 1 hora = 4 slots)
+  const sampleTime = officialApi && officialApi.available ? officialApi.fetchedAt : now;
+  if (fiveHourPct != null || sevenDayPct != null) {
+    quotaSamples.set(sampleTime, { t: sampleTime, fh: fiveHourPct, sd: sevenDayPct });
+  }
+  for (const t of quotaSamples.keys()) if (now - t > 24 * 3600 * 1000) quotaSamples.delete(t);
   const history = [];
   for (let h = 23; h >= 0; h--) {
     const refSlot = currentSlot - h * 4;
-    let eff5 = 0;
-    let eff7 = 0;
-    for (const [slotStr, b] of Object.entries(slotAgg)) {
-      const s = Number(slotStr);
-      const d = refSlot - s;
-      if (d >= 0 && d <= slots7d) {
-        eff7 += b.effective;
-        if (d <= slots5h) eff5 += b.effective;
-      }
-    }
+    const refTs = refSlot * SLOT_MS;
+    const sample = [...quotaSamples.values()].filter((point) => point.t <= refTs && refTs - point.t < 3600000)
+      .sort((a, b) => b.t - a.t)[0];
     history.push({
-      t: refSlot * SLOT_MS,
-      fh: Math.min(100, Math.round((eff5 / Math.max(1, limit5hEff)) * 100)),
-      sd: Math.min(100, Math.round((eff7 / Math.max(1, limit7dEff)) * 100))
+      t: refTs,
+      fh: sample ? sample.fh : null,
+      sd: sample ? sample.sd : null
     });
+  }
+
+  if (history.length > 0) {
+    history[history.length - 1] = { t: now, fh: fiveHourPct, sd: sevenDayPct };
   }
 
   const cacheHitPct =
@@ -612,23 +778,42 @@ function buildAgyQuota(slotAgg, settings, config = {}) {
   const burnRatePerHour =
     oneHour.total > 0 ? oneHour.total : Math.round(fiveHour.total / 5);
 
+  const hasOfficialWeekly = Boolean(officialWeekly);
+
   return {
     available: true,
+    source:
+      providerStatus && providerStatus.exhausted
+        ? 'provider-error'
+        : hasOfficialWeekly
+        ? 'google-api'
+        : 'provider-logs',
+    estimated: false,
     model: settings.model,
-    gcpProject: settings.gcpProject,
-    gcpLocation: settings.gcpLocation,
+    gcpProject: (officialApi && officialApi.projectId) || settings.gcpProject,
+    gcpLocation: (officialApi && officialApi.region) || settings.gcpLocation,
+    userTier: (officialApi && officialApi.userTier) || '',
     fiveHourPct,
     sevenDayPct,
-    fiveHour,
+    sevenDayPctExact,
+    officialWeekly,
+    officialFiveHour,
+    estimatedFiveHourPct,
+    estimatedSevenDayPct,
+    fiveHour: activeFiveHour,
+    rollingFiveHour: fiveHour,
     sevenDay,
     oneHour,
     burnRatePerHour,
     cacheHitPct,
-    limit5hM: Math.round(limit5hEff / 1_000_000),
+    limit5hM: Number((limit5hEff / 1_000_000).toFixed(1)),
+    configuredLimit5hM: Math.round(configuredLimit5hEff / 1_000_000),
     limit7dM: Math.round(limit7dEff / 1_000_000),
     nextFiveHourResetAt,
     nextWeeklyResetAt,
-    updatedAt: now,
+    providerStatus,
+    updatedAt: (officialApi && officialApi.fetchedAt) || now,
+    officialStale: Boolean(officialApi && officialApi.stale),
     history
   };
 }
@@ -638,6 +823,7 @@ function buildAgyQuota(slotAgg, settings, config = {}) {
  */
 function collectAgyData(config = {}) {
   const baseDir = getAgyBaseDir();
+  const providerStatus = readAgyQuotaStatus(baseDir);
   const settings = readAgySettings(baseDir);
   const activeLocks = getActiveLockedConversations(baseDir);
   const dbRows = readConversationSummaries(baseDir);
@@ -701,19 +887,27 @@ function collectAgyData(config = {}) {
     } catch {}
     lockSigParts.push(`${cid}:${linfo.lockMtimeMs}:${trSig}`);
   }
+  const officialApiSig =
+    providerStatus && providerStatus.officialApi && providerStatus.officialApi.weekly
+      ? `${providerStatus.officialApi.weekly.remainingFraction}:${providerStatus.officialApi.weekly.resetTime || ''}`
+      : '';
   const topCacheKey = [
     settingsCache.key,
     dbSummariesCache.key,
+    summariesSourceError,
     historyMapCache.key,
     brainScanCache.mtimeMs,
     lockSigParts.join(','),
-    config.agyFiveHourLimitM || 25,
-    config.agySevenDayLimitM || 100,
+    config.agyFiveHourLimitM || config.fiveHourLimitM || DEFAULT_FIVE_HOUR_LIMIT_M,
+    config.agySevenDayLimitM || config.sevenDayLimitM || DEFAULT_SEVEN_DAY_LIMIT_M,
+    providerStatus ? `${providerStatus.state}:${providerStatus.exhausted ? 1 : 0}:${providerStatus.resetAt || 0}:${providerStatus.lastResetAt || 0}` : '',
+    officialApiSig,
+    JSON.stringify(providerStatus && providerStatus.officialApi),
     hasRecentLiveActivity ? Math.floor(now / 5000) : Math.floor(now / SLOT_MS)
   ].join('|');
 
   if (agyResultCache.data && agyResultCache.key === topCacheKey) {
-    return agyResultCache.data;
+    return { ...agyResultCache.data, agyQuota: { ...agyResultCache.data.agyQuota, providerStatus } };
   }
 
   const sessions = [];
@@ -787,6 +981,7 @@ function collectAgyData(config = {}) {
       } else if (
         dbStatus === 'CASCADE_RUN_STATUS_RUNNING' ||
         hasActiveBgWork ||
+        (tr && tr.isStreamingIncomplete) ||
         (tr && tr.transcriptState === 'running' && (!row || notFullyIdle || Date.now() - tr.lastActivityAt < 15000))
       ) {
         state = 'running';
@@ -796,16 +991,17 @@ function collectAgyData(config = {}) {
         state = 'waiting_input';
       }
     } else if (
-      (dbStatus === 'CASCADE_RUN_STATUS_RUNNING' || hasActiveBgWork) &&
+      (dbStatus === 'CASCADE_RUN_STATUS_RUNNING' || hasActiveBgWork || (tr && tr.isStreamingIncomplete)) &&
       tr &&
       Date.now() - tr.lastActivityAt < 45000
     ) {
       state = 'running';
     }
 
+    const hasInterruptedError = Boolean(tr && tr.lastErrorText && state === 'waiting_input');
     const stateLabelMap = {
       waiting_approval: 'Permiso',
-      waiting_input: 'Lista',
+      waiting_input: hasInterruptedError ? 'Error' : 'Lista',
       running: 'Activa',
       closed: 'Cerrada'
     };
@@ -826,6 +1022,8 @@ function collectAgyData(config = {}) {
     if (state === 'running') {
       if (tr && tr.currentToolCall) {
         currentAction = `${tr.currentToolCall.name}${tr.currentToolCall.detail ? ': ' + tr.currentToolCall.detail : ''}`;
+      } else if (tr && tr.isStreamingIncomplete) {
+        currentAction = `🧠 Generando${tr.lastThinkingTitle ? ': ' + tr.lastThinkingTitle : ' respuesta / código...'}`;
       } else if (tr && tr.activeBgTask) {
         currentAction = `⏳ Background: ${tr.activeBgTask.detail || 'comando en segundo plano'}`;
       } else if (runningSubagents.length > 0) {
@@ -836,6 +1034,8 @@ function collectAgyData(config = {}) {
       }
     } else if (state === 'waiting_approval' && tr && tr.pendingQuestion) {
       currentAction = `Pregunta: ${tr.pendingQuestion}`;
+    } else if (hasInterruptedError) {
+      currentAction = `⚠️ ${tr.lastErrorText}`;
     }
 
     if (isLocked || state !== 'closed' || Date.now() - updatedAt < 24 * 60 * 60 * 1000) {
@@ -844,6 +1044,7 @@ function collectAgyData(config = {}) {
         sessionId: convId,
         provider: 'agy',
         providerLabel: isSubagent ? 'AGY Sub' : 'AGY',
+        model: settings.model,
         surface: (row && row.source) || 'cli',
         isOpen: isLocked || state === 'running',
         isSubagent,
@@ -887,11 +1088,12 @@ function collectAgyData(config = {}) {
     return b.updatedAt - a.updatedAt;
   });
 
-  const agyQuota = buildAgyQuota(slotAgg, settings, config);
+  const agyQuota = buildAgyQuota(slotAgg, settings, config, providerStatus);
 
   const result = {
     sessions,
     dailyTokens: dailyAgg,
+    sourceError: summariesSourceError,
     agyQuota
   };
   agyResultCache = { key: topCacheKey, data: result };
@@ -899,5 +1101,5 @@ function collectAgyData(config = {}) {
 }
 
 module.exports = {
-  collectAgyData
+  collectAgyData, buildAgyQuota, parseTranscript, getActiveLockedConversations, localDayKey
 };

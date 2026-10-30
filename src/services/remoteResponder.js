@@ -2,6 +2,45 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
+
+// Acciones rápidas permitidas: deben coincidir con el switch de quickAction del script PowerShell
+const QUICK_ACTIONS = new Set(['approve', 'enter', 'option1', 'option2', 'option3', 'reject', 'escape']);
+
+/**
+ * Script temporal en un directorio por usuario (LOCALAPPDATA) con nombre aleatorio.
+ * El llamador lo borra después de usarlo.
+ */
+function writeTempScript(prefix, content) {
+  const base = process.env.LOCALAPPDATA || os.homedir();
+  const dir = path.join(base, 'AI Pulse Widget', 'run');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `${prefix}-${crypto.randomBytes(12).toString('hex')}.ps1`);
+  fs.writeFileSync(file, content, 'utf8');
+  return file;
+}
+
+/**
+ * Resuelve un ejecutable de claude sin usar shell: claude.exe directo, o el cli.js
+ * del shim npm (claude.cmd) ejecutado con node. Devuelve null si no lo encuentra.
+ */
+function resolveClaudeCommand(cb) {
+  execFile('where', ['claude'], { windowsHide: true, timeout: 5000 }, (err, stdout) => {
+    if (err) return cb(null);
+    const lines = String(stdout || '')
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    const exe = lines.find((l) => /\.exe$/i.test(l));
+    if (exe) return cb({ file: exe, prefix: [] });
+    const shim = lines.find((l) => /\.(cmd|bat)$/i.test(l));
+    if (shim) {
+      const cli = path.join(path.dirname(shim), 'node_modules', '@anthropic-ai', 'claude-code', 'cli.js');
+      if (fs.existsSync(cli)) return cb({ file: 'node', prefix: [cli] });
+    }
+    cb(null);
+  });
+}
 
 /**
  * Envía una respuesta remota o acción rápida (Aprobar y/Enter, 1/2/3, Esc, o prompt de texto)
@@ -32,6 +71,11 @@ function sendSessionReply({
     const cleanText = String(text || '').trim();
     const cleanAction = String(quickAction || '').trim().toLowerCase();
 
+    if (cleanAction && !QUICK_ACTIONS.has(cleanAction)) {
+      resolve({ ok: false, error: 'Acción no permitida' });
+      return;
+    }
+
     if (!cleanText && !cleanAction) {
       resolve({ ok: false, error: 'Mensaje o acción vacía' });
       return;
@@ -44,6 +88,7 @@ function sendSessionReply({
 
     const escapedLockPath = lockFilePath.replace(/'/g, "''");
     const b64Text = Buffer.from(cleanText, 'utf8').toString('base64');
+    const b64Action = Buffer.from(cleanAction, 'utf8').toString('base64');
 
     const psScript = `
 Add-Type @"
@@ -363,7 +408,7 @@ $targetPid = ${safePid}
 $provider = "${safeProvider}"
 $surface = "${safeSurface}"
 $lockPath = '${escapedLockPath}'
-$quickAction = "${cleanAction}"
+$quickAction = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String("${b64Action}"))
 $b64Text = "${b64Text}"
 
 # 0. Si es Claude Desktop App (interfaz gráfica Electron)
@@ -442,36 +487,29 @@ if ($targetPid -gt 0) {
         }
     }
 
+    $denied = $false
     foreach ($candPid in $pidsToTry) {
         $written = [Win32Injector]::WriteDirectToConsolePid([uint32]$candPid, $textToInject, $sendEnter, $sendEsc)
         if ($written -gt 0) {
             Write-Output "sent_conin:pid=\${candPid}:target=\${targetPid}:events=\${written}"
             exit 0
         }
+        if ($written -eq -1 -or $written -eq -2) { $denied = $true }
     }
 
-    if (-not $isCurrentlyAdmin -and $PSCommandPath) {
-        $outFile = "$PSCommandPath.out"
-        try {
-            Start-Process -FilePath "powershell.exe" -Verb RunAs -WindowStyle Hidden -Wait -ArgumentList "-NoProfile -STA -NonInteractive -ExecutionPolicy Bypass -Command \`"& '$PSCommandPath' | Out-File -FilePath '$outFile' -Encoding utf8\`""
-            if (Test-Path $outFile) {
-                Get-Content $outFile -Raw
-                Remove-Item $outFile -Force -ErrorAction SilentlyContinue
-                exit 0
-            }
-        } catch {}
+    # Sin elevación no se puede adjuntar a una consola elevada: se informa, no se pide UAC
+    if ($denied -and -not $isCurrentlyAdmin) {
+        Write-Output "needs_elevation"
+        exit 0
     }
 }
 
 Write-Output "not_found"
 `;
 
-    const tmpScript = path.join(
-      os.tmpdir(),
-      `ai-pulse-reply-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.ps1`
-    );
+    let tmpScript = '';
     try {
-      fs.writeFileSync(tmpScript, psScript, 'utf8');
+      tmpScript = writeTempScript('ai-pulse-reply', psScript);
     } catch (e) {
       resolve({ ok: false, error: e.message });
       return;
@@ -492,28 +530,48 @@ Write-Output "not_found"
           return;
         }
 
+        if (out.startsWith('needs_elevation')) {
+          resolve({
+            ok: false,
+            code: 'needs_elevation',
+            error: 'La consola de esta sesión corre elevada. Ejecutá el widget como administrador para responder.',
+            detail: out
+          });
+          return;
+        }
+
         // Fallback: si es una sesión de Claude CLI cerrada y enviaron un prompt de texto, reanudar con claude --resume
         if (safeProvider === 'claude' && safeSurface !== 'app' && rawConvId && cleanText) {
           const cwd = workspace && fs.existsSync(workspace) ? workspace : os.homedir();
-          execFile(
-            'claude',
-            ['--resume', rawConvId, '-p', cleanText],
-            { cwd, timeout: 60000, windowsHide: true, shell: true },
-            (clErr, clOut) => {
-              if (clErr) {
-                resolve({
-                  ok: false,
-                  error: 'La consola no está abierta y falló claude --resume: ' + clErr.message
-                });
-              } else {
-                resolve({
-                  ok: true,
-                  method: 'claude_resume_headless',
-                  detail: String(clOut || '').slice(0, 300)
-                });
-              }
+          resolveClaudeCommand((bin) => {
+            if (!bin) {
+              resolve({
+                ok: false,
+                error: 'La consola no está abierta y no se encontró el ejecutable de claude'
+              });
+              return;
             }
-          );
+            // Sin shell: el texto viaja como un argv separado, nunca dentro de una cadena de comando
+            execFile(
+              bin.file,
+              [...bin.prefix, '--resume', rawConvId, '-p', cleanText],
+              { cwd, timeout: 60000, windowsHide: true, shell: false },
+              (clErr, clOut) => {
+                if (clErr) {
+                  resolve({
+                    ok: false,
+                    error: 'La consola no está abierta y falló claude --resume: ' + clErr.message
+                  });
+                } else {
+                  resolve({
+                    ok: true,
+                    method: 'claude_resume_headless',
+                    detail: String(clOut || '').slice(0, 300)
+                  });
+                }
+              }
+            );
+          });
           return;
         }
 
