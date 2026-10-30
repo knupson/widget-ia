@@ -1428,7 +1428,8 @@
     const activeWidgetUrl =
       mob.activeWidgetUrl || tunnelWidgetUrl || lanWidgetUrl;
     const activeBase = (mob.tunnel && mob.tunnel.publicUrl) || fallbackBase;
-    const activeApkUrl = `${activeBase}/api/apk`;
+    const activeApkUrl =
+      mob.activeApkUrl || `${activeBase}/api/apk${token ? `?token=${encodeURIComponent(token)}` : ''}`;
 
     return {
       lanIp,
@@ -1465,7 +1466,15 @@
     if (qrCap) qrCap.textContent = targetUrl;
     if (targetUrl && targetUrl !== lastQrEncodedUrl) {
       lastQrEncodedUrl = targetUrl;
-      qrImg.src = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&margin=8&data=${encodeURIComponent(targetUrl)}`;
+      // QR generado localmente: la URL lleva el token y no puede salir a un servicio externo
+      try {
+        const qr = window.qrcode(0, 'M');
+        qr.addData(targetUrl);
+        qr.make();
+        qrImg.src = qr.createDataURL(5, 8);
+      } catch {
+        qrImg.removeAttribute('src');
+      }
     }
   }
 

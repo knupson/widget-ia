@@ -505,6 +505,9 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
       : '';
     const activeAppUrl = tunnelAppUrl || lanAppUrl;
     const activeWidgetUrl = tunnelWidgetUrl || lanWidgetUrl;
+    // ?token= es la única forma de autenticar una descarga desde el QR (el navegador no manda headers)
+    const apkBase = tunnelBase || lanBase;
+    const activeApkUrl = apkBase ? `${apkBase}/api/apk?token=${encodeURIComponent(token)}` : '';
 
     const mobileAccess = {
       lanIp: primaryLanIp,
@@ -517,7 +520,8 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
       tunnelWidgetUrl,
       activeUrl: activeAppUrl,
       activeAppUrl,
-      activeWidgetUrl
+      activeWidgetUrl,
+      activeApkUrl
     };
 
     latestSnapshot = {
