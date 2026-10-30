@@ -22,12 +22,14 @@ function refresh() {
         const codex = named('codex.exe').filter((p) => !String(p.CommandLine || '').toLowerCase().includes(' app-server'));
         // `agy models` lo lanza el propio widget para renovar el token de cuota: no es una sesión
         const agy = named('agy.exe').filter((p) => !/\smodels\s*$/i.test(String(p.CommandLine || '')));
+        // La app de escritorio es Electron: sus hijos (gpu, renderer, crashpad...) llevan --type=
+        const claude = named('claude.exe').filter((p) => !/\s--type=/i.test(String(p.CommandLine || '')));
         const topLevelCount = (items) => {
           const ids = new Set(items.map((p) => Number(p.ProcessId)));
           return items.filter((p) => !ids.has(Number(p.ParentProcessId))).length;
         };
         counts = {
-          claude: named('claude.exe').length,
+          claude: topLevelCount(claude),
           codex: topLevelCount(codex),
           agy: topLevelCount(agy),
           updatedAt: Date.now()
