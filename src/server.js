@@ -11,6 +11,7 @@ const { focusSessionWindow } = require('./services/windowFocuser');
 const { getSessionMessages } = require('./services/conversationReader');
 const { sendSessionReply } = require('./services/remoteResponder');
 const { TunnelManager } = require('./services/tunnelManager');
+const { createUsageHistoryStore } = require('./services/usageHistory');
 const processCounter = require('./services/processCounter');
 
 const CONFIG_PATH = path.resolve(__dirname, '..', 'config.json');
@@ -233,6 +234,8 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
       refreshSnapshot(true);
     }
   });
+
+  const usageHistoryStore = createUsageHistoryStore();
 
   const remoteManager = new RemoteManager({
     config,
@@ -543,6 +546,12 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
       recentAlerts
     };
 
+    usageHistoryStore.record({
+      claudeQuota: claudeData.planQuota,
+      codexQuota: codexData.codexQuota,
+      now
+    });
+
     if (sseClients.size > 0) {
       const windowVisible = typeof isRendererVisible === 'function' ? isRendererVisible() : true;
       const hasExternalWebClients = sseClients.size > 1;
@@ -851,6 +860,13 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
     if (req.method === 'GET' && pathname === '/api/state') {
       if (!latestSnapshot) refreshSnapshot();
       sendJson(res, 200, sanitizeSnapshot(latestSnapshot, isLocalLoopback), req, cookieHeaders);
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/api/usage/history') {
+      if (!latestSnapshot) refreshSnapshot();
+      const range = urlObj.searchParams.get('range') || '24h';
+      sendJson(res, 200, usageHistoryStore.getHistory({ range }), req, cookieHeaders);
       return;
     }
 
