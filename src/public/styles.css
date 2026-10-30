@@ -704,6 +704,23 @@ body.mode-web .panel-container {
   transition: width 0.35s ease;
 }
 
+/* AGY muestra actividad local; estos puntos no representan un porcentaje. */
+.pq-bar.agy-activity,
+.dmb-track.agy-activity {
+  flex: 0 0 4px;
+  width: 4px;
+  min-width: 4px;
+  height: 4px;
+}
+
+#pill-agy-box .pq-val {
+  flex: 1;
+}
+
+#kpi-agy-card .dual-mini-bars {
+  flex-direction: row;
+}
+
 .fill-orange { background: linear-gradient(90deg, #ea580c, #ff6b1a); }
 .fill-ochre { background: linear-gradient(90deg, #b45309, #e09f3e); }
 .fill-gold { background: linear-gradient(90deg, #ca8a04, #facc15); }

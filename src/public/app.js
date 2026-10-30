@@ -206,6 +206,37 @@
     return String(Math.round(n));
   }
 
+  function agyUsageNote(quota) {
+    const free = quota.sevenDayPctExact == null
+      ? '--'
+      : `${Number(Math.max(0, Math.min(100, 100 - quota.sevenDayPctExact)).toFixed(4))}%`;
+    const burn = quota.burnRatePerHour == null ? '--' : fmtNumber(quota.burnRatePerHour);
+    return `cupo empresa: ${free} libre · ${burn} tok/h`;
+  }
+
+  function renderAgyUsage(quota, mode) {
+    const status = quota.providerStatus || {};
+    for (const [key, usage] of [['fh', quota.fiveHour], ['sd', quota.sevenDay]]) {
+      const exhausted = status.exhausted && (key === 'sd' ? status.window === '7d' : status.window !== '7d');
+      const valueId = mode === 'pill' ? `pill-agy-${key}-txt` : `kpi-agy-${key}-val`;
+      const barId = mode === 'pill' ? `pill-agy-${key}` : `kpi-agy-${key}-bar`;
+      const value = document.getElementById(valueId);
+      if (value) {
+        value.textContent = exhausted ? '100%' : usage?.total == null ? '--' : fmtNumber(usage.total);
+        value.classList.toggle('quota-exhausted', Boolean(exhausted));
+        value.title = exhausted ? 'Cupo agotado' : 'Tokens consumidos';
+      }
+      const indicator = document.getElementById(barId);
+      if (indicator) {
+        const danger = key === 'sd'
+          ? quota.officialWeekly?.usedPctExact >= 90
+          : exhausted;
+        indicator.style.width = exhausted || danger || usage?.total > 0 ? '100%' : '0%';
+        indicator.classList.toggle('fill-danger', Boolean(danger));
+      }
+    }
+  }
+
   function fmtRelativeTime(ts) {
     if (!ts) return '';
     const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
@@ -567,14 +598,18 @@
       agyQuota.available ? 1 : 0,
       agyQuota.fiveHourPct,
       agyQuota.sevenDayPct,
+      agyQuota.sevenDayPctExact,
+      agyQuota.officialWeekly?.usedPctExact,
+      agyQuota.fiveHour?.total,
+      agyQuota.sevenDay?.total,
+      agyQuota.burnRatePerHour,
       agyQuota.nextFiveHourResetAt || 0,
       agyQuota.nextWeeklyResetAt || 0,
-      agyQuota.burnRatePerHour || 0,
       agyQuota.cacheHitPct || 0,
-      agyQuota.fiveHour?.total || 0,
       agyQuota.fiveHour?.turns || 0,
-      agyQuota.sevenDay?.total || 0,
       agyQuota.sevenDay?.turns || 0,
+      agyQuota.model || '',
+      agyQuota.providerStatus?.window,
       agyQuota.providerStatus ? `${agyQuota.providerStatus.state}:${agyQuota.providerStatus.exhausted ? 1 : 0}:${agyQuota.providerStatus.resetAt || 0}` : '',
       data.codexQuota ? `${data.codexQuota.fiveHourPct ?? ''}:${data.codexQuota.sevenDayPct ?? ''}:${data.codexQuota.updatedAt || 0}` : '',
       data.config && data.config.soundEnabled ? 1 : 0,
@@ -675,17 +710,7 @@
     }
 
     // Cuota AGY en Píldora
-    const agyFh = agyQuota.fiveHourPct != null ? agyQuota.fiveHourPct : 0;
-    const agySd = agyQuota.sevenDayPct != null ? agyQuota.sevenDayPct : 0;
-    const agyFhEl = document.getElementById('pill-agy-fh');
-    const agySdEl = document.getElementById('pill-agy-sd');
-    if (agyFhEl) agyFhEl.style.width = `${Math.min(100, agyFh)}%`;
-    if (agySdEl) {
-      agySdEl.style.width = `${Math.min(100, agySd)}%`;
-      agySdEl.classList.toggle('fill-danger', agySd >= 90);
-    }
-    document.getElementById('pill-agy-fh-txt').textContent = agyQuota.available ? `${agyFh}%` : '--%';
-    document.getElementById('pill-agy-sd-txt').textContent = agyQuota.available ? `${agySd}%` : '--%';
+    renderAgyUsage(agyQuota, 'pill');
 
     const agyResetTimer = document.getElementById('pill-agy-reset-timer');
     if (agyResetTimer) {
@@ -701,7 +726,7 @@
       const agy7dStr = agyQuota.nextWeeklyResetAt
         ? `\n📅 Libera ventana 7d: ${fmtDateTimeShort(agyQuota.nextWeeklyResetAt)} (${fmtCountdown(agyQuota.nextWeeklyResetAt)})`
         : '';
-      pillAgyBox.title = `🟡 AGY (${agyQuota.model})\n5h: ${agyFh}% (${fmtNumber(agyQuota.fiveHour?.total)} tok · ${agyQuota.fiveHour?.turns || 0} turnos)\n7d: ${agySd}% (${fmtNumber(agyQuota.sevenDay?.total)} tok · ${agyQuota.sevenDay?.turns || 0} turnos)${agy5hStr}${agy7dStr}`;
+      pillAgyBox.title = `🟡 AGY (${agyQuota.model})\n5h: ${fmtNumber(agyQuota.fiveHour?.total)} tok · ${agyQuota.fiveHour?.turns || 0} turnos\n7d: ${fmtNumber(agyQuota.sevenDay?.total)} tok · ${agyQuota.sevenDay?.turns || 0} turnos\n${agyUsageNote(agyQuota)}${agy5hStr}${agy7dStr}`;
     }
 
     // Iconos de sonido
@@ -772,9 +797,15 @@
       agyQuota.available ? 1 : 0,
       agyQuota.fiveHourPct,
       agyQuota.sevenDayPct,
+      agyQuota.sevenDayPctExact,
+      agyQuota.officialWeekly?.usedPctExact,
+      agyQuota.fiveHour?.total,
+      agyQuota.sevenDay?.total,
+      agyQuota.burnRatePerHour,
       agyQuota.nextFiveHourResetAt || 0,
       agyQuota.nextWeeklyResetAt || 0,
       agyQuota.model || '',
+      agyQuota.providerStatus?.window,
       agyQuota.providerStatus ? `${agyQuota.providerStatus.state}:${agyQuota.providerStatus.exhausted ? 1 : 0}:${agyQuota.providerStatus.resetAt || 0}` : '',
       data.codexQuota ? `${data.codexQuota.fiveHourPct ?? ''}:${data.codexQuota.sevenDayPct ?? ''}:${data.codexQuota.updatedAt || 0}` : '',
       analytics.weekly?.combined?.total || 0,
@@ -832,30 +863,20 @@
       ].filter(Boolean).join('\n');
     }
 
-    // KPI 3: Cuota AGY
-    const agyFh = agyQuota.fiveHourPct != null ? agyQuota.fiveHourPct : 0;
-    const agySd = agyQuota.sevenDayPct != null ? agyQuota.sevenDayPct : 0;
-    document.getElementById('kpi-agy-fh-val').textContent = agyQuota.available ? `${agyFh}%` : '--%';
-    document.getElementById('kpi-agy-sd-val').textContent = agyQuota.available ? `${agySd}%` : '--%';
-    document.getElementById('kpi-agy-fh-bar').style.width = `${Math.min(100, agyFh)}%`;
-    const agySdBar = document.getElementById('kpi-agy-sd-bar');
-    agySdBar.style.width = `${Math.min(100, agySd)}%`;
-    agySdBar.classList.toggle('fill-danger', agySd >= 90);
+    // KPI 3: Consumo local AGY
+    renderAgyUsage(agyQuota, 'kpi');
 
     const fhAgyTok = agyQuota.fiveHour?.total || 0;
     const sdAgyTok = agyQuota.sevenDay?.total || 0;
     const kpiAgySub = document.getElementById('kpi-agy-sub');
     if (kpiAgySub) {
-      if (agyQuota.nextFiveHourResetAt || agyQuota.nextWeeklyResetAt) {
-        kpiAgySub.textContent = `⏳5h:${fmtCountdownShort(agyQuota.nextFiveHourResetAt)} · 7d:${fmtCountdownShort(agyQuota.nextWeeklyResetAt)}`;
-      } else {
-        kpiAgySub.textContent = `5h:${fmtNumber(fhAgyTok)} · 7d:${fmtNumber(sdAgyTok)}`;
-      }
+      kpiAgySub.textContent = agyUsageNote(agyQuota);
     }
     const kpiAgyCard = document.getElementById('kpi-agy-card');
     if (kpiAgyCard) {
       kpiAgyCard.title = [
         `Cuota Antigravity (AGY) · 5h: ${fmtNumber(fhAgyTok)} tok | 7d: ${fmtNumber(sdAgyTok)} tok`,
+        agyUsageNote(agyQuota),
         agyQuota.nextFiveHourResetAt ? `⏳ Libera 5h: ${fmtTimeShort(agyQuota.nextFiveHourResetAt)} (${fmtCountdown(agyQuota.nextFiveHourResetAt)})` : '',
         agyQuota.nextWeeklyResetAt ? `📅 Libera 7d: ${fmtDateTimeShort(agyQuota.nextWeeklyResetAt)} (${fmtCountdown(agyQuota.nextWeeklyResetAt)})` : ''
       ].filter(Boolean).join('\n');
@@ -1232,17 +1253,17 @@
     }
 
     // 2. Cuota y Telemetría Antigravity (AGY)
-    const agyFh = agyQuota.fiveHourPct != null ? agyQuota.fiveHourPct : 0;
-    const agySd = agyQuota.sevenDayPct != null ? agyQuota.sevenDayPct : 0;
+    const agyFh = agyQuota.fiveHourPct ?? null;
+    const agySd = agyQuota.sevenDayPct ?? null;
 
-    document.getElementById('agy-fh-pct').textContent = agyQuota.available ? `${agyFh}%` : '--%';
-    document.getElementById('agy-sd-pct').textContent = agyQuota.available ? `${agySd}%` : '--%';
+    document.getElementById('agy-fh-pct').textContent = agyQuota.available && agyFh != null ? `${agyFh}%` : '--';
+    document.getElementById('agy-sd-pct').textContent = agyQuota.available && agySd != null ? `${agySd}%` : '--';
     document.getElementById('agy-fh-bar').style.width = `${Math.min(100, agyFh)}%`;
 
     const agySdBar = document.getElementById('agy-sd-bar');
     if (agySdBar) {
       agySdBar.style.width = `${Math.min(100, agySd)}%`;
-      agySdBar.classList.toggle('fill-danger', agySd >= 90);
+      agySdBar.classList.toggle('fill-danger', agyQuota.officialWeekly?.usedPctExact >= 90);
     }
 
     const agyMetaBadge = document.getElementById('agy-meta-badge');
@@ -1738,16 +1759,16 @@
       awClBonus.classList.toggle('hidden', !clQuota.lastBonusReset);
     }
 
-    const agyFh = agyQuota.fiveHourPct != null ? agyQuota.fiveHourPct : 0;
-    const agySd = agyQuota.sevenDayPct != null ? agyQuota.sevenDayPct : 0;
+    const agyFh = agyQuota.fiveHourPct ?? null;
+    const agySd = agyQuota.sevenDayPct ?? null;
     const awAgyFh = document.getElementById('aw-agy-fh');
     const awAgySd = document.getElementById('aw-agy-sd');
     if (awAgyFh) awAgyFh.style.width = `${Math.min(100, agyFh)}%`;
     if (awAgySd) awAgySd.style.width = `${Math.min(100, agySd)}%`;
     const awAgyFhTxt = document.getElementById('aw-agy-fh-txt');
     const awAgySdTxt = document.getElementById('aw-agy-sd-txt');
-    if (awAgyFhTxt) awAgyFhTxt.textContent = agyQuota.available ? `${agyFh}%` : '--%';
-    if (awAgySdTxt) awAgySdTxt.textContent = agyQuota.available ? `${agySd}%` : '--%';
+    if (awAgyFhTxt) awAgyFhTxt.textContent = agyQuota.available && agyFh != null ? `${agyFh}%` : '--';
+    if (awAgySdTxt) awAgySdTxt.textContent = agyQuota.available && agySd != null ? `${agySd}%` : '--';
 
     const awAgyTimer = document.getElementById('aw-agy-timer');
     if (awAgyTimer) {
@@ -2068,7 +2089,7 @@
       const el = document.getElementById(id); if (el) el.title = freshness;
     }
 
-    const agy = data.agyQuota || {};
+    const agy = resolveAgyQuota(data);
     const status = agy.providerStatus || {};
     const isExhausted = Boolean(status.exhausted);
     const isRecovered = !isExhausted && status.state === 'recovered';
@@ -2105,7 +2126,7 @@
       } else if (key === 'fh') {
         dispVal = '--';
       }
-      for (const id of [`pill-agy-${key}-txt`, `aw-agy-${key}-txt`, `kpi-agy-${key}-val`, `agy-${key}-pct`]) {
+      for (const id of [`aw-agy-${key}-txt`, `agy-${key}-pct`]) {
         text(id, dispVal);
         const el = document.getElementById(id);
         if (el) {
@@ -2113,12 +2134,12 @@
           el.title = key === 'fh' && value == null && !isKeyExhausted ? 'Sin dato oficial de 5h' : '';
         }
       }
-      for (const barId of [`pill-agy-${key}`, `aw-agy-${key}`, `kpi-agy-${key}-bar`, `agy-${key}-bar`]) {
+      for (const barId of [`aw-agy-${key}`, `agy-${key}-bar`]) {
         const barEl = document.getElementById(barId);
         if (barEl) {
           const pctNum = isKeyExhausted ? 100 : value != null ? Math.min(100, Math.max(0, Number(value) || 0)) : 0;
           barEl.style.width = `${pctNum}%`;
-          barEl.classList.toggle('fill-danger', pctNum >= 90 || isKeyExhausted);
+          barEl.classList.toggle('fill-danger', key === 'sd' ? offWeekly?.usedPctExact >= 90 : pctNum >= 90 || isKeyExhausted);
         }
       }
     }
@@ -2145,9 +2166,7 @@
     let awTimer = primaryOfficialReset
       ? `⏳${fmtCountdownShort(primaryOfficialReset)}`
       : 'Activo';
-    let kpiSub = agy.nextWeeklyResetAt
-      ? `5h: ${isExhausted && status.window !== '7d' ? '100%' : agy.fiveHourPct != null ? `${Math.round(agy.fiveHourPct)}%` : '--'} · 7d reset: ${fmtCountdownShort(agy.nextWeeklyResetAt)}`
-      : `5h:${fmtNumber(agy.fiveHour?.total || 0)} · 7d:${fmtNumber(agy.sevenDay?.total || 0)}`;
+    let kpiSub = agyUsageNote(agy);
 
     if (isExhausted) {
       const cd = status.resetAt ? fmtCountdownShort(status.resetAt) : '';
@@ -2169,12 +2188,14 @@
     text('pill-agy-reset-timer', pillTimer);
     text('aw-agy-timer', awTimer);
     text('kpi-agy-sub', kpiSub);
+    renderAgyUsage(agy, 'pill');
+    renderAgyUsage(agy, 'kpi');
     for (const id of ['agy-provider-status', 'pill-agy-reset-timer', 'kpi-agy-sub', 'aw-agy-timer']) {
       document.getElementById(id)?.classList.toggle('quota-exhausted', isExhausted);
     }
     for (const id of ['pill-agy-box', 'kpi-agy-card']) {
       const el = document.getElementById(id);
-      if (el) el.title = message;
+      if (el) el.title = `${agyUsageNote(agy)}\n5h: ${fmtNumber(agy.fiveHour?.total)} tok · 7d: ${fmtNumber(agy.sevenDay?.total)} tok\n${message}`;
     }
 
     if (isExhausted && status.window !== '7d') {
