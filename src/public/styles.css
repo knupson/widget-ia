@@ -1241,6 +1241,14 @@ body.mode-web .panel-container {
   text-overflow: ellipsis;
 }
 
+.model-weekly-limits:empty { display: none; }
+.model-weekly-limit { margin-top: 6px; }
+.model-weekly-limit .qb-bar { height: 3px; margin-top: 3px; }
+
+.sr-context { width: 48px; flex-shrink: 0; font-size: 9px; color: var(--text-muted); }
+.sr-context-track { display: block; height: 3px; margin-top: 2px; background: rgba(255, 255, 255, 0.07); border-radius: 3px; overflow: hidden; }
+.sr-context-track > span { display: block; height: 100%; background: var(--claude-color); }
+
 .qb-reset {
   margin-top: 2px;
   font-size: 9.2px;

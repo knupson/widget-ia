@@ -935,18 +935,16 @@
       return true;
     });
 
-    // Ordenar poniendo primero las fijadas (Pin), luego abiertas y prioridad de estado
-    const statePriority = { waiting_approval: 0, waiting_input: 1, running: 2, closed: 3 };
-    filtered.sort((a, b) => {
-      const pinA = pinnedIds.has(a.id);
-      const pinB = pinnedIds.has(b.id);
-      if (pinA !== pinB) return pinA ? -1 : 1;
-      if (a.isOpen !== b.isOpen) return a.isOpen ? -1 : 1;
-      if (statePriority[a.state] !== statePriority[b.state]) {
-        return statePriority[a.state] - statePriority[b.state];
-      }
-      return b.updatedAt - a.updatedAt;
-    });
+    // Urgencia primero; el orden recibido se conserva dentro de cada grupo.
+    const statePriority = {
+      waiting_approval: 0, waiting_question: 0, question: 0, needs_you: 0,
+      failed: 1, error: 1,
+      running: 2, working: 2,
+      done: 3, completed: 3, waiting_input: 3, waiting_reply: 3,
+      idle: 4, closed: 5, offline: 5
+    };
+    const urgency = (s) => s.isOpen === false ? 5 : (statePriority[s.state] ?? 4);
+    filtered.sort((a, b) => urgency(a) - urgency(b));
 
     const sessionsSig = JSON.stringify({
       activeFilter,
@@ -973,6 +971,7 @@
         s.title,
         s.pid,
         s.turns,
+        s.context,
         s.tokens && s.tokens.total,
         s.tokens && s.tokens.effective,
         s.tokens && s.tokens.input,
@@ -1071,11 +1070,15 @@
             <div class="sr-right">
               <span class="sr-state-tag st-${escapeHtml(s.state)}">${escapeHtml(compactStateLabel(s))}</span>
               <span class="sr-tok-pill">${fmtNumber(totTok)}</span>
+              ${s.provider === 'claude' && s.isOpen && Number.isFinite(s.context?.usedPct)
+                ? `<span class="sr-context" title="Contexto: ${fmtNumber(s.context.used)} / ${fmtNumber(s.context.limit)} tokens" role="meter" aria-label="Contexto usado" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.min(100, s.context.usedPct)}">
+                    <span>Ctx ${s.context.usedPct}%</span><span class="sr-context-track"><span style="width:${Math.min(100, Math.max(0, s.context.usedPct))}%"></span></span>
+                  </span>` : ''}
               <span class="sr-time">${fmtRelativeTime(s.updatedAt)}</span>
 
               <div class="sr-actions">
                 <button class="btn-row-icon btn-chat" data-action="chat" data-id="${escapeHtml(s.id)}" title="Ver conversación en vivo y responder remotamente" aria-label="Ver conversación en vivo">💬</button>
-                <button class="btn-row-icon ${isPinned ? 'pinned-active' : ''}" data-action="pin" data-id="${escapeHtml(s.id)}" title="${isPinned ? 'Desfijar consola' : 'Fijar consola arriba'}" aria-label="${isPinned ? 'Desfijar consola' : 'Fijar consola arriba'}">📌</button>
+                <button class="btn-row-icon ${isPinned ? 'pinned-active' : ''}" data-action="pin" data-id="${escapeHtml(s.id)}" title="${isPinned ? 'Quitar resaltado' : 'Resaltar consola'}" aria-label="${isPinned ? 'Quitar resaltado' : 'Resaltar consola'}">📌</button>
                 ${
                   s.hasUnreadAlert
                     ? `<button class="btn-row-icon" data-action="ack" data-id="${escapeHtml(s.id)}" title="Marcar alerta como vista" aria-label="Marcar alerta como vista">✓</button>`
@@ -1124,7 +1127,7 @@
     const tokensSig = JSON.stringify([
       clQuota.source, clQuota.fiveHourPct, clQuota.sevenDayPct, clQuota.stale, clQuota.lastKnownFiveHourPct,
       clQuota.lastKnownSevenDayPct, clQuota.updatedAt || 0, clQuota.nextFiveHourResetAt || 0,
-      clQuota.nextWeeklyResetAt || 0, clQuota.resets, clQuota.history,
+      clQuota.nextWeeklyResetAt || 0, clQuota.resets, clQuota.history, clQuota.modelWeeklyLimits,
       agyQuota, analytics, Math.floor(Date.now() / 60000)
     ]);
     if (tokensSig === lastTokensSig) return;
@@ -1140,6 +1143,15 @@
     document.getElementById('tokens-sd-pct').textContent = clQuota.sevenDayPct != null ? `${clSd}%` : '--%';
     setClaudeBar(document.getElementById('tokens-fh-bar'), clQuota.fiveHourPct);
     setClaudeBar(document.getElementById('tokens-sd-bar'), clQuota.sevenDayPct);
+    const modelWeekly = document.getElementById('claude-model-weekly');
+    if (modelWeekly) {
+      modelWeekly.innerHTML = (clQuota.modelWeeklyLimits || [])
+        .filter((b) => Number.isFinite(b.usedPct) && b.resetsAt > Date.now())
+        .map((b) => `<div class="model-weekly-limit">
+          <div class="qb-foot">${escapeHtml(b.model)} · ${b.usedPct}% · resetea en ${fmtCountdown(b.resetsAt)}</div>
+          <div class="qb-bar"><div class="qb-fill fill-ochre ${b.usedPct >= 90 ? 'fill-danger' : ''}" style="width:${Math.min(100, Math.max(0, b.usedPct))}%"></div></div>
+        </div>`).join('');
+    }
 
     const sdWarn = document.getElementById('tokens-sd-warning');
     if (clSd >= 90) {

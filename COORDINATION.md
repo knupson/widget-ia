@@ -1,5 +1,11 @@
 # Coordinación de trabajo
 
+## Codex — extras de cuota Claude, 2026-10-30
+
+Responsable: rama feat/claude-quota-extras. Alcance localizado: claudeCollector.js (sublímites/contexto), main.js (notificaciones/atajo), app.js (medidores y orden de sesiones), index.html y styles.css (medidores). server.js recibe la llamada al detector de umbrales; lógica nueva en services/quotaThresholds.js. Otro agente desarrolla la pestaña de uso y pruebas en otra rama.
+
+Estado: implementación terminada. `npm.cmd run check` pasó en cada paso (final: 23/23); `git diff --check` sin errores. Pruebas simuladas OK: sublímites ausentes/nulos/0/vencidos, último contexto y lectura incremental, 200k/1M, deduplicación de umbrales y cambio de reset, rechazo de cuotas obsoletas/estimadas, orden estable, atajo y registro fallido. No se abrió Electron real. Los umbrales se recuerdan sólo en memoria.
+
 ## Codex — integrado, 2026-10-29
 
 Estado: implementación terminada; `node --check` y `git diff --check` sin errores. Se comprobaron identificadores HTML únicos.
