@@ -261,6 +261,7 @@ class TunnelManager {
         const match = text.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i);
         if (match && match[0] && this.publicUrl !== match[0]) {
           this.publicUrl = match[0];
+          this.connectedAt = Date.now();
           this.status = 'connected';
           this.error = '';
           this.healthFailures = 0;
@@ -391,7 +392,10 @@ class TunnelManager {
     this.healthFailures = (this.healthFailures || 0) + 1;
     // Si el DNS del túnel murió (ENOTFOUND / HTTP 530) o acumuló 2 fallos seguidos (60s),
     // verificamos que haya internet hacia Cloudflare antes de reciclar el proceso para obtener una URL nueva.
-    const threshold = immediateIfInternetUp ? 1 : 2;
+    // Un quick tunnel recién creado puede dar 530/ENOTFOUND hasta registrarse en el edge: reciclarlo ahí
+    // sólo cambia la URL (y deja muerta la que ya tiene el celular), así que los primeros 2 min se tolera más.
+    const young = Date.now() - (this.connectedAt || 0) < 120000;
+    const threshold = young ? 3 : immediateIfInternetUp ? 1 : 2;
     if (this.healthFailures < threshold) return;
 
     const probeReq = https.get(

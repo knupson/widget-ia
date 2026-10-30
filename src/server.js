@@ -825,7 +825,9 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
     const clientIp = clientIpOf(req);
     const rateLimited = isAuthRateLimited(clientIp);
     const reqToken = extractRequestToken(req, urlObj);
-    const hasValidToken = !rateLimited && isValidRemoteToken(reqToken);
+    // El rate limit frena intentos con token inválido, nunca uno válido: tras rotar el token, una app vieja
+    // reintentando con la clave anterior bloqueaba la IP del celular y con ella la descarga del QR.
+    const hasValidToken = isValidRemoteToken(reqToken);
     const cookieHeaders = {};
     if (hasValidToken && urlObj.searchParams.get('token')) {
       cookieHeaders['Set-Cookie'] = tokenCookie(reqToken);
