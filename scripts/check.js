@@ -14,6 +14,9 @@ const walk = (dir) => {
   }
 };
 walk(path.join(root, 'src'));
+if (fs.existsSync(path.join(root, 'test'))) {
+  walk(path.join(root, 'test'));
+}
 
 let failed = 0;
 for (const file of files) {
