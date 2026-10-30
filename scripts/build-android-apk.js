@@ -158,9 +158,10 @@ function getLocalLanIp() {
   return '192.168.0.1';
 }
 
-function fetchLiveState(port) {
+function fetchLiveState(port, token) {
   return new Promise((resolve) => {
-    const req = http.get(`http://127.0.0.1:${port}/api/state`, { timeout: 1200 }, (res) => {
+    const headers = token ? { Authorization: `Bearer ${token}` } : {};
+    const req = http.get(`http://127.0.0.1:${port}/api/state`, { timeout: 1200, headers }, (res) => {
       let body = '';
       res.on('data', (c) => (body += c));
       res.on('end', () => {
@@ -191,7 +192,7 @@ async function main() {
 
   const cfg = fs.existsSync(CONFIG_PATH) ? JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')) : {};
   const port = cfg.port || 19876;
-  const live = await fetchLiveState(port);
+  const live = await fetchLiveState(port, cfg.remoteAuthToken);
 
   const lanIp = (live && live.mobileAccess && live.mobileAccess.lanIp) || getLocalLanIp();
   const lanBase = `http://${lanIp}:${port}`;

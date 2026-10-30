@@ -36,8 +36,36 @@ public final class ConfigStore {
 
     private ConfigStore() {}
 
+    private static volatile boolean buildDefaultsApplied = false;
+
     public static SharedPreferences prefs(Context ctx) {
-        return ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        SharedPreferences p = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        if (!buildDefaultsApplied) applyBuildDefaultsIfChanged(p);
+        return p;
+    }
+
+    /**
+     * Las SharedPreferences sobreviven a una actualización del APK. Si el APK trae credenciales distintas
+     * a las del build anterior (token/tópico rotados), las guardadas quedan muertas: se reemplazan y se
+     * olvidan las bases conocidas (el túnel viejo ya no existe; se redescubre por LAN o ntfy).
+     */
+    private static synchronized void applyBuildDefaultsIfChanged(SharedPreferences p) {
+        if (buildDefaultsApplied) return;
+        buildDefaultsApplied = true;
+        String token = cleanBase(DEFAULT_AUTH_TOKEN);
+        if (token.isEmpty()) return; // APK sin credenciales inyectadas: respetar lo configurado a mano
+        String fingerprint = Integer.toHexString((token + "|" + cleanBase(DEFAULT_NTFY_TOPIC)).hashCode());
+        if (fingerprint.equals(p.getString("build_defaults_fp", ""))) return;
+        p.edit()
+                .putString("build_defaults_fp", fingerprint)
+                .putString("auth_token", token)
+                .putString("ntfy_topic", cleanBase(DEFAULT_NTFY_TOPIC))
+                .putString("lan_base", cleanBase(DEFAULT_LAN_BASE))
+                .putString("tunnel_base", cleanBase(DEFAULT_TUNNEL_BASE))
+                .remove("last_active_base")
+                .remove("last_good_json")
+                .putLong("last_lan_fail_ts", 0L)
+                .commit();
     }
 
     public static String getLanBase(Context ctx) {
