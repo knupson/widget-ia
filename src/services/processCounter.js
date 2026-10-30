@@ -20,7 +20,8 @@ function refresh() {
         const processes = Array.isArray(parsed) ? parsed : [parsed];
         const named = (name) => processes.filter((p) => String(p.Name).toLowerCase() === name);
         const codex = named('codex.exe').filter((p) => !String(p.CommandLine || '').toLowerCase().includes(' app-server'));
-        const agy = named('agy.exe');
+        // `agy models` lo lanza el propio widget para renovar el token de cuota: no es una sesión
+        const agy = named('agy.exe').filter((p) => !/\smodels\s*$/i.test(String(p.CommandLine || '')));
         const topLevelCount = (items) => {
           const ids = new Set(items.map((p) => Number(p.ProcessId)));
           return items.filter((p) => !ids.has(Number(p.ParentProcessId))).length;

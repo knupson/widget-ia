@@ -16,6 +16,28 @@ let apiQuotaCache = {
 };
 
 const OFFICIAL_QUOTA_TTL_MS = 10 * 60000;
+const CLI_REFRESH_MIN_INTERVAL_MS = 10 * 60000;
+let lastCliRefreshAt = 0;
+
+/**
+ * El access token de agy dura 1 h y el widget no tiene el client OAuth para renovarlo. `agy models` sólo
+ * lista modelos (no consume cuota) y como efecto renueva el token en el Credential Manager.
+ */
+function refreshAgyTokenViaCli() {
+  const now = Date.now();
+  if (now - lastCliRefreshAt < CLI_REFRESH_MIN_INTERVAL_MS) return Promise.resolve(false);
+  lastCliRefreshAt = now;
+  const local = process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'agy', 'bin', 'agy.exe') : '';
+  const bin = local && fs.existsSync(local) ? local : 'agy';
+  return new Promise((resolve) => {
+    execFile(bin, ['models'], { windowsHide: true, timeout: 40000 }, (err) => resolve(!err));
+  });
+}
+
+function credExpiresSoon(cred, now = Date.now()) {
+  const expiry = cred && cred.token && cred.token.expiry ? Date.parse(cred.token.expiry) || 0 : 0;
+  return expiry > 0 && expiry - now < 2 * 60000;
+}
 
 const CRED_PS_SCRIPT = `
 Add-Type -TypeDefinition @'
@@ -233,8 +255,9 @@ function triggerBackgroundOfficialQuotaRefresh(now = Date.now()) {
 
       if (!apiQuotaCache.cred) return;
 
-      let res = await fetchBusinessAiCodeQuota(apiQuotaCache.cred);
+      let res = credExpiresSoon(apiQuotaCache.cred) ? { httpStatus: 401 } : await fetchBusinessAiCodeQuota(apiQuotaCache.cred);
       if (res && res.httpStatus === 401) {
+        await refreshAgyTokenViaCli();
         const freshCred = await loadAgyCredentialFromKeyring();
         if (freshCred) {
           apiQuotaCache.cred = freshCred;
