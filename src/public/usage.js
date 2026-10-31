@@ -387,11 +387,9 @@
 
     function isUsageTabVisible() {
       const pane = document.getElementById('tab-usage');
-      if (!pane || !pane.classList.contains('active')) return false;
-      if (typeof document.visibilityState === 'string' && document.visibilityState === 'hidden') {
-        return false;
-      }
-      return true;
+      // Sólo la pestaña activa: el widget se muestra con showInactive() y Electron
+      // puede reportar visibilityState 'hidden' con la ventana a la vista.
+      return Boolean(pane && pane.classList.contains('active'));
     }
 
     function renderHistoryChart(histData) {
