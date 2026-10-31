@@ -304,6 +304,7 @@
         Consolas <span id="tab-badge-sessions" class="tab-badge">0</span>
       </button>
       <button class="tab-btn" data-tab="tokens">Cuotas y Tokens</button>
+      <button class="tab-btn" data-tab="usage">Uso</button>
       <button class="tab-btn" data-tab="remotes">
         Remotos / Hooks <span id="tab-badge-remotes" class="tab-badge hidden">0</span>
       </button>
@@ -476,6 +477,70 @@
             <h3>Top Proyectos por Consumo</h3>
           </div>
           <div id="top-projects-list" class="top-projects-list"></div>
+        </div>
+      </section>
+
+      <!-- PESTAÑA USO: HISTORIAL DE CUOTA, ACTIVIDAD 6 MESES Y PROYECTOS -->
+      <section id="tab-usage" class="tab-pane">
+        <!-- Gráfico Histórico de Cuota (%) -->
+        <div class="section-card">
+          <div class="section-header">
+            <h3>📈 Evolución de Cuota Oficial (%)</h3>
+            <div class="usage-range-bar" role="group" aria-label="Rango temporal">
+              <button type="button" class="usage-range-btn" data-usage-range="1h">1h</button>
+              <button type="button" class="usage-range-btn active" data-usage-range="24h">24h</button>
+              <button type="button" class="usage-range-btn" data-usage-range="7d">7d</button>
+              <button type="button" class="usage-range-btn" data-usage-range="30d">30d</button>
+            </div>
+          </div>
+          <div id="usage-history-legend" class="usage-legend-row"></div>
+          <div id="usage-history-chart-wrap" class="usage-chart-wrap">
+            <div class="usage-empty-box">Cargando historial de cuota...</div>
+          </div>
+        </div>
+
+        <!-- Mapa de Calor de Actividad (6 Meses) -->
+        <div class="section-card">
+          <div class="section-header">
+            <h3>🗓️ Actividad de Tokens (Últimos 6 Meses)</h3>
+            <span id="usage-activity-summary" class="badge-pill">Calculando...</span>
+          </div>
+          <div id="usage-activity-heatmap-wrap" class="usage-heatmap-wrap">
+            <div class="usage-empty-box">Cargando mapa de actividad...</div>
+          </div>
+        </div>
+
+        <!-- Tabla de Tokens + Costo Estimado por Proyecto -->
+        <div class="section-card">
+          <div class="section-header">
+            <h3>📁 Uso y Costo Estimado por Proyecto</h3>
+            <div class="section-actions">
+              <span id="usage-projects-totals" class="badge-pill">0 proy.</span>
+              <button type="button" id="btn-usage-refresh" class="btn-mini-action" title="Reescanear transcripciones locales">↻ Actualizar</button>
+            </div>
+          </div>
+          <p id="usage-pricing-note" class="card-desc usage-estimate-note">
+            💡 Costo en USD estimado según tarifas de lista de API por familia (Opus / Sonnet / Haiku / Codex). Los planes Pro/Max/Team no cobran por token.
+          </p>
+          <div class="token-table-wrap">
+            <table class="token-table usage-projects-table">
+              <thead>
+                <tr>
+                  <th>Proyecto</th>
+                  <th>Entrada</th>
+                  <th>Salida</th>
+                  <th>Caché</th>
+                  <th>Total</th>
+                  <th>USD Est.</th>
+                </tr>
+              </thead>
+              <tbody id="usage-projects-tbody">
+                <tr>
+                  <td colspan="6" class="empty-state">Cargando proyectos...</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </div>
       </section>
 
@@ -832,6 +897,7 @@
   <div id="toast" class="toast hidden">Copiado al portapapeles</div>
 
   <script src="/vendor/qrcode.js"></script>
+  <script src="/usage.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

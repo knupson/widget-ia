@@ -2456,10 +2456,10 @@ body.mode-android-widget #panel-view {
     padding: 6px 7px;
   }
 
-  /* Navegación de 4 pestañas en 1 sola línea sin romper texto */
+  /* Navegación de 5 pestañas en 1 sola línea sin romper texto */
   body.mode-web .tabs-nav {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
     gap: 4px;
     padding: 4px 6px 0;
   }
@@ -2686,6 +2686,297 @@ body.mode-android-widget #panel-view {
 /* Cuota de Claude sin lectura vigente: track punteado, sin relleno (no es un 0% real) */
 .is-unknown {
   background-image: repeating-linear-gradient(90deg, rgba(224, 159, 62, 0.22) 0 4px, transparent 4px 8px);
+}
+
+/* =========================================================
+   PESTAÑA USO: GRÁFICO HISTÓRICO, HEATMAP 6 MESES Y PROYECTOS
+   ========================================================= */
+.usage-range-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: rgba(15, 11, 8, 0.85);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  padding: 2px;
+}
+
+.usage-range-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2.5px 7px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+
+.usage-range-btn:hover {
+  color: var(--text-primary);
+}
+
+.usage-range-btn.active {
+  background: rgba(255, 107, 26, 0.22);
+  color: #fed7aa;
+  box-shadow: inset 0 0 0 1px rgba(255, 107, 26, 0.45);
+}
+
+.usage-legend-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin-bottom: 6px;
+  font-size: 10.2px;
+  color: var(--text-secondary);
+}
+
+.usage-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.usage-legend-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.usage-svg-container {
+  position: relative;
+  width: 100%;
+  background: rgba(13, 10, 7, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 7px;
+  padding: 4px 2px 2px;
+}
+
+.usage-history-svg {
+  width: 100%;
+  height: 156px;
+  display: block;
+  cursor: crosshair;
+}
+
+.usage-grid-line {
+  stroke: rgba(255, 255, 255, 0.07);
+  stroke-width: 1;
+}
+
+.usage-grid-vline {
+  stroke: rgba(255, 255, 255, 0.045);
+  stroke-width: 1;
+  stroke-dasharray: 2 3;
+}
+
+.usage-warn-line {
+  stroke: rgba(245, 158, 11, 0.35);
+  stroke-width: 1;
+  stroke-dasharray: 4 3;
+}
+
+.usage-axis-lbl {
+  fill: var(--text-muted);
+  font-size: 9.5px;
+  font-family: var(--font-mono, monospace);
+}
+
+.usage-tip-lbl {
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.usage-hover-line {
+  stroke: rgba(255, 247, 237, 0.45);
+  stroke-width: 1;
+  stroke-dasharray: 2 2;
+  pointer-events: none;
+}
+
+.usage-floating-tip {
+  position: absolute;
+  top: 8px;
+  background: rgba(18, 14, 10, 0.96);
+  border: 1px solid rgba(255, 107, 26, 0.45);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 9.8px;
+  color: var(--text-primary);
+  pointer-events: none;
+  z-index: 6;
+  min-width: 138px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.55);
+}
+
+.usage-tip-head {
+  font-weight: 700;
+  color: #fed7aa;
+  margin-bottom: 3px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  padding-bottom: 2px;
+}
+
+.usage-tip-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  line-height: 1.35;
+}
+
+.usage-empty-box {
+  padding: 16px 12px;
+  text-align: center;
+  font-size: 10.6px;
+  color: var(--text-muted);
+  background: rgba(13, 10, 7, 0.55);
+  border: 1px dashed rgba(255, 255, 255, 0.08);
+  border-radius: 7px;
+}
+
+.usage-cal-container {
+  background: rgba(13, 10, 7, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 7px;
+  padding: 6px 8px;
+}
+
+.usage-cal-svg {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+.usage-cal-lbl {
+  fill: var(--text-muted);
+  font-size: 8.6px;
+}
+
+.usage-cal-cell {
+  stroke: rgba(255, 255, 255, 0.04);
+  stroke-width: 0.8;
+  transition: stroke 0.12s ease;
+}
+
+.usage-cal-cell:hover {
+  stroke: #fff7ed;
+  stroke-width: 1.3;
+}
+
+.usage-cal-cell.is-today {
+  stroke: #fbbf24;
+  stroke-width: 1.2;
+}
+
+.usage-cal-cell.level-0,
+.usage-scale-box.level-0 {
+  fill: rgba(255, 255, 255, 0.05);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.usage-cal-cell.level-1,
+.usage-scale-box.level-1 {
+  fill: rgba(255, 107, 26, 0.25);
+  background: rgba(255, 107, 26, 0.25);
+}
+
+.usage-cal-cell.level-2,
+.usage-scale-box.level-2 {
+  fill: rgba(255, 107, 26, 0.48);
+  background: rgba(255, 107, 26, 0.48);
+}
+
+.usage-cal-cell.level-3,
+.usage-scale-box.level-3 {
+  fill: rgba(255, 107, 26, 0.74);
+  background: rgba(255, 107, 26, 0.74);
+}
+
+.usage-cal-cell.level-4,
+.usage-scale-box.level-4 {
+  fill: #ff6b1a;
+  background: #ff6b1a;
+}
+
+.usage-cal-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-top: 5px;
+  flex-wrap: wrap;
+}
+
+.usage-cal-scale {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.usage-scale-box {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  display: inline-block;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.usage-estimate-note {
+  margin-bottom: 7px;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.usage-proj-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 140px;
+}
+
+.usage-proj-top {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.usage-proj-name {
+  color: var(--text-primary);
+  font-size: 10.8px;
+}
+
+.usage-proj-sub {
+  font-size: 9.2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}
+
+.usage-proj-bar {
+  width: 100%;
+  height: 3px;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 999px;
+  overflow: hidden;
+  margin-top: 1px;
+}
+
+.usage-proj-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #ff6b1a, #fbbf24);
+  border-radius: 999px;
+}
+
+.usage-cost-cell {
+  font-family: var(--font-mono, monospace);
+  color: #fde68a;
+  font-weight: 700;
 }
 
 /* Accesibilidad: sin animaciones ni transiciones para quien pidió reducir movimiento */

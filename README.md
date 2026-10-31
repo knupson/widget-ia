@@ -43,6 +43,10 @@
   - Con la lectura vencida, los porcentajes aparecen como `--%` con el marcador `ant.`, las barras se muestran como una pista punteada (nunca como un `0%` real) y el tooltip indica cuándo fue la última lectura y cuál era su valor. Abrí Claude Desktop para actualizarla.
   - Campos de la API: `planQuota.stale` (`true` cuando la lectura está vencida), `lastKnownFiveHourPct` / `lastKnownSevenDayPct` (último valor conocido) y `updatedAt`.
 - **Pestañas actualizadas sólo cuando cambia algo**: tablas, gráficos y listas se reconstruyen únicamente si cambian los datos visibles, así no se pierden clics, selección ni scroll.
+- **Pestaña "Uso" (Historial, Actividad de 6 Meses y Proyectos)**:
+  - **Evolución de cuota oficial (`1h` / `24h` / `7d` / `30d`)**: persiste muestras oficiales de Claude (`5h`/`7d`) y Codex (`5h`/`7d`) en `~/.claude/ai-pulse/usage-history.json` (máximo una cada ~5 min, retenidas por 30 días, sin inventar ceros cuando el dato es desconocido) y las grafica en SVG nativo (`/api/usage/history`).
+  - **Mapa de calor de actividad (6 meses / 26 semanas)**: calendario estilo GitHub con intensidad diaria de tokens y hora pico local.
+  - **Uso y costo estimado por proyecto**: agrega desde los transcripts locales de Claude y sesiones de Codex los tokens (`entrada`, `salida`, `lectura/escritura de caché`) y un costo estimado en USD según tarifas de lista de API por familia (`opus`, `sonnet`, `haiku`, `codex`), con caché incremental por `mtime` y tamaño de archivo (`/api/usage/projects`).
 
 ### 🌐 4. Monitoreo de CLIs Remotos (SSH con Llave Privada, `ntfy.sh` y Webhook)
 - **Sondeo SSH con soporte de llave privada (`-i`)**: Configurá servidores remotos (`usuario@ip`, puerto y ruta a tu clave privada como `~/.ssh/id_ed25519` o `C:\Keys\server.pem`) para monitorear sesiones remotas sin instalar agentes adicionales.
@@ -84,11 +88,13 @@ npm run build:launcher
 ```
 Esto compila `AI Pulse Widget.exe` (subsistema `winexe` con icono personalizado `assets/icon.ico`) y actualiza el acceso directo en tu Escritorio.
 
-### 4. Verificar la sintaxis del proyecto
+### 4. Verificar sintaxis y ejecutar pruebas unitarias
 ```powershell
 npm run check
+npm test
 ```
-Corre `node --check` sobre `main.js`, `preload.js`, `start-electron.js` y todo `src/**/*.js`.
+- `npm run check` corre `node --check` sobre `main.js`, `preload.js`, `start-electron.js`, `src/**/*.js` y `test/**/*.js`.
+- `npm test` ejecuta la suite de pruebas unitarias con el runner nativo de Node (`node --test test/`), sin dependencias externas.
 
 ---
 
@@ -108,7 +114,10 @@ Corre `node --check` sobre `main.js`, `preload.js`, `start-electron.js` y todo `
 | [`src/services/conversationReader.js`](src/services/conversationReader.js) | Lector del historial conversacional del chat en vivo. |
 | [`src/services/windowFocuser.js`](src/services/windowFocuser.js) | Motor Win32 (`user32.dll` + árbol de procesos CIM) para enfocar la consola o ventana exacta de cada sesión. |
 | [`src/services/hooksManager.js`](src/services/hooksManager.js) | Instalador en 1 clic de hooks locales para `~/.claude/settings.json` y `~/.gemini/antigravity-cli/hooks.json`. |
-| [`src/public/`](src/public/) | Interfaz de usuario (HTML5, CSS3 con tema *Obsidian & Ochre*, gráficas SVG y audio WebAudio sintetizado). Incluye la PWA: `manifest.json`, `sw.js` e iconos. |
+| [`src/services/usageHistory.js`](src/services/usageHistory.js) | Persistencia del historial de porcentaje de cuota oficial (`5h`/`7d` de Claude y Codex, muestreo cada ~5 min, poda a 30 días). |
+| [`src/services/projectUsage.js`](src/services/projectUsage.js) | Agregador incremental (caché por `mtime`/`size`) de actividad diaria de 6 meses y tokens + costo estimado en USD por proyecto. |
+| [`src/public/`](src/public/) | Interfaz de usuario (HTML5, CSS3 con tema *Obsidian & Ochre*, gráficas SVG, [`usage.js`](src/public/usage.js) y audio WebAudio sintetizado). Incluye la PWA: `manifest.json`, `sw.js` e iconos. |
+| [`test/`](test/) | Suite de pruebas unitarias nativas (`node --test`) para colectores, historial de cuota, agregador de proyectos y helpers de UI. |
 | [`scripts/build-launcher.js`](scripts/build-launcher.js) | Generador de iconos `.ico` multi-resolución y compilador C# para `AI Pulse Widget.exe`. |
 | [`scripts/check.js`](scripts/check.js) | Chequeo de sintaxis de todos los JS del proyecto (`npm run check`). |
 
