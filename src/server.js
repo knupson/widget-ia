@@ -458,7 +458,11 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
     // Evaluar transiciones de estado para disparar alertas automáticas
     for (const s of allSessions) {
       const prev = prevStates.get(s.id);
-      if (s.state === 'running') {
+      // Subagentes y corridas headless (agy -p, claude -p) no suenan: avisa la principal que los lanzó.
+      const silent = Boolean(s.isHeadless || s.isSubagent);
+      if (silent) {
+        unreadAlerts.delete(s.id);
+      } else if (s.state === 'running') {
         // Si volvió a trabajar, limpiar alerta pendiente
         unreadAlerts.delete(s.id);
       } else if (
@@ -478,6 +482,10 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
     const statePriority = { waiting_approval: 0, waiting_input: 1, running: 2, closed: 3 };
     allSessions.sort((a, b) => {
       if (a.isOpen !== b.isOpen) return a.isOpen ? -1 : 1;
+      // Conversaciones principales arriba; agentes (headless/subagentes) abajo
+      const aAgent = Boolean(a.isHeadless || a.isSubagent);
+      const bAgent = Boolean(b.isHeadless || b.isSubagent);
+      if (aAgent !== bAgent) return aAgent ? 1 : -1;
       if (Boolean(a.hasUnreadAlert) !== Boolean(b.hasUnreadAlert)) {
         return a.hasUnreadAlert ? -1 : 1;
       }
@@ -488,11 +496,17 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
     });
 
     const openSessions = allSessions.filter((s) => s.isOpen);
+    // Listas/permiso/activas cuentan sólo conversaciones principales: los agentes van aparte.
+    const agentSessions = openSessions.filter((s) => s.isHeadless || s.isSubagent);
+    const mainSessions = openSessions.filter((s) => !(s.isHeadless || s.isSubagent));
     const summary = {
       totalOpen: openSessions.length,
-      waitingInput: openSessions.filter((s) => s.state === 'waiting_input').length,
-      waitingApproval: openSessions.filter((s) => s.state === 'waiting_approval').length,
-      running: openSessions.filter((s) => s.state === 'running').length,
+      agentsOpen: agentSessions.length,
+      agentsRunning: agentSessions.filter((s) => s.state === 'running').length,
+      mainOpen: mainSessions.length,
+      waitingInput: mainSessions.filter((s) => s.state === 'waiting_input').length,
+      waitingApproval: mainSessions.filter((s) => s.state === 'waiting_approval').length,
+      running: mainSessions.filter((s) => s.state === 'running').length,
       remoteOpen: openSessions.filter((s) => s.isRemote).length,
       unreadAlertsCount: unreadAlerts.size,
       activeSessionTokens: openSessions.reduce((acc, s) => acc + ((s.tokens && s.tokens.total) || 0), 0)

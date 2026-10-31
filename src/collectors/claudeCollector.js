@@ -1529,6 +1529,8 @@ function collectClaudeData(hookStateOverrides = new Map()) {
         gitBranch: (parsed && parsed.gitBranch) || '',
         isOpen,
         isSubagent: false,
+        // `claude -p` / Agent SDK: lo lanza otro proceso, no es una charla principal
+        isHeadless: Boolean(activeMeta && /^sdk/.test(String(activeMeta.entrypoint || ''))),
         state, // 'running' | 'waiting_approval' | 'waiting_input' | 'closed'
         stateLabel: stateLabelMap[state] || state,
         backgroundTasksCount: parsed && parsed.activeBgCommand ? 1 : 0,
