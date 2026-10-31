@@ -261,6 +261,41 @@ public class Win32Focus {
         }
         return 0;
     }
+
+    // Título de la consola de un proceso (= nombre de su pestaña en Windows Terminal).
+    [DllImport("kernel32.dll")]
+    static extern bool FreeConsole();
+    [DllImport("kernel32.dll")]
+    static extern bool AttachConsole(uint dwProcessId);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    static extern uint GetConsoleTitle(System.Text.StringBuilder lpConsoleTitle, uint nSize);
+
+    public static string ConsoleTitleOf(int pid) {
+        if (pid <= 0) return "";
+        FreeConsole();
+        if (!AttachConsole((uint)pid)) return "";
+        var sb = new System.Text.StringBuilder(1024);
+        GetConsoleTitle(sb, 1024);
+        FreeConsole();
+        return sb.ToString();
+    }
+
+    // Todas las ventanas de nivel superior de Windows Terminal (puede haber varias por proceso).
+    // Reusa EnumWindows/GetClassName declarados arriba.
+    public static List<IntPtr> TerminalWindowsOf(int pid) {
+        var result = new List<IntPtr>();
+        EnumWindows((h, l) => {
+            uint p;
+            GetWindowThreadProcessId(h, out p);
+            if (p == (uint)pid) {
+                var sb = new System.Text.StringBuilder(256);
+                GetClassName(h, sb, 256);
+                if (sb.ToString() == "CASCADIA_HOSTING_WINDOW_CLASS") result.Add(h);
+            }
+            return true;
+        }, IntPtr.Zero);
+        return result;
+    }
 }
 "@
 
@@ -359,7 +394,40 @@ function Select-WindowsTerminalTab([IntPtr]$wtHwnd, [int]$wtPid, [int]$tabIndex)
     return $methodUsed
 }
 
-$isCurrentlyAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+# Busca la pestaña cuyo nombre coincide con el título de consola de la sesión, en TODAS las
+# ventanas de Windows Terminal. El orden de creación de procesos no sirve como índice:
+# se rompe con paneles divididos, varias ventanas o pestañas reordenadas.
+function Select-WindowsTerminalTabByTitle([int]$wtPid, [string]$tabTitle) {
+    if ($wtPid -le 0 -or [string]::IsNullOrWhiteSpace($tabTitle)) { return $null }
+    try {
+        Add-Type -AssemblyName UIAutomationClient -ErrorAction Stop
+        Add-Type -AssemblyName UIAutomationTypes -ErrorAction Stop
+        $cond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::TabItem
+        )
+        foreach ($hWin in [Win32Focus]::TerminalWindowsOf($wtPid)) {
+            $el = [System.Windows.Automation.AutomationElement]::FromHandle($hWin)
+            if (-not $el) { continue }
+            $tabItems = $el.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+            foreach ($tab in $tabItems) {
+                if ($tab.Current.Name -ne $tabTitle) { continue }
+                Focus-WindowHandle $hWin $wtPid $false | Out-Null
+                $selPattern = $null
+                if ($tab.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$selPattern)) {
+                    $selPattern.Select()
+                } else {
+                    $invPattern = $null
+                    if ($tab.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invPattern)) { $invPattern.Invoke() }
+                }
+                return @{ hwnd = $hWin; method = "uia_title($($tabItems.Count))" }
+            }
+        }
+    } catch {}
+    return $null
+}
+
+$isCurrentlyAdmin =([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
 $targetPid = ${safePid}
 $provider = "${safeProvider}"
@@ -436,6 +504,18 @@ if ($targetPid -gt 0 -and $allProcs) {
     }
 
     if ($wtPid -gt 0 -and $shellPid -gt 0) {
+        # 1º: por título de pestaña (robusto con varias ventanas, paneles y pestañas reordenadas)
+        $consoleTitle = [Win32Focus]::ConsoleTitleOf($shellPid)
+        $byTitle = Select-WindowsTerminalTabByTitle $wtPid $consoleTitle
+        if ($byTitle) {
+            Start-Sleep -Milliseconds 40
+            Restore-WidgetTopMost
+            $deskName = [Win32Focus]::GetCurrentDesktopName()
+            Write-Output "focused_wt_tab:\${wtPid}:tab=title:shell=\${shellPid}:pid=\${targetPid}:hwnd=$($byTitle.hwnd):desk=\${deskName}:method=$($byTitle.method)"
+            exit 0
+        }
+
+        # 2º (respaldo): índice según el orden de creación de las shells hijas de WindowsTerminal
         # Calcular el índice exacto de pestaña (0-based) según el orden de creación de las shells hijas de WindowsTerminal
         $shells = @($allProcs | Where-Object {
             $_.ParentProcessId -eq $wtPid -and (
