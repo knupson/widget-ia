@@ -1835,6 +1835,18 @@ input[type="range"] {
   cursor: pointer;
 }
 
+/* Agentes (agy -p, claude -p, subagentes): atenuados para no competir con las principales */
+.session-row.is-agent {
+  opacity: 0.6;
+  border-left-style: dashed;
+  background: #120d0a;
+}
+
+.session-row.is-agent:hover,
+.session-row.is-agent:focus-within {
+  opacity: 1;
+}
+
 .btn-row-icon.btn-chat {
   background: rgba(224, 159, 62, 0.14);
   border-color: rgba(224, 159, 62, 0.38);

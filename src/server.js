@@ -482,6 +482,10 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
     const statePriority = { waiting_approval: 0, waiting_input: 1, running: 2, closed: 3 };
     allSessions.sort((a, b) => {
       if (a.isOpen !== b.isOpen) return a.isOpen ? -1 : 1;
+      // Conversaciones principales arriba; agentes (headless/subagentes) abajo
+      const aAgent = Boolean(a.isHeadless || a.isSubagent);
+      const bAgent = Boolean(b.isHeadless || b.isSubagent);
+      if (aAgent !== bAgent) return aAgent ? 1 : -1;
       if (Boolean(a.hasUnreadAlert) !== Boolean(b.hasUnreadAlert)) {
         return a.hasUnreadAlert ? -1 : 1;
       }
@@ -494,6 +498,8 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
     const openSessions = allSessions.filter((s) => s.isOpen);
     const summary = {
       totalOpen: openSessions.length,
+      agentsOpen: openSessions.filter((s) => s.isHeadless || s.isSubagent).length,
+      mainOpen: openSessions.filter((s) => !(s.isHeadless || s.isSubagent)).length,
       waitingInput: openSessions.filter((s) => s.state === 'waiting_input').length,
       waitingApproval: openSessions.filter((s) => s.state === 'waiting_approval').length,
       running: openSessions.filter((s) => s.state === 'running').length,

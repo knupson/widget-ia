@@ -250,6 +250,28 @@
     return `${days}d`;
   }
 
+  // Agente = lo lanzó otro proceso (agy -p, claude -p) o es subagente: no es una charla principal.
+  function isAgentSession(s) {
+    return Boolean(s && (s.isHeadless || s.isSubagent));
+  }
+
+  function providerShortLabel(s) {
+    if (s.isRemote) return 'REM';
+    const base = s.provider === 'claude'
+      ? (s.surface === 'app' ? 'CL·APP' : 'CLAUDE')
+      : s.provider === 'codex' ? 'CODEX' : 'AGY';
+    if (s.isHeadless) return `${base}·AGENTE`;
+    if (s.isSubagent) return `${base}·SUB`;
+    return base;
+  }
+
+  function openBreakdownText(sum) {
+    const agents = sum.agentsOpen || 0;
+    const main = sum.mainOpen ?? Math.max(0, (sum.totalOpen || 0) - agents);
+    const mainTxt = `${main} ${main === 1 ? 'principal' : 'principales'}`;
+    return agents > 0 ? `${mainTxt} + ${agents} ${agents === 1 ? 'agente' : 'agentes'}` : mainTxt;
+  }
+
   function escapeHtml(str) {
     return String(str || '')
       .replace(/&/g, '&amp;')
@@ -589,6 +611,7 @@
       sum.running || 0,
       sum.unreadAlertsCount || 0,
       sum.totalOpen || 0,
+      sum.agentsOpen || 0,
       clQuota.source, clQuota.fiveHourPct,
       clQuota.sevenDayPct,
       clQuota.nextFiveHourResetAt || 0,
@@ -762,7 +785,7 @@
     // Subtítulo y chip de velocidad en el header
     const liveStatus = document.getElementById('header-live-status');
     if (liveStatus) {
-      liveStatus.textContent = `${sum.totalOpen || 0} abiertas · ${waitingTotal} listas · ${sum.running || 0} activas`;
+      liveStatus.textContent = `${openBreakdownText(sum)} · ${waitingTotal} listas · ${sum.running || 0} activas`;
     }
 
     const burnChip = document.getElementById('header-burn-chip');
@@ -830,7 +853,7 @@
       approvalSub.textContent = `⚠️ ${sum.waitingApproval} pidiendo permiso`;
       approvalSub.style.color = '#fde047';
     } else {
-      approvalSub.textContent = `${sum.totalOpen || 0} consolas abiertas ahora`;
+      approvalSub.textContent = `${openBreakdownText(sum)} ahora`;
       approvalSub.style.color = '';
     }
 
@@ -948,6 +971,8 @@
       const pinA = pinnedIds.has(a.id);
       const pinB = pinnedIds.has(b.id);
       if (pinA !== pinB) return pinA ? -1 : 1;
+      // Principales arriba; agentes (agy -p, claude -p, subagentes) al final
+      if (isAgentSession(a) !== isAgentSession(b)) return isAgentSession(a) ? 1 : -1;
       return urgency(a) - urgency(b) || (b.updatedAt || 0) - (a.updatedAt || 0);
     });
 
@@ -971,6 +996,7 @@
         s.surface,
         s.isRemote,
         s.isSubagent,
+        s.isHeadless,
         s.workspace,
         s.projectName,
         s.title,
@@ -1012,15 +1038,7 @@
           ? 'prov-claude'
           : s.provider === 'codex' ? 'prov-codex' : 'prov-agy';
 
-        const shortProv = s.isRemote
-          ? 'REM'
-          : s.provider === 'claude'
-          ? s.surface === 'app'
-            ? 'CL·APP'
-            : 'CLAUDE'
-          : s.provider === 'codex' ? 'CODEX' : s.isSubagent
-          ? 'AGY·SUB'
-          : 'AGY';
+        const shortProv = providerShortLabel(s);
 
         const dotClass =
           s.state === 'waiting_approval'
@@ -1054,7 +1072,7 @@
           (s.backgroundTasksCount || 0) > 0;
 
         return `
-        <article class="session-row state-${escapeHtml(s.state)} ${isPinned ? 'is-pinned' : ''} ${s.hasUnreadAlert ? 'unread-highlight' : ''}"
+        <article class="session-row state-${escapeHtml(s.state)} ${isPinned ? 'is-pinned' : ''} ${s.hasUnreadAlert ? 'unread-highlight' : ''} ${isAgentSession(s) ? 'is-agent' : ''}"
                  data-session-id="${escapeHtml(s.id)}"
                  data-raw-session-id="${escapeHtml(s.sessionId || s.id)}"
                  data-pid="${escapeHtml(s.pid || '')}"
@@ -1864,13 +1882,7 @@
         : sessionObj.provider === 'claude'
         ? 'prov-claude'
         : sessionObj.provider === 'codex' ? 'prov-codex' : 'prov-agy';
-      const shortProv = sessionObj.isRemote
-        ? 'REM'
-        : sessionObj.provider === 'claude'
-        ? sessionObj.surface === 'app'
-          ? 'CL·APP'
-          : 'CLAUDE'
-        : sessionObj.provider === 'codex' ? 'CODEX' : 'AGY';
+      const shortProv = providerShortLabel(sessionObj);
       provPill.className = `provider-pill ${provClass}`;
       provPill.textContent = shortProv;
     }
