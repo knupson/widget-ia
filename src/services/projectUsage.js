@@ -1,7 +1,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { Worker, isMainThread, parentPort, workerData } = require('node:worker_threads');
+const { Worker, isMainThread, parentPort, workerData, threadId } = require('node:worker_threads');
 
 const DAY_MS = 24 * 3600 * 1000;
 const SIX_MONTHS_DAYS = 183; // ~6 meses (26 semanas + margen)
@@ -9,6 +9,11 @@ const STREAM_CHUNK_BYTES = 64 * 1024; // 64 KB por bloque de lectura incremental
 const MAX_LINE_CARRY_BYTES = 4 * 1024 * 1024; // Límite defensivo ante líneas corruptas sin '\n'
 const MAX_SEEN_IDS_PER_FILE = 2500; // Cota de memoria por archivo para deduplicación de streaming
 const DEFAULT_MAX_CACHED_FILES = 2500; // Cota de archivos agregados en caché
+const CACHE_SCHEMA_VERSION = 1; // Versión del esquema de caché en disco (ignorar si no coincide)
+const DEFAULT_CACHE_PATH = path.join(os.homedir(), '.claude', 'ai-pulse', 'project-usage-cache.json');
+const DEFAULT_CACHE_SAVE_THROTTLE_MS = 30 * 1000; // Máximo una escritura a disco cada ~30 s
+const MAX_PERSISTED_SEEN_GROUPS_PER_FILE = 250; // Cota de entradas de deduplicación persistidas por archivo
+const FILE_HEAD_HASH_BYTES = 128; // Bytes iniciales para huella rápida de identidad de archivo
 
 // Tarifas oficiales verificadas por modelo y versión en USD por millón de tokens (USD / 1M tokens).
 // Fuentes y fecha de verificación (2026-10-30):
@@ -575,20 +580,64 @@ function parseCodexTranscriptContent(content) {
 }
 
 const sharedReadBuffer = Buffer.allocUnsafe(STREAM_CHUNK_BYTES);
+const headHashBuffer = Buffer.allocUnsafe(FILE_HEAD_HASH_BYTES);
+
+function computeBufferHeadHash(buf, len = buf.length) {
+  const n = Math.min(FILE_HEAD_HASH_BYTES, len, buf.length);
+  if (n <= 0) return 0;
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < n; i++) {
+    hash ^= buf[i];
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash >>> 0;
+}
+
+function readFileHeadHash(filePath, maxBytes = FILE_HEAD_HASH_BYTES) {
+  const toRead = Math.min(FILE_HEAD_HASH_BYTES, Math.max(0, Number(maxBytes) || 0));
+  if (toRead <= 0) return 0;
+  let fd = null;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const bytesRead = fs.readSync(fd, headHashBuffer, 0, toRead, 0);
+    if (bytesRead <= 0) return 0;
+    return computeBufferHeadHash(headHashBuffer, bytesRead);
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+  }
+}
 
 /**
  * Lee un archivo JSONL por bloques desde `startOffset` hasta `targetSize` sin cargar el archivo entero
- * ni hacer `.split()`. Devuelve el nuevo offset de byte confirmado tras la última línea completa.
+ * ni hacer `.split()`. Devuelve el nuevo offset de byte confirmado, cualquier resto parcial de línea (`carry`)
+ * y la huella de cabecera (`headHash`) si se leyó desde el byte 0.
  */
-function streamJsonlFileIncremental(filePath, startOffset, targetSize, onLine) {
+function streamJsonlFileIncremental(filePath, startOffset, targetSize, onLine, initialCarry = '') {
   if (targetSize <= startOffset) {
-    return { nextOffset: startOffset, bytesRead: 0, linesProcessed: 0 };
+    return {
+      nextOffset: startOffset,
+      bytesRead: 0,
+      linesProcessed: 0,
+      carry: typeof initialCarry === 'string' ? initialCarry : '',
+      headHash: null
+    };
   }
 
   const fd = fs.openSync(filePath, 'r');
   let pos = startOffset;
   let lastCommittedOffset = startOffset;
-  let carryBuf = null;
+  let carryBuf =
+    typeof initialCarry === 'string' && initialCarry.length > 0
+      ? Buffer.from(initialCarry, 'utf8')
+      : null;
+  let carryOut = '';
+  let headHash = null;
   let linesProcessed = 0;
 
   try {
@@ -596,6 +645,10 @@ function streamJsonlFileIncremental(filePath, startOffset, targetSize, onLine) {
       const toRead = Math.min(STREAM_CHUNK_BYTES, targetSize - pos);
       const bytesRead = fs.readSync(fd, sharedReadBuffer, 0, toRead, pos);
       if (bytesRead <= 0) break;
+
+      if (pos === 0 && headHash === null) {
+        headHash = computeBufferHeadHash(sharedReadBuffer, bytesRead);
+      }
 
       const slice = sharedReadBuffer.subarray(0, bytesRead);
       const bufferStartFileOffset = pos - (carryBuf ? carryBuf.length : 0);
@@ -635,7 +688,8 @@ function streamJsonlFileIncremental(filePath, startOffset, targetSize, onLine) {
       pos += bytesRead;
     }
 
-    // Si quedó una última línea sin '\n' al final del archivo, procesarla solo si es JSON válido completo
+    // Si quedó una última línea sin '\n' al final del archivo, procesarla si es JSON válido completo;
+    // de lo contrario conservarla en `carry` y avanzar el offset hasta `pos` para continuar en el próximo escaneo.
     if (carryBuf && carryBuf.length > 0) {
       let end = carryBuf.length;
       if (end > 0 && carryBuf[end - 1] === 0x0d) end--;
@@ -644,8 +698,16 @@ function streamJsonlFileIncremental(filePath, startOffset, targetSize, onLine) {
         if (onLine(lineStr)) {
           linesProcessed++;
           lastCommittedOffset = pos;
+          carryOut = '';
+        } else {
+          carryOut = carryBuf.toString('utf8');
+          lastCommittedOffset = pos;
         }
       } else if (end === 0) {
+        lastCommittedOffset = pos;
+        carryOut = '';
+      } else {
+        carryOut = carryBuf.toString('utf8');
         lastCommittedOffset = pos;
       }
     }
@@ -658,17 +720,22 @@ function streamJsonlFileIncremental(filePath, startOffset, targetSize, onLine) {
   return {
     nextOffset: lastCommittedOffset,
     bytesRead: Math.max(0, lastCommittedOffset - startOffset),
-    linesProcessed
+    linesProcessed,
+    carry: carryOut,
+    headHash
   };
 }
 
 function pruneFileStateDays(state, cutoffDayKey) {
-  if (!state || !state.daily) return;
+  if (!state || !state.daily) return false;
+  let pruned = false;
   for (const dayKey of Object.keys(state.daily)) {
     if (dayKey < cutoffDayKey) {
       delete state.daily[dayKey];
+      pruned = true;
     }
   }
+  return pruned;
 }
 
 /**
@@ -1027,19 +1094,568 @@ function isUnchangedCacheEntry(cached, fileMeta) {
   return cached.size === fileMeta.size && cached.mtimeMs === fileMeta.mtimeMs && cached.offset === fileMeta.size;
 }
 
+function sanitizeTokens(src) {
+  const t = emptyTokens();
+  if (src && typeof src === 'object') {
+    addTokens(t, src, 1);
+  }
+  return t;
+}
+
 /**
- * Escáner incremental con seguimiento de byte offset por archivo y caché acotada en memoria.
+ * Recalcula todos los costos en USD de un resumen de uso a partir únicamente de sus conteos
+ * de tokens y de la tabla de precios vigente (`MODEL_PRICES_USD_PER_M` / `PRICES_AS_OF`).
  */
-function createIncrementalScanner({
-  claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects'),
-  codexSessionsDir = path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'sessions'),
-  maxCachedFiles = DEFAULT_MAX_CACHED_FILES
-} = {}) {
-  const fileCache = new Map(); // filePath -> { offset, size, mtimeMs, ino, dev, birthtimeMs, state, record }
+function repriceUsageReport(rawReport, priceTable = MODEL_PRICES_USD_PER_M) {
+  if (!rawReport || typeof rawReport !== 'object') return null;
+  const totalByModel = {};
+  const allUnpriced = new Set();
+  const totalsTokens = sanitizeTokens(rawReport.totals && rawReport.totals.tokens);
+
+  const projects = Array.isArray(rawReport.projects)
+    ? rawReport.projects.map((proj) => {
+        const projTokens = sanitizeTokens(proj && proj.tokens);
+        const byModel = {};
+        const rawModels = Array.isArray(proj && proj.models) ? proj.models : [];
+        for (const m of rawModels) {
+          if (!m || !m.model) continue;
+          const tok = sanitizeTokens(m.tokens);
+          const provider = m.provider || 'claude';
+          byModel[m.model] = { provider, tokens: tok };
+          if (!totalByModel[m.model]) {
+            totalByModel[m.model] = { provider, tokens: emptyTokens() };
+          }
+          addTokens(totalByModel[m.model].tokens, tok);
+        }
+
+        const costInfo = estimateByModelCostUsd(byModel, priceTable);
+        for (const um of costInfo.unpricedModels) allUnpriced.add(um);
+
+        const modelsSummary = Object.entries(byModel)
+          .map(([model, info]) => ({
+            model,
+            pricingKey: resolveModelPricingKey(model, priceTable),
+            family: resolveModelFamily(model, info.provider),
+            provider: info.provider,
+            tokens: info.tokens,
+            estimatedCostUsd: estimateModelCostUsd(info.tokens, model, info.provider, priceTable)
+          }))
+          .sort((a, b) => b.tokens.total - a.tokens.total);
+
+        return {
+          name: (proj && proj.name) || 'sin-proyecto',
+          path: (proj && proj.path) || 'sin-proyecto',
+          providers: Array.isArray(proj && proj.providers) ? proj.providers : [],
+          sessions: Math.max(1, Number(proj && proj.sessions) || 1),
+          lastSeen: (proj && proj.lastSeen) || null,
+          tokens: projTokens,
+          models: modelsSummary,
+          estimatedCostUsd: costInfo.estimatedCostUsd,
+          knownCostUsd: costInfo.knownCostUsd,
+          costPartial: costInfo.costPartial,
+          unpricedTokens: costInfo.unpricedTokens,
+          unpricedModels: costInfo.unpricedModels
+        };
+      })
+    : [];
+
+  projects.sort((a, b) => b.tokens.total - a.tokens.total || a.name.localeCompare(b.name));
+
+  const totalCostInfo = estimateByModelCostUsd(totalByModel, priceTable);
+  const now = Date.now();
+  const windowDays = Number(rawReport.windowDays) || SIX_MONTHS_DAYS;
+  const cutoffMs = startOfLocalDayMs(now - windowDays * DAY_MS);
+
+  return {
+    generatedAt: Number(rawReport.generatedAt) || now,
+    updatedAt: Number(rawReport.updatedAt) || Number(rawReport.generatedAt) || now,
+    computing: Boolean(rawReport.computing),
+    stale: Boolean(rawReport.stale),
+    lastError: rawReport.lastError || null,
+    windowDays,
+    fromDate: rawReport.fromDate || localDayKey(cutoffMs),
+    toDate: rawReport.toDate || localDayKey(now),
+    coverage: rawReport.coverage || {
+      sourcesConfigured: 2,
+      sourcesAvailable: 2,
+      claudeAvailable: true,
+      codexAvailable: true,
+      scannedFiles: 0,
+      cachedFiles: 0,
+      incrementalFiles: 0,
+      fullReadFiles: 0,
+      bytesRead: 0,
+      unreadableFiles: 0,
+      errorCount: 0,
+      errors: [],
+      status: 'ok'
+    },
+    pricing: {
+      asOf: PRICES_AS_OF,
+      isEstimate: true,
+      models: priceTable,
+      families: MODEL_FAMILY_PRICES_USD_PER_M,
+      costPartial: totalCostInfo.costPartial,
+      unpricedTokens: totalCostInfo.unpricedTokens,
+      unpricedModels: Array.from(allUnpriced).sort()
+    },
+    activity: rawReport.activity
+      ? {
+          days: Array.isArray(rawReport.activity.days) ? rawReport.activity.days : [],
+          maxDailyTokens: Number(rawReport.activity.maxDailyTokens) || 0,
+          activeDaysCount: Number(rawReport.activity.activeDaysCount) || 0
+        }
+      : { days: [], maxDailyTokens: 0, activeDaysCount: 0 },
+    projects,
+    totals: {
+      tokens: totalsTokens,
+      projectsCount: projects.length,
+      estimatedCostUsd: totalCostInfo.estimatedCostUsd,
+      knownCostUsd: totalCostInfo.knownCostUsd,
+      costPartial: totalCostInfo.costPartial,
+      unpricedTokens: totalCostInfo.unpricedTokens,
+      unpricedModels: totalCostInfo.unpricedModels
+    }
+  };
+}
+
+function serializeReportForCache(report) {
+  if (!report || typeof report !== 'object') return null;
+  const projects = Array.isArray(report.projects)
+    ? report.projects.map((proj) => ({
+        name: proj.name || 'sin-proyecto',
+        path: proj.path || 'sin-proyecto',
+        providers: Array.isArray(proj.providers) ? proj.providers : [],
+        sessions: Math.max(1, Number(proj.sessions) || 1),
+        lastSeen: proj.lastSeen || null,
+        tokens: sanitizeTokens(proj.tokens),
+        models: Array.isArray(proj.models)
+          ? proj.models.map((m) => ({
+              model: m.model,
+              provider: m.provider || 'claude',
+              tokens: sanitizeTokens(m.tokens)
+            }))
+          : []
+      }))
+    : [];
+
+  return {
+    generatedAt: Number(report.generatedAt) || Date.now(),
+    updatedAt: Number(report.updatedAt) || Number(report.generatedAt) || Date.now(),
+    lastError: report.lastError || null,
+    windowDays: Number(report.windowDays) || SIX_MONTHS_DAYS,
+    fromDate: report.fromDate || null,
+    toDate: report.toDate || null,
+    coverage: report.coverage || null,
+    activity: report.activity
+      ? {
+          days: Array.isArray(report.activity.days) ? report.activity.days : [],
+          maxDailyTokens: Number(report.activity.maxDailyTokens) || 0,
+          activeDaysCount: Number(report.activity.activeDaysCount) || 0
+        }
+      : { days: [], maxDailyTokens: 0, activeDaysCount: 0 },
+    projects,
+    totals: {
+      tokens: sanitizeTokens(report.totals && report.totals.tokens),
+      projectsCount: projects.length
+    }
+  };
+}
+
+function serializeFileCacheEntry(item) {
+  if (!item || !item.state) return null;
+  const state = item.state;
+  const dailyOut = {};
+  if (state.daily && typeof state.daily === 'object') {
+    for (const [dayKey, dayData] of Object.entries(state.daily)) {
+      if (!dayData || !dayData.tokens || (Number(dayData.tokens.total) || 0) <= 0) continue;
+      const byModelOut = {};
+      if (dayData.byModel && typeof dayData.byModel === 'object') {
+        for (const [modelName, tok] of Object.entries(dayData.byModel)) {
+          if (!tok || (Number(tok.total) || 0) <= 0) continue;
+          byModelOut[modelName] = sanitizeTokens(tok);
+        }
+      }
+      const byHour = new Array(24).fill(0);
+      if (Array.isArray(dayData.byHour)) {
+        for (let h = 0; h < 24; h++) {
+          byHour[h] = Math.max(0, Number(dayData.byHour[h]) || 0);
+        }
+      }
+      dailyOut[dayKey] = {
+        tokens: sanitizeTokens(dayData.tokens),
+        byHour,
+        byModel: byModelOut
+      };
+    }
+  }
+
+  let dedup = null;
+  if (state.provider === 'codex') {
+    dedup = {
+      model: state.model || 'codex',
+      previous: {
+        input: Math.max(0, Number(state.previous && state.previous.input) || 0),
+        cache: Math.max(0, Number(state.previous && state.previous.cache) || 0),
+        output: Math.max(0, Number(state.previous && state.previous.output) || 0),
+        total: Math.max(0, Number(state.previous && state.previous.total) || 0)
+      }
+    };
+  } else {
+    const groupsMap = new Map();
+    if (state.seenEntries instanceof Map) {
+      for (const [k, v] of state.seenEntries.entries()) {
+        if (!k || !v || !v.tok) continue;
+        let g = groupsMap.get(v);
+        if (!g) {
+          g = {
+            keys: [],
+            dayKey: v.dayKey,
+            hour: Number(v.hour) || 0,
+            model: v.model || '',
+            tok: sanitizeTokens(v.tok)
+          };
+          groupsMap.set(v, g);
+        }
+        g.keys.push(k);
+      }
+    }
+    const groups = Array.from(groupsMap.values());
+    const recentGroups =
+      groups.length > MAX_PERSISTED_SEEN_GROUPS_PER_FILE
+        ? groups.slice(groups.length - MAX_PERSISTED_SEEN_GROUPS_PER_FILE)
+        : groups;
+    dedup = { seenEntries: recentGroups };
+  }
+
+  return {
+    identity: {
+      size: Math.max(0, Number(item.size) || 0),
+      mtimeMs: Number(item.mtimeMs) || 0,
+      ino: Number(item.ino) || 0,
+      dev: Number(item.dev) || 0,
+      birthtimeMs: Number(item.birthtimeMs) || 0,
+      headHash: Number(item.headHash) || 0
+    },
+    offset: Math.max(0, Number(item.offset) || 0),
+    carry: typeof item.carry === 'string' ? item.carry : '',
+    provider: state.provider === 'codex' ? 'codex' : 'claude',
+    isSubagent: Boolean(state.isSubagent),
+    projectSlug: state.projectSlug || null,
+    cwd: state.cwd || null,
+    lastSeenMs: Number(state.lastSeenMs) || 0,
+    hasUsage: Boolean(state.hasUsage),
+    daily: dailyOut,
+    dedup
+  };
+}
+
+function deserializeFileCacheEntry(rawEntry, cutoffDayKey) {
+  if (!rawEntry || typeof rawEntry !== 'object') return null;
+  const id = rawEntry.identity && typeof rawEntry.identity === 'object' ? rawEntry.identity : rawEntry;
+  const offset = Number(rawEntry.offset);
+  const size = Number(id.size);
+  const mtimeMs = Number(id.mtimeMs);
+  if (
+    !Number.isFinite(offset) ||
+    offset < 0 ||
+    !Number.isFinite(size) ||
+    size < 0 ||
+    offset > size ||
+    !Number.isFinite(mtimeMs) ||
+    mtimeMs <= 0
+  ) {
+    return null;
+  }
+
+  const provider = rawEntry.provider === 'codex' ? 'codex' : 'claude';
+  const state =
+    provider === 'codex'
+      ? createCodexFileState()
+      : createClaudeFileState({
+          isSubagent: Boolean(rawEntry.isSubagent),
+          projectSlug: rawEntry.projectSlug || null
+        });
+
+  state.cwd = typeof rawEntry.cwd === 'string' && rawEntry.cwd.trim() ? rawEntry.cwd.trim() : null;
+  state.lastSeenMs = Number(rawEntry.lastSeenMs) || 0;
+  state.hasUsage = Boolean(rawEntry.hasUsage);
+
+  if (rawEntry.daily && typeof rawEntry.daily === 'object') {
+    for (const [dayKey, dayData] of Object.entries(rawEntry.daily)) {
+      if (!dayKey || (cutoffDayKey && dayKey < cutoffDayKey)) continue;
+      if (!dayData || typeof dayData !== 'object') continue;
+      const tok = sanitizeTokens(dayData.tokens);
+      if (tok.total <= 0) continue;
+      const byHour = new Array(24).fill(0);
+      if (Array.isArray(dayData.byHour)) {
+        for (let h = 0; h < 24; h++) {
+          byHour[h] = Math.max(0, Number(dayData.byHour[h]) || 0);
+        }
+      }
+      const byModel = {};
+      if (dayData.byModel && typeof dayData.byModel === 'object') {
+        for (const [modelName, mTok] of Object.entries(dayData.byModel)) {
+          const cleanModelTok = sanitizeTokens(mTok);
+          if (cleanModelTok.total > 0) {
+            byModel[modelName] = cleanModelTok;
+          }
+        }
+      }
+      state.daily[dayKey] = {
+        tokens: tok,
+        byHour,
+        byModel
+      };
+      state.hasUsage = true;
+    }
+  }
+
+  const rawDedup = rawEntry.dedup && typeof rawEntry.dedup === 'object' ? rawEntry.dedup : null;
+  if (provider === 'codex') {
+    if (rawDedup) {
+      if (typeof rawDedup.model === 'string' && rawDedup.model.trim()) {
+        state.model = rawDedup.model.trim();
+      }
+      if (rawDedup.previous && typeof rawDedup.previous === 'object') {
+        state.previous = {
+          input: Math.max(0, Number(rawDedup.previous.input) || 0),
+          cache: Math.max(0, Number(rawDedup.previous.cache) || 0),
+          output: Math.max(0, Number(rawDedup.previous.output) || 0),
+          total: Math.max(0, Number(rawDedup.previous.total) || 0)
+        };
+      }
+    }
+  } else if (rawDedup && Array.isArray(rawDedup.seenEntries)) {
+    for (const g of rawDedup.seenEntries) {
+      if (!g || !Array.isArray(g.keys) || !g.dayKey || !g.model || !g.tok) continue;
+      const val = {
+        dayKey: String(g.dayKey),
+        hour: Math.max(0, Math.min(23, Number(g.hour) || 0)),
+        model: String(g.model),
+        tok: sanitizeTokens(g.tok)
+      };
+      rememberSeenClaudeEntry(state.seenEntries, g.keys, val);
+    }
+  }
+
+  const carryStr =
+    typeof rawEntry.carry === 'string' && rawEntry.carry.length <= MAX_LINE_CARRY_BYTES
+      ? rawEntry.carry
+      : '';
+
+  return {
+    offset,
+    size,
+    mtimeMs,
+    ino: Number(id.ino) || 0,
+    dev: Number(id.dev) || 0,
+    birthtimeMs: Number(id.birthtimeMs) || 0,
+    headHash: Number(id.headHash) || 0,
+    carry: carryStr,
+    state,
+    record: toFileRecord(state)
+  };
+}
+
+let atomicTmpSeq = 0;
+
+/**
+ * Persiste en disco de forma atómica (archivo temporal + rename) la caché por archivo
+ * y el último resumen de reporte (almacenando solo tokens y recalculando costos al leer).
+ */
+function saveProjectUsageCache(cacheFilePath, fileCacheMap, lastValidReport = null, now = Date.now()) {
+  if (!cacheFilePath) return false;
+  let tmpPath = null;
+  try {
+    const dir = path.dirname(cacheFilePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    const filesObj = {};
+    if (fileCacheMap instanceof Map) {
+      for (const [filePath, item] of fileCacheMap.entries()) {
+        if (!filePath || !item) continue;
+        const serialized = serializeFileCacheEntry(item);
+        if (serialized) {
+          filesObj[filePath] = serialized;
+        }
+      }
+    }
+    const payload = {
+      version: CACHE_SCHEMA_VERSION,
+      pricesAsOf: PRICES_AS_OF,
+      savedAt: now,
+      files: filesObj,
+      lastReport: serializeReportForCache(lastValidReport)
+    };
+    tmpPath = `${cacheFilePath}.${process.pid}.${threadId || 0}.${now}.${++atomicTmpSeq}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(payload), 'utf8');
+    fs.renameSync(tmpPath, cacheFilePath);
+    return true;
+  } catch {
+    if (tmpPath) {
+      try {
+        if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+      } catch {}
+    }
+    return false;
+  }
+}
+
+/**
+ * Carga y valida la caché en disco. Si el archivo no existe, está corrupto o su `version`
+ * no coincide con `CACHE_SCHEMA_VERSION`, devuelve `null` sin lanzar excepciones.
+ */
+function loadProjectUsageCache(
+  cacheFilePath,
+  { now = Date.now(), maxCachedFiles = DEFAULT_MAX_CACHED_FILES, summaryOnly = false } = {}
+) {
+  if (!cacheFilePath) return null;
+  try {
+    if (!fs.existsSync(cacheFilePath)) return null;
+    const raw = fs.readFileSync(cacheFilePath, 'utf8');
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    if (parsed.version !== CACHE_SCHEMA_VERSION) return null;
+    if (!parsed.files || typeof parsed.files !== 'object' || Array.isArray(parsed.files)) {
+      return null;
+    }
+
+    const lastReport = parsed.lastReport ? repriceUsageReport(parsed.lastReport) : null;
+    if (summaryOnly) {
+      return {
+        version: parsed.version,
+        pricesAsOf: parsed.pricesAsOf || null,
+        savedAt: Number(parsed.savedAt) || null,
+        cacheSize: Object.keys(parsed.files).length,
+        lastReport
+      };
+    }
+
+    const cutoffMs = startOfLocalDayMs(now - SIX_MONTHS_DAYS * DAY_MS);
+    const cutoffDayKey = localDayKey(cutoffMs);
+    const entries = [];
+
+    for (const [filePath, rawEntry] of Object.entries(parsed.files)) {
+      if (!filePath) continue;
+      const entry = deserializeFileCacheEntry(rawEntry, cutoffDayKey);
+      if (entry) {
+        entries.push([filePath, entry]);
+      }
+    }
+
+    if (entries.length > maxCachedFiles) {
+      entries.sort((a, b) => (b[1].mtimeMs || 0) - (a[1].mtimeMs || 0));
+      entries.length = maxCachedFiles;
+    }
+
+    return {
+      version: parsed.version,
+      pricesAsOf: parsed.pricesAsOf || null,
+      savedAt: Number(parsed.savedAt) || null,
+      files: new Map(entries),
+      lastReport
+    };
+  } catch {
+    return null;
+  }
+}
+
+function resolveCacheFilePath(options = {}, hasCustomDirs = false) {
+  if (options.cacheFilePath !== undefined) return options.cacheFilePath || null;
+  if (options.cachePath !== undefined) return options.cachePath || null;
+  if (options.filePath !== undefined) return options.filePath || null;
+  return hasCustomDirs ? null : DEFAULT_CACHE_PATH;
+}
+
+/**
+ * Escáner incremental con seguimiento de byte offset por archivo, caché acotada en memoria
+ * y persistencia atómica en disco con throttling.
+ */
+function createIncrementalScanner(options = {}) {
+  const hasCustomDirs = Boolean(options.claudeProjectsDir || options.codexSessionsDir);
+  const claudeProjectsDir =
+    options.claudeProjectsDir !== undefined
+      ? options.claudeProjectsDir
+      : path.join(os.homedir(), '.claude', 'projects');
+  const codexSessionsDir =
+    options.codexSessionsDir !== undefined
+      ? options.codexSessionsDir
+      : path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'sessions');
+  const maxCachedFiles = options.maxCachedFiles || DEFAULT_MAX_CACHED_FILES;
+  const cacheFilePath = resolveCacheFilePath(options, hasCustomDirs);
+  const saveThrottleMs =
+    options.saveThrottleMs !== undefined && options.saveThrottleMs !== null
+      ? Math.max(0, Number(options.saveThrottleMs) || 0)
+      : DEFAULT_CACHE_SAVE_THROTTLE_MS;
+
+  const fileCache = new Map(); // filePath -> { offset, size, mtimeMs, ino, dev, birthtimeMs, headHash, carry, state, record }
   let lastValidReport = null;
+  let cacheDirty = false;
+  let lastSavedAt = 0;
+  let saveTimer = null;
+
+  if (cacheFilePath) {
+    const cacheExistedOnDisk = fs.existsSync(cacheFilePath);
+    const loaded = loadProjectUsageCache(cacheFilePath, { maxCachedFiles });
+    if (loaded) {
+      for (const [k, v] of loaded.files.entries()) {
+        fileCache.set(k, v);
+      }
+      if (loaded.lastReport) {
+        lastValidReport = loaded.lastReport;
+      }
+      if (loaded.pricesAsOf !== PRICES_AS_OF || !loaded.lastReport) {
+        cacheDirty = true;
+      }
+    } else if (cacheExistedOnDisk) {
+      // El archivo existía pero estaba corrupto o tenía versión incompatible: reescribir tras escanear
+      cacheDirty = true;
+    }
+  }
+
+  function persistCacheNow(now = Date.now()) {
+    if (!cacheFilePath) return false;
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = null;
+    }
+    const ok = saveProjectUsageCache(cacheFilePath, fileCache, lastValidReport, now);
+    if (ok) {
+      cacheDirty = false;
+      lastSavedAt = now;
+    }
+    return ok;
+  }
+
+  function scheduleThrottledSave(now = Date.now()) {
+    if (!cacheFilePath || !cacheDirty || saveTimer) return;
+    const elapsed = lastSavedAt > 0 ? Math.max(0, now - lastSavedAt) : 0;
+    const delayMs = Math.max(25, saveThrottleMs - elapsed);
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      if (cacheDirty && cacheFilePath) {
+        persistCacheNow(Date.now());
+      }
+    }, delayMs);
+    if (typeof saveTimer.unref === 'function') {
+      saveTimer.unref();
+    }
+  }
+
+  function flushCache({ now = Date.now() } = {}) {
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = null;
+    }
+    if (!cacheFilePath || !cacheDirty) return false;
+    return persistCacheNow(now);
+  }
 
   function enforceCacheBound() {
-    if (fileCache.size <= maxCachedFiles) return;
+    if (fileCache.size <= maxCachedFiles) return false;
     const entries = Array.from(fileCache.entries()).sort(
       (a, b) => (a[1].mtimeMs || 0) - (b[1].mtimeMs || 0)
     );
@@ -1047,22 +1663,38 @@ function createIncrementalScanner({
     for (let i = 0; i < toRemove; i++) {
       fileCache.delete(entries[i][0]);
     }
+    return toRemove > 0;
   }
 
   function processFileMeta(f, provider, projectSlug, cutoffDayKey, stats, errors) {
     const cached = fileCache.get(f.filePath);
     if (isUnchangedCacheEntry(cached, f)) {
+      if (pruneFileStateDays(cached.state, cutoffDayKey)) {
+        cached.record = toFileRecord(cached.state);
+        cacheDirty = true;
+      }
       stats.cachedFiles++;
       return cached.record;
     }
 
-    const incremental = canReadIncrementally(cached, f) && cached.offset > 0 && f.size > cached.offset;
+    let incremental = canReadIncrementally(cached, f) && cached.offset > 0 && f.size > cached.offset;
+    if (incremental && cached.headHash) {
+      const currentHeadHash = readFileHeadHash(
+        f.filePath,
+        Math.min(FILE_HEAD_HASH_BYTES, cached.offset)
+      );
+      if (currentHeadHash !== null && currentHeadHash !== cached.headHash) {
+        incremental = false;
+      }
+    }
+
     const state = incremental
       ? cached.state
       : provider === 'codex'
         ? createCodexFileState()
         : createClaudeFileState({ isSubagent: f.isSubagent, projectSlug });
     const startOffset = incremental ? cached.offset : 0;
+    const initialCarry = incremental && cached.carry ? cached.carry : '';
 
     try {
       const lineHandler =
@@ -1070,9 +1702,21 @@ function createIncrementalScanner({
           ? (line) => processCodexJsonlLine(state, line)
           : (line) => processClaudeJsonlLine(state, line);
 
-      const streamRes = streamJsonlFileIncremental(f.filePath, startOffset, f.size, lineHandler);
+      const streamRes = streamJsonlFileIncremental(
+        f.filePath,
+        startOffset,
+        f.size,
+        lineHandler,
+        initialCarry
+      );
       pruneFileStateDays(state, cutoffDayKey);
       const record = toFileRecord(state);
+      const headHash =
+        incremental && cached.headHash
+          ? cached.headHash
+          : streamRes.headHash !== null
+            ? streamRes.headHash
+            : readFileHeadHash(f.filePath, Math.min(FILE_HEAD_HASH_BYTES, f.size)) || 0;
 
       fileCache.set(f.filePath, {
         offset: streamRes.nextOffset,
@@ -1081,6 +1725,8 @@ function createIncrementalScanner({
         ino: f.ino || 0,
         dev: f.dev || 0,
         birthtimeMs: f.birthtimeMs || 0,
+        headHash,
+        carry: streamRes.carry || '',
         state,
         record
       });
@@ -1107,7 +1753,7 @@ function createIncrementalScanner({
     }
   }
 
-  function scan({ now = Date.now() } = {}) {
+  function scan({ now = Date.now(), forceSave = false } = {}) {
     const cutoffMs = startOfLocalDayMs(now - SIX_MONTHS_DAYS * DAY_MS);
     const cutoffDayKey = localDayKey(cutoffMs);
     const activeFiles = new Set();
@@ -1126,6 +1772,7 @@ function createIncrementalScanner({
     let codexConfigured = Boolean(codexSessionsDir);
     let claudeAvailable = false;
     let codexAvailable = false;
+    let scanChangedCache = false;
 
     // 1. Escanear proyectos de Claude Code (~/.claude/projects/<projectSlug>/**/*.jsonl)
     if (claudeConfigured) {
@@ -1192,10 +1839,16 @@ function createIncrementalScanner({
       for (const cachedPath of fileCache.keys()) {
         if (!activeFiles.has(cachedPath)) {
           fileCache.delete(cachedPath);
+          scanChangedCache = true;
         }
       }
     }
-    enforceCacheBound();
+    if (enforceCacheBound()) {
+      scanChangedCache = true;
+    }
+    if (stats.fullReadFiles > 0 || stats.incrementalFiles > 0) {
+      scanChangedCache = true;
+    }
 
     const sourcesConfigured = (claudeConfigured ? 1 : 0) + (codexConfigured ? 1 : 0);
     const sourcesAvailable = (claudeAvailable ? 1 : 0) + (codexAvailable ? 1 : 0);
@@ -1241,6 +1894,7 @@ function createIncrementalScanner({
       };
     }
 
+    const hadPreviousReport = Boolean(lastValidReport);
     const report = aggregateUsageRecords(records, {
       now,
       daysWindow: SIX_MONTHS_DAYS,
@@ -1253,8 +1907,28 @@ function createIncrementalScanner({
     } else if (status === 'partial') {
       report.lastError = (errors[0] && errors[0].message) || 'Lectura parcial de sesiones';
       lastValidReport = report;
+      if (!hadPreviousReport) scanChangedCache = true;
     } else {
       lastValidReport = report;
+      if (!hadPreviousReport) scanChangedCache = true;
+    }
+
+    if (status !== 'error') {
+      if (scanChangedCache) {
+        cacheDirty = true;
+      }
+      if (cacheDirty && cacheFilePath) {
+        const canSaveNow =
+          forceSave ||
+          lastSavedAt === 0 ||
+          saveThrottleMs <= 0 ||
+          now - lastSavedAt >= saveThrottleMs;
+        if (canSaveNow) {
+          persistCacheNow(now);
+        } else {
+          scheduleThrottledSave(now);
+        }
+      }
     }
 
     return {
@@ -1263,16 +1937,30 @@ function createIncrementalScanner({
     };
   }
 
+  function stop() {
+    return flushCache({ now: Date.now() });
+  }
+
   return {
     scan,
+    flushCache,
+    stop,
     getCacheSize: () => fileCache.size,
+    getCacheFilePath: () => cacheFilePath,
+    getLastSavedAt: () => lastSavedAt,
+    isCacheDirty: () => cacheDirty,
     getFileCacheEntry: (filePath) => {
       const item = fileCache.get(filePath);
       if (!item) return null;
       return {
         offset: item.offset,
         size: item.size,
-        mtimeMs: item.mtimeMs
+        mtimeMs: item.mtimeMs,
+        ino: item.ino || 0,
+        dev: item.dev || 0,
+        birthtimeMs: item.birthtimeMs || 0,
+        headHash: item.headHash || 0,
+        carry: item.carry || ''
       };
     }
   };
@@ -1295,18 +1983,31 @@ function buildInitialEmptyReport(now = Date.now()) {
  * Crea el agregador de uso por proyecto respaldado por un worker (`node:worker_threads`)
  * para no bloquear el hilo principal durante el escaneo y parseo incremental de JSONL.
  */
-function createProjectUsageAggregator({
-  claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects'),
-  codexSessionsDir = path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'sessions'),
-  cacheTtlMs = 15000,
-  maxCachedFiles = DEFAULT_MAX_CACHED_FILES
-} = {}) {
+function createProjectUsageAggregator(options = {}) {
+  const hasCustomDirs = Boolean(options.claudeProjectsDir || options.codexSessionsDir);
+  const claudeProjectsDir =
+    options.claudeProjectsDir !== undefined
+      ? options.claudeProjectsDir
+      : path.join(os.homedir(), '.claude', 'projects');
+  const codexSessionsDir =
+    options.codexSessionsDir !== undefined
+      ? options.codexSessionsDir
+      : path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'sessions');
+  const cacheTtlMs = options.cacheTtlMs !== undefined ? options.cacheTtlMs : 15000;
+  const maxCachedFiles = options.maxCachedFiles || DEFAULT_MAX_CACHED_FILES;
+  const cacheFilePath = resolveCacheFilePath(options, hasCustomDirs);
+  const saveThrottleMs =
+    options.saveThrottleMs !== undefined && options.saveThrottleMs !== null
+      ? Math.max(0, Number(options.saveThrottleMs) || 0)
+      : DEFAULT_CACHE_SAVE_THROTTLE_MS;
+
   let worker = null;
   let stopped = false;
   let lastReport = null;
   let lastUpdatedAt = null;
   let lastScanStartedAt = 0;
   let computing = false;
+  let hasCompletedLiveScan = false;
   let reqSeq = 0;
   let activeScanReqId = 0;
   let queuedScanArgs = null;
@@ -1320,6 +2021,26 @@ function createProjectUsageAggregator({
     unreadableFiles: 0
   };
   const pendingWaiters = new Set();
+
+  if (cacheFilePath) {
+    const persisted = loadProjectUsageCache(cacheFilePath, {
+      maxCachedFiles,
+      summaryOnly: true
+    });
+    if (persisted && persisted.lastReport) {
+      lastReport = {
+        ...persisted.lastReport,
+        stale: true,
+        computing: true
+      };
+      lastUpdatedAt =
+        persisted.lastReport.updatedAt ||
+        persisted.lastReport.generatedAt ||
+        persisted.savedAt ||
+        Date.now();
+      lastStats.cacheSize = persisted.cacheSize || 0;
+    }
+  }
 
   function resolveAllWaiters(reportObj) {
     for (const resolve of pendingWaiters) {
@@ -1339,7 +2060,9 @@ function createProjectUsageAggregator({
         role: 'projectUsageWorker',
         claudeProjectsDir,
         codexSessionsDir,
-        maxCachedFiles
+        maxCachedFiles,
+        cacheFilePath,
+        saveThrottleMs
       }
     });
     if (typeof worker.unref === 'function') {
@@ -1348,6 +2071,7 @@ function createProjectUsageAggregator({
 
     worker.on('message', (msg) => {
       if (!msg || msg.type !== 'scanResult') return;
+      hasCompletedLiveScan = true;
       if (msg.stats) {
         lastStats = msg.stats;
       }
@@ -1423,7 +2147,10 @@ function createProjectUsageAggregator({
       return;
     }
     const ttlExpired =
-      lastUpdatedAt === null || cacheTtlMs <= 0 || now - lastUpdatedAt >= cacheTtlMs;
+      !hasCompletedLiveScan ||
+      lastUpdatedAt === null ||
+      cacheTtlMs <= 0 ||
+      now - lastUpdatedAt >= cacheTtlMs;
     if (force || !lastReport || ttlExpired) {
       postScanToWorker({ now, force });
     }
@@ -1438,17 +2165,20 @@ function createProjectUsageAggregator({
         updatedAt: lastUpdatedAt
       };
     }
+    const isStartupStale = !hasCompletedLiveScan;
     return {
       ...lastReport,
-      computing: Boolean(computing),
+      stale: Boolean(lastReport.stale || isStartupStale),
+      computing: Boolean(computing || isStartupStale),
       updatedAt: lastUpdatedAt
     };
   }
 
   /**
    * Devuelve de inmediato el último resumen calculado sin bloquear el proceso principal.
-   * Si el caché venció o `force` es true, dispara el escaneo incremental en el worker
-   * y marca `computing: true` junto con `updatedAt` del último resumen disponible.
+   * Si el caché venció, es el primer arranque con resumen persistido o `force` es true,
+   * dispara el escaneo incremental en el worker y marca `computing: true`
+   * (y `stale: true` hasta finalizar el primer escaneo tras iniciar).
    */
   function getUsageReport({ now = Date.now(), force = false } = {}) {
     triggerScanIfNeeded({ now, force });
@@ -1461,7 +2191,7 @@ function createProjectUsageAggregator({
    */
   function refresh({ now = Date.now(), force = false } = {}) {
     triggerScanIfNeeded({ now, force });
-    if (!computing && lastReport) {
+    if (!computing && lastReport && hasCompletedLiveScan) {
       return Promise.resolve(buildResponseSnapshot(now));
     }
     return new Promise((resolve) => {
@@ -1476,6 +2206,27 @@ function createProjectUsageAggregator({
     if (worker) {
       const w = worker;
       worker = null;
+      await new Promise((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve();
+        };
+        const timer = setTimeout(finish, 1500);
+        if (typeof timer.unref === 'function') timer.unref();
+        w.once('message', (msg) => {
+          if (msg && msg.type === 'stopped') finish();
+        });
+        w.once('exit', finish);
+        w.once('error', finish);
+        try {
+          w.postMessage({ type: 'stop', reqId: ++reqSeq });
+        } catch {
+          finish();
+        }
+      });
       try {
         await w.terminate();
       } catch {}
@@ -1488,6 +2239,7 @@ function createProjectUsageAggregator({
     refresh,
     stop,
     getCacheSize: () => lastStats.cacheSize || 0,
+    getCacheFilePath: () => cacheFilePath,
     getStats: () => ({ ...lastStats, computing, updatedAt: lastUpdatedAt, lastScanStartedAt })
   };
 }
@@ -1497,11 +2249,24 @@ if (!isMainThread && parentPort && workerData && workerData.role === 'projectUsa
   const scanner = createIncrementalScanner({
     claudeProjectsDir: workerData.claudeProjectsDir,
     codexSessionsDir: workerData.codexSessionsDir,
-    maxCachedFiles: workerData.maxCachedFiles || DEFAULT_MAX_CACHED_FILES
+    maxCachedFiles: workerData.maxCachedFiles || DEFAULT_MAX_CACHED_FILES,
+    cacheFilePath: workerData.cacheFilePath,
+    saveThrottleMs: workerData.saveThrottleMs
   });
 
   parentPort.on('message', (msg) => {
-    if (!msg || msg.type !== 'scan') return;
+    if (!msg) return;
+    if (msg.type === 'stop') {
+      try {
+        scanner.stop();
+      } catch {}
+      parentPort.postMessage({
+        type: 'stopped',
+        reqId: msg.reqId || 0
+      });
+      return;
+    }
+    if (msg.type !== 'scan') return;
     try {
       const result = scanner.scan({ now: msg.now || Date.now() });
       parentPort.postMessage({
@@ -1544,6 +2309,9 @@ if (!isMainThread && parentPort && workerData && workerData.role === 'projectUsa
 module.exports = {
   SIX_MONTHS_DAYS,
   PRICES_AS_OF,
+  CACHE_SCHEMA_VERSION,
+  DEFAULT_CACHE_PATH,
+  DEFAULT_CACHE_SAVE_THROTTLE_MS,
   MODEL_PRICES_USD_PER_M,
   MODEL_FAMILY_PRICES_USD_PER_M,
   emptyTokens,
@@ -1553,6 +2321,9 @@ module.exports = {
   resolveModelFamily,
   estimateModelCostUsd,
   estimateByModelCostUsd,
+  repriceUsageReport,
+  loadProjectUsageCache,
+  saveProjectUsageCache,
   parseClaudeTranscriptContent,
   parseCodexTranscriptContent,
   streamJsonlFileIncremental,
