@@ -458,7 +458,11 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
     // Evaluar transiciones de estado para disparar alertas automáticas
     for (const s of allSessions) {
       const prev = prevStates.get(s.id);
-      if (s.state === 'running') {
+      // Subagentes y corridas headless (agy -p, claude -p) no suenan: avisa la principal que los lanzó.
+      const silent = Boolean(s.isHeadless || s.isSubagent);
+      if (silent) {
+        unreadAlerts.delete(s.id);
+      } else if (s.state === 'running') {
         // Si volvió a trabajar, limpiar alerta pendiente
         unreadAlerts.delete(s.id);
       } else if (

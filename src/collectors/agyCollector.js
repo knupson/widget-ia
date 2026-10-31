@@ -55,6 +55,58 @@ function readAgySettings(baseDir) {
 }
 
 /**
+ * Conversaciones creadas por `agy -p` (Print mode, headless): las lanzan otros
+ * agentes como subtrabajo y no deben alertar como si fueran una charla principal.
+ * Cada corrida escribe log/cli-<fecha>.log con "Print mode: starting" y luego
+ * "Created conversation <id>" (o conversationID="<id>" si retoma una).
+ */
+const headlessLogCache = new Map(); // file -> { key, ids: string[] }
+const HEADLESS_LOG_MAX_AGE_MS = 48 * 3600 * 1000;
+const HEADLESS_LOG_HEAD_BYTES = 256 * 1024;
+
+function readHeadlessConversationIds(baseDir) {
+  const ids = new Set();
+  const logDir = path.join(baseDir, 'log');
+  let files;
+  try {
+    files = fs.readdirSync(logDir).filter((f) => /^cli-.*\.log$/.test(f));
+  } catch {
+    headlessLogCache.clear();
+    return ids;
+  }
+  const seen = new Set();
+  const now = Date.now();
+  for (const file of files) {
+    const full = path.join(logDir, file);
+    let st;
+    try { st = fs.statSync(full); } catch { continue; }
+    if (now - st.mtimeMs > HEADLESS_LOG_MAX_AGE_MS) continue;
+    seen.add(file);
+    const key = `${st.mtimeMs}:${st.size}`;
+    let entry = headlessLogCache.get(file);
+    if (!entry || entry.key !== key) {
+      entry = { key, ids: [] };
+      try {
+        const fd = fs.openSync(full, 'r');
+        const buf = Buffer.alloc(Math.min(st.size, HEADLESS_LOG_HEAD_BYTES));
+        fs.readSync(fd, buf, 0, buf.length, 0);
+        fs.closeSync(fd);
+        const text = buf.toString('utf8');
+        if (text.includes('Print mode: starting')) {
+          const resumed = text.match(/Print mode: starting[^\n]*conversationID="([0-9a-f-]{36})"/);
+          if (resumed) entry.ids.push(resumed[1]);
+          for (const m of text.matchAll(/Created conversation ([0-9a-f-]{36})/g)) entry.ids.push(m[1]);
+        }
+      } catch { /* log rotando o bloqueado: se reintenta en el próximo poll */ }
+      headlessLogCache.set(file, entry);
+    }
+    for (const id of entry.ids) ids.add(id);
+  }
+  for (const file of headlessLogCache.keys()) if (!seen.has(file)) headlessLogCache.delete(file);
+  return ids;
+}
+
+/**
  * Detecta qué conversaciones de AGY tienen un bloqueo activo a nivel de SO
  * en ~/.gemini/antigravity-cli/presence/<conversationId>.lock
  */
@@ -828,6 +880,7 @@ function collectAgyData(config = {}) {
   const activeLocks = getActiveLockedConversations(baseDir);
   const dbRows = readConversationSummaries(baseDir);
   const historyMap = readHistoryMap(baseDir);
+  const headlessIds = readHeadlessConversationIds(baseDir);
 
   const dbMap = new Map();
   for (const row of dbRows) {
@@ -1048,6 +1101,7 @@ function collectAgyData(config = {}) {
         surface: (row && row.source) || 'cli',
         isOpen: isLocked || state === 'running',
         isSubagent,
+        isHeadless: headlessIds.has(convId),
         parentConversationId: (row && row.parent_conversation_id) || null,
         state,
         stateLabel: stateLabelMap[state] || state,
