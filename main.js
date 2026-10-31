@@ -17,6 +17,11 @@ const { createWidgetServer } = require('./src/server');
 const { focusSessionWindow } = require('./src/services/windowFocuser');
 const { startFullscreenWatcher } = require('./src/services/fullscreenWatcher');
 
+// Chromium deja de pintar ventanas que considera tapadas (native occlusion). Si el widget
+// sin "siempre visible" queda detrás de otra app y se expande desde la bandeja, la zona
+// nueva sale negra hasta el próximo repintado. El widget es chico: preferimos que pinte siempre.
+app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
+
 // Errores no capturados: se loguean sin tumbar el proceso principal
 process.on('unhandledRejection', (reason) => {
   console.error('[unhandledRejection]', reason);
@@ -278,6 +283,8 @@ function setWindowMode(mode) {
   mainWindow.setSkipTaskbar(true);
   enforceAlwaysOnTop();
   mainWindow.webContents.send('widget:modeChanged', currentMode);
+  // Repintado completo tras el cambio de tamaño (evita el cuadro negro del primer frame)
+  mainWindow.webContents.invalidate();
 }
 
 function showDesktopNotification(alertObj) {
@@ -433,8 +440,10 @@ function setupTray(port) {
       if (widgetServer) widgetServer.forceBroadcast();
       updateMenu();
     } else if (currentMode === 'pill') {
-      setWindowMode('expanded');
+      // Traer al frente ANTES de agrandar: si estaba tapada, el redimensionado no se pinta
+      mainWindow.moveTop();
       mainWindow.focus();
+      setWindowMode('expanded');
     } else {
       setWindowMode('pill');
     }
