@@ -12,6 +12,11 @@
   const DAY_MS = 24 * HOUR_MS;
   const CALENDAR_WEEKS = 26;
 
+  // Intervalos máximos de actualización mientras la pestaña Uso está visible
+  const HISTORY_POLL_INTERVAL_MS = 60 * 1000; // máx. cada 60s para /api/usage/history
+  const PROJECTS_POLL_INTERVAL_MS = 5 * 60 * 1000; // máx. cada 5 min para /api/usage/projects
+  const COMPUTING_RETRY_MS = 600; // reintento breve cuando el worker aún está calculando
+
   const MONTHS_ES = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic'];
   const WEEKDAYS_ES = ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'];
 
@@ -31,15 +36,24 @@
     return String(Math.round(num));
   }
 
-  function fmtEstimatedUsd(costUsd) {
+  /**
+   * Formatea un costo estimado en USD.
+   * - Devuelve `'n/d'` cuando `costUsd` es `null` o inválido (modelo sin tarifa conocida).
+   * - Si `options.partial` es `true` (mezcla de modelos con tarifa conocida y desconocida),
+   *   agrega explícitamente el marcador `' (parcial)'` para no mostrarlo como total cerrado.
+   */
+  function fmtEstimatedUsd(costUsd, options = {}) {
+    const isPartial = Boolean(options && options.partial);
     if (costUsd === null || costUsd === undefined || !Number.isFinite(Number(costUsd))) {
       return 'n/d';
     }
     const val = Number(costUsd);
-    if (val === 0) return '~$0.00';
-    if (val < 0.01) return '<~$0.01';
-    if (val >= 100) return `~$${val.toFixed(1)}`;
-    return `~$${val.toFixed(2)}`;
+    let formatted;
+    if (val === 0) formatted = '~$0.00';
+    else if (val < 0.01) formatted = '<~$0.01';
+    else if (val >= 100) formatted = `~$${val.toFixed(1)}`;
+    else formatted = `~$${val.toFixed(2)}`;
+    return isPartial ? `${formatted} (parcial)` : formatted;
   }
 
   function fmtLocalDayKey(dateObj) {
@@ -75,6 +89,126 @@
     if (ratio < 0.4) return 2;
     if (ratio < 0.7) return 3;
     return 4;
+  }
+
+  /**
+   * Determina si el reporte presenta errores de lectura o falta de acceso a las fuentes.
+   */
+  function hasUsageSourceError(reportData) {
+    if (!reportData || typeof reportData !== 'object') return true;
+    if (reportData.lastError) return true;
+    const cov = reportData.coverage;
+    if (!cov || typeof cov !== 'object') return false;
+    if (cov.status === 'error' || cov.status === 'partial') return true;
+    if ((Number(cov.errorCount) || 0) > 0 || (Number(cov.unreadableFiles) || 0) > 0) return true;
+    if ((Number(cov.sourcesConfigured) || 0) > 0 && (Number(cov.sourcesAvailable) || 0) === 0) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Construye el texto de resumen del calendario de actividad distinguiendo entre
+   * «sin actividad» y «sin datos» cuando no se pudo leer la fuente.
+   */
+  function formatActivitySummaryText(reportData) {
+    if (!reportData || typeof reportData !== 'object') {
+      return 'Sin datos (no se pudo leer la fuente de sesiones locales)';
+    }
+    if (reportData.computing && !reportData.updatedAt) {
+      return 'Calculando uso de sesiones locales…';
+    }
+    const act = reportData.activity || { days: [], maxDailyTokens: 0, activeDaysCount: 0 };
+    const cov = reportData.coverage || {};
+    const sourceErr = hasUsageSourceError(reportData);
+
+    const suffixes = [];
+    if (reportData.stale) {
+      suffixes.push('⚠️ desactualizado (sin datos nuevos por error de lectura)');
+    } else if (cov.status === 'partial' || (Number(cov.unreadableFiles) || 0) > 0) {
+      const unread = Number(cov.unreadableFiles) || Number(cov.errorCount) || 1;
+      suffixes.push(`⚠️ cobertura parcial (${unread} sin leer)`);
+    }
+    if (reportData.computing) {
+      suffixes.push('actualizando…');
+    }
+    const suffixTxt = suffixes.length > 0 ? ` · ${suffixes.join(' · ')}` : '';
+
+    if (act.activeDaysCount > 0) {
+      return `${act.activeDaysCount} días activos · Pico diario: ${fmtCompactTokens(act.maxDailyTokens)} tok${suffixTxt}`;
+    }
+
+    if (sourceErr) {
+      return 'Sin datos (no se pudo leer la fuente de sesiones locales)';
+    }
+
+    return 'Sin actividad registrada en los últimos 6 meses';
+  }
+
+  /**
+   * Construye el texto de detalle al pasar el cursor sobre una celda del calendario.
+   * Muestra «sin datos» (y no «Sin actividad») cuando la fuente tuvo errores de lectura.
+   */
+  function formatCalendarCellTooltip(cell, reportData) {
+    if (!cell) return '';
+    const dateStr = fmtSpanishDate(cell.date);
+    if ((cell.total || 0) > 0) {
+      const peak = cell.peakHour !== null ? ` · Hora pico: ${fmtHourEs(cell.peakHour)}` : '';
+      return `${dateStr}: ${fmtCompactTokens(cell.total)} tok (E: ${fmtCompactTokens(cell.input)} · S: ${fmtCompactTokens(cell.output)} · Caché: ${fmtCompactTokens((cell.cacheRead || 0) + (cell.cacheWrite || 0))})${peak}`;
+    }
+    if (hasUsageSourceError(reportData)) {
+      return `${dateStr}: Sin datos (no se pudo leer la fuente)`;
+    }
+    return `${dateStr}: Sin actividad de tokens`;
+  }
+
+  /**
+   * Controlador de generaciones de pedidos asíncronos para descartar respuestas fuera de orden
+   * y cancelar solicitudes previas en vuelo mediante `AbortController`.
+   */
+  function createRequestTracker() {
+    let currentGen = 0;
+    let currentKey = '';
+    let activeController = null;
+
+    function begin(key = '') {
+      if (activeController && typeof activeController.abort === 'function') {
+        try {
+          activeController.abort();
+        } catch {}
+      }
+      currentGen += 1;
+      currentKey = String(key || '');
+      activeController = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      return {
+        gen: currentGen,
+        key: currentKey,
+        signal: activeController ? activeController.signal : undefined
+      };
+    }
+
+    function isCurrent(token, expectedKey = currentKey) {
+      if (!token || typeof token !== 'object') return false;
+      return token.gen === currentGen && token.key === String(expectedKey || '');
+    }
+
+    function cancel() {
+      if (activeController && typeof activeController.abort === 'function') {
+        try {
+          activeController.abort();
+        } catch {}
+      }
+      activeController = null;
+      currentGen += 1;
+    }
+
+    return {
+      begin,
+      isCurrent,
+      cancel,
+      getCurrentGen: () => currentGen,
+      getCurrentKey: () => currentKey
+    };
   }
 
   /**
@@ -216,8 +350,15 @@
     let activeRange = '24h';
     let lastHistoryData = null;
     let lastProjectsData = null;
-    let fetchInFlight = false;
-    let lastFetchedAt = 0;
+    let lastHistoryFetchedAt = 0;
+    let lastProjectsFetchedAt = 0;
+    let historyInFlight = false;
+    let projectsInFlight = false;
+    let wasUsageTabVisible = false;
+    let computingRetryTimer = null;
+
+    const historyTracker = createRequestTracker();
+    const projectsTracker = createRequestTracker();
 
     function getAuthToken() {
       try {
@@ -228,10 +369,10 @@
       }
     }
 
-    async function fetchUsageJson(urlPath) {
+    async function fetchUsageJson(urlPath, { signal } = {}) {
       const token = getAuthToken();
       const headers = token ? { 'X-Auth-Token': token } : {};
-      const res = await fetch(urlPath, { headers, credentials: 'same-origin' });
+      const res = await fetch(urlPath, { headers, credentials: 'same-origin', signal });
       if (!res.ok) return null;
       return res.json();
     }
@@ -242,6 +383,15 @@
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;');
+    }
+
+    function isUsageTabVisible() {
+      const pane = document.getElementById('tab-usage');
+      if (!pane || !pane.classList.contains('active')) return false;
+      if (typeof document.visibilityState === 'string' && document.visibilityState === 'hidden') {
+        return false;
+      }
+      return true;
     }
 
     function renderHistoryChart(histData) {
@@ -415,10 +565,7 @@
       const grid = buildCalendarGrid(act.days || [], Date.now(), CALENDAR_WEEKS);
 
       if (sumEl) {
-        sumEl.textContent =
-          act.activeDaysCount > 0
-            ? `${act.activeDaysCount} días activos · Pico diario: ${fmtCompactTokens(act.maxDailyTokens)} tok`
-            : 'Sin actividad registrada en los últimos 6 meses';
+        sumEl.textContent = formatActivitySummaryText(reportData);
       }
 
       const cell = 12;
@@ -455,6 +602,10 @@
         })
         .join('');
 
+      const footerHint = hasUsageSourceError(reportData)
+        ? '⚠️ Fuente con errores de lectura (los días vacíos se informan como sin datos)'
+        : 'Pasá el cursor sobre un día para ver el detalle y hora pico';
+
       wrap.innerHTML = `
         <div class="usage-cal-container">
           <svg id="usage-cal-svg" class="usage-cal-svg" viewBox="0 0 ${W} ${H}">
@@ -463,7 +614,7 @@
             ${rects}
           </svg>
           <div class="usage-cal-footer">
-            <span id="usage-cal-hover-info" class="muted-xs">Pasá el cursor sobre un día para ver el detalle y hora pico</span>
+            <span id="usage-cal-hover-info" class="muted-xs">${escapeHtml(footerHint)}</span>
             <div class="usage-cal-scale">
               <span class="muted-xs">Menos</span>
               <span class="usage-scale-box level-0"></span>
@@ -486,13 +637,7 @@
         if (!rectEl) return;
         const c = grid.cells[Number(rectEl.dataset.idx)];
         if (!c) return;
-        const dateStr = fmtSpanishDate(c.date);
-        if (c.total <= 0) {
-          infoEl.textContent = `${dateStr}: Sin actividad de tokens`;
-        } else {
-          const peak = c.peakHour !== null ? ` · Hora pico: ${fmtHourEs(c.peakHour)}` : '';
-          infoEl.textContent = `${dateStr}: ${fmtCompactTokens(c.total)} tok (E: ${fmtCompactTokens(c.input)} · S: ${fmtCompactTokens(c.output)} · Caché: ${fmtCompactTokens(c.cacheRead + c.cacheWrite)})${peak}`;
-        }
+        infoEl.textContent = formatCalendarCellTooltip(c, reportData);
       });
     }
 
@@ -503,21 +648,44 @@
       if (!tbody) return;
 
       const projects = (reportData && Array.isArray(reportData.projects) && reportData.projects) || [];
-      const totals = (reportData && reportData.totals) || { tokens: { total: 0 }, estimatedCostUsd: 0 };
-      const pricing = (reportData && reportData.pricing) || { asOf: '2026-10-06' };
+      const totals = (reportData && reportData.totals) || {
+        tokens: { total: 0 },
+        estimatedCostUsd: 0,
+        costPartial: false,
+        unpricedModels: []
+      };
+      const pricing = (reportData && reportData.pricing) || { asOf: '2026-10-30', unpricedModels: [] };
+      const sourceErr = hasUsageSourceError(reportData);
 
       if (totalsBadge) {
         const totalTok = totals.tokens ? totals.tokens.total : 0;
-        const costTxt = fmtEstimatedUsd(totals.estimatedCostUsd);
-        totalsBadge.textContent = `${projects.length} proy. · ${fmtCompactTokens(totalTok)} tok · ${costTxt} est.`;
+        const costTxt = fmtEstimatedUsd(totals.estimatedCostUsd, { partial: Boolean(totals.costPartial) });
+        const statusFlag =
+          reportData && reportData.stale
+            ? ' · desactualizado'
+            : reportData && reportData.computing
+              ? ' · calculando…'
+              : '';
+        totalsBadge.textContent = `${projects.length} proy. · ${fmtCompactTokens(totalTok)} tok · ${costTxt} est.${statusFlag}`;
       }
 
       if (noteEl && pricing.asOf) {
-        noteEl.textContent = `💡 Costo en USD estimado según tarifas de lista de API por familia (Opus / Sonnet / Haiku / Codex, fuente ${pricing.asOf}). Los planes Pro/Max/Team no cobran por token.`;
+        const unpriced = Array.isArray(pricing.unpricedModels) ? pricing.unpricedModels : [];
+        const unpricedSuffix =
+          unpriced.length > 0
+            ? ` ⚠️ Sin tarifa verificada para: ${unpriced.join(', ')} (costo marcado como parcial o n/d).`
+            : '';
+        noteEl.textContent = `💡 Costo en USD estimado por modelo y versión (incluye caché 5m a 1.25x y 1h a 2x; fuente verificada ${pricing.asOf}). Los planes Pro/Max/Team no cobran por token.${unpricedSuffix}`;
       }
 
       if (projects.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="6" class="empty-state">No se encontraron sesiones con consumo de tokens en los últimos 6 meses.</td></tr>`;
+        if (reportData && reportData.computing && !reportData.updatedAt) {
+          tbody.innerHTML = `<tr><td colspan="6" class="empty-state">Escaneando sesiones locales en segundo plano…</td></tr>`;
+        } else if (sourceErr) {
+          tbody.innerHTML = `<tr><td colspan="6" class="empty-state">Sin datos: no se pudo leer la fuente de sesiones locales.</td></tr>`;
+        } else {
+          tbody.innerHTML = `<tr><td colspan="6" class="empty-state">No se encontraron sesiones con consumo de tokens en los últimos 6 meses.</td></tr>`;
+        }
         return;
       }
 
@@ -538,6 +706,19 @@
             .map((m) => `${m.model} (${fmtCompactTokens(m.tokens.total)})`)
             .join(' · ');
           const sessTxt = `${p.sessions || 1} ${(p.sessions || 1) === 1 ? 'sesión' : 'sesiones'}`;
+          const write5m = t.cacheWrite5m !== undefined ? t.cacheWrite5m : t.cacheWrite || 0;
+          const write1h = t.cacheWrite1h || 0;
+          const cacheTip =
+            write1h > 0
+              ? `Lectura: ${fmtCompactTokens(t.cacheRead || 0)} · Escritura 5m: ${fmtCompactTokens(write5m)} · Escritura 1h: ${fmtCompactTokens(write1h)}`
+              : `Lectura: ${fmtCompactTokens(t.cacheRead || 0)} · Escritura: ${fmtCompactTokens(t.cacheWrite || 0)}`;
+
+          const costTxt = fmtEstimatedUsd(p.estimatedCostUsd, { partial: Boolean(p.costPartial) });
+          const unpricedList = Array.isArray(p.unpricedModels) ? p.unpricedModels : [];
+          const costTitle =
+            unpricedList.length > 0
+              ? `Sin tarifa verificada para: ${unpricedList.join(', ')}`
+              : '';
 
           return `
             <tr title="${escapeHtml(p.path || p.name)}\nModelos: ${escapeHtml(modelsList)}">
@@ -553,62 +734,127 @@
               </td>
               <td>${fmtCompactTokens(t.input || 0)}</td>
               <td>${fmtCompactTokens(t.output || 0)}</td>
-              <td title="Lectura: ${fmtCompactTokens(t.cacheRead || 0)} · Escritura: ${fmtCompactTokens(t.cacheWrite || 0)}">${fmtCompactTokens((t.cacheRead || 0) + (t.cacheWrite || 0))}</td>
+              <td title="${escapeHtml(cacheTip)}">${fmtCompactTokens((t.cacheRead || 0) + (t.cacheWrite || 0))}</td>
               <td><strong>${fmtCompactTokens(t.total || 0)}</strong></td>
-              <td class="usage-cost-cell">${escapeHtml(fmtEstimatedUsd(p.estimatedCostUsd))}</td>
+              <td class="usage-cost-cell"${costTitle ? ` title="${escapeHtml(costTitle)}"` : ''}>${escapeHtml(costTxt)}</td>
             </tr>
           `;
         })
         .join('');
     }
 
-    async function refreshUsageView({ force = false } = {}) {
-      const pane = document.getElementById('tab-usage');
-      if (!pane || (!force && !pane.classList.contains('active'))) return;
+    async function refreshHistory({ force = false, range = activeRange } = {}) {
+      const targetRange = range || activeRange;
       const now = Date.now();
-      if (!force && fetchInFlight) return;
-      if (!force && lastHistoryData && lastProjectsData && now - lastFetchedAt < 15000) {
+      if (
+        !force &&
+        lastHistoryData &&
+        lastHistoryData.range === targetRange &&
+        now - lastHistoryFetchedAt < HISTORY_POLL_INTERVAL_MS
+      ) {
+        return;
+      }
+      if (!force && historyInFlight && historyTracker.getCurrentKey() === targetRange) {
         return;
       }
 
-      fetchInFlight = true;
+      const token = historyTracker.begin(targetRange);
+      historyInFlight = true;
       try {
-        const [hist, proj] = await Promise.all([
-          fetchUsageJson(`/api/usage/history?range=${encodeURIComponent(activeRange)}`),
-          fetchUsageJson(`/api/usage/projects${force ? '?force=1' : ''}`)
-        ]);
-        if (hist) {
-          lastHistoryData = hist;
-          renderHistoryChart(hist);
+        const hist = await fetchUsageJson(
+          `/api/usage/history?range=${encodeURIComponent(targetRange)}`,
+          { signal: token.signal }
+        );
+        // Descartar respuesta si llegó fuera de orden o si el usuario ya cambió de rango
+        if (!hist || !historyTracker.isCurrent(token, activeRange)) {
+          return;
         }
-        if (proj) {
-          lastProjectsData = proj;
-          renderActivityHeatmap(proj);
-          renderProjectsTable(proj);
+        if (hist.range && hist.range !== activeRange) {
+          return;
         }
-        lastFetchedAt = Date.now();
+        lastHistoryData = hist;
+        lastHistoryFetchedAt = Date.now();
+        renderHistoryChart(hist);
       } catch (err) {
-        console.error('[AI Pulse Uso] Error cargando datos:', err);
+        if (err && err.name === 'AbortError') return;
+        console.error('[AI Pulse Uso] Error cargando historial:', err);
       } finally {
-        fetchInFlight = false;
+        if (historyTracker.isCurrent(token, activeRange)) {
+          historyInFlight = false;
+        }
       }
+    }
+
+    function scheduleComputingFollowUp() {
+      if (computingRetryTimer) return;
+      computingRetryTimer = setTimeout(() => {
+        computingRetryTimer = null;
+        if (!isUsageTabVisible()) return;
+        refreshProjects({ force: false, isFollowUp: true });
+      }, COMPUTING_RETRY_MS);
+    }
+
+    async function refreshProjects({ force = false, onOpen = false, isFollowUp = false } = {}) {
+      const now = Date.now();
+      if (
+        !force &&
+        !onOpen &&
+        !isFollowUp &&
+        lastProjectsData &&
+        now - lastProjectsFetchedAt < PROJECTS_POLL_INTERVAL_MS
+      ) {
+        return;
+      }
+      if (!force && projectsInFlight) {
+        return;
+      }
+
+      const token = projectsTracker.begin('projects');
+      projectsInFlight = true;
+      try {
+        const proj = await fetchUsageJson(`/api/usage/projects${force ? '?force=1' : ''}`, {
+          signal: token.signal
+        });
+        if (!proj || !projectsTracker.isCurrent(token, 'projects')) {
+          return;
+        }
+        lastProjectsData = proj;
+        lastProjectsFetchedAt = Date.now();
+        renderActivityHeatmap(proj);
+        renderProjectsTable(proj);
+
+        if (proj.computing && isUsageTabVisible()) {
+          scheduleComputingFollowUp();
+        }
+      } catch (err) {
+        if (err && err.name === 'AbortError') return;
+        console.error('[AI Pulse Uso] Error cargando proyectos:', err);
+      } finally {
+        if (projectsTracker.isCurrent(token, 'projects')) {
+          projectsInFlight = false;
+        }
+      }
+    }
+
+    async function refreshUsageView({ force = false, onOpen = false } = {}) {
+      if (!force && !isUsageTabVisible()) return;
+      await Promise.all([
+        refreshHistory({ force, range: activeRange }),
+        refreshProjects({ force, onOpen })
+      ]);
     }
 
     function initUsageUi() {
       // Botones de rango (1h / 24h / 7d / 30d)
       document.querySelectorAll('[data-usage-range]').forEach((btn) => {
-        btn.addEventListener('click', async () => {
+        btn.addEventListener('click', () => {
           const r = btn.dataset.usageRange;
           if (!r) return;
           activeRange = r;
           document.querySelectorAll('[data-usage-range]').forEach((b) => {
             b.classList.toggle('active', b.dataset.usageRange === activeRange);
           });
-          const hist = await fetchUsageJson(`/api/usage/history?range=${encodeURIComponent(activeRange)}`);
-          if (hist) {
-            lastHistoryData = hist;
-            renderHistoryChart(hist);
-          }
+          refreshHistory({ force: true, range: activeRange });
         });
       });
 
@@ -616,18 +862,32 @@
         refreshUsageView({ force: true });
       });
 
-      // Al activar la pestaña Uso, cargar datos inmediatamente
+      // Al abrir la pestaña Uso, cargar inmediatamente (/api/usage/projects y /api/usage/history)
       document.querySelectorAll('.tab-btn').forEach((btn) => {
         btn.addEventListener('click', () => {
           if (btn.dataset.tab === 'usage') {
-            setTimeout(() => refreshUsageView({ force: false }), 10);
+            wasUsageTabVisible = true;
+            setTimeout(() => refreshUsageView({ force: false, onOpen: true }), 10);
+          } else {
+            wasUsageTabVisible = false;
+            if (computingRetryTimer) {
+              clearTimeout(computingRetryTimer);
+              computingRetryTimer = null;
+            }
           }
         });
       });
     }
 
     window.renderUsageTab = () => {
-      refreshUsageView({ force: false });
+      const visible = isUsageTabVisible();
+      if (!visible) {
+        wasUsageTabVisible = false;
+        return;
+      }
+      const justOpened = !wasUsageTabVisible;
+      wasUsageTabVisible = true;
+      refreshUsageView({ force: false, onOpen: justOpened });
     };
 
     if (document.readyState === 'loading') {
@@ -639,6 +899,8 @@
 
   return {
     CALENDAR_WEEKS,
+    HISTORY_POLL_INTERVAL_MS,
+    PROJECTS_POLL_INTERVAL_MS,
     SERIES_COLORS,
     fmtCompactTokens,
     fmtEstimatedUsd,
@@ -646,6 +908,10 @@
     fmtSpanishDate,
     fmtHourEs,
     computeActivityLevel,
+    hasUsageSourceError,
+    formatActivitySummaryText,
+    formatCalendarCellTooltip,
+    createRequestTracker,
     buildCalendarGrid,
     computeTimeTicks,
     emptyHistoryMessage
