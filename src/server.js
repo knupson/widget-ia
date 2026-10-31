@@ -1460,6 +1460,9 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
     if (pollTimer) clearInterval(pollTimer);
     remoteManager.stop();
     tunnelManager.stop();
+    if (projectUsageAggregator && typeof projectUsageAggregator.stop === 'function') {
+      projectUsageAggregator.stop();
+    }
     try {
       server.close();
     } catch {}
