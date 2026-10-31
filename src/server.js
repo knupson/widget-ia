@@ -16,6 +16,36 @@ const { createProjectUsageAggregator } = require('./services/projectUsage');
 const processCounter = require('./services/processCounter');
 const { createQuotaThresholdNotifier } = require('./services/quotaThresholds');
 
+// Freno semanal de Claude (pedido del user 2026-10-31): nunca pasar el 80% con más de 2 días para el reset.
+// Presupuesto lineal: hasta el día 5 de la semana se permite como máximo 80%; antes, proporcional.
+// Ritmo semanal: cuánto se puede gastar por día para llegar vivo al reset (pedido del user 2026-10-31).
+// budgetNowPct = lo que "debería" llevar gastado si el consumo fuera parejo; perDayPct = (100 - usado) / días restantes.
+function weeklyPace(pctRaw, resetAtRaw) {
+  const pct = pctRaw != null && Number.isFinite(Number(pctRaw)) ? Number(pctRaw) : null;
+  const resetAt = Number(resetAtRaw) > Date.now() ? Number(resetAtRaw) : null;
+  if (pct == null || !resetAt) return { pct, resetAt, daysLeft: null, budgetNowPct: null, perDayPct: null, overPct: null };
+  const WEEK = 7 * 24 * 3600 * 1000;
+  const daysLeft = (resetAt - Date.now()) / 86400000;
+  const elapsed = Math.min(1, Math.max(0, 1 - (resetAt - Date.now()) / WEEK));
+  const budgetNowPct = Math.round(elapsed * 100);
+  const perDayPct = Number((Math.max(0, 100 - pct) / Math.max(daysLeft, 1 / 24)).toFixed(1));
+  return { pct, resetAt, daysLeft: Number(daysLeft.toFixed(1)), budgetNowPct, perDayPct, overPct: Math.round(pct - budgetNowPct) };
+}
+
+function claudeWeeklyGuard(pq) {
+  const pct = pq && pq.sevenDayPct != null && !pq.stale ? Number(pq.sevenDayPct) : null;
+  const resetAt = pq && Number(pq.nextWeeklyResetAt) > Date.now() ? Number(pq.nextWeeklyResetAt) : null;
+  if (pct == null || !resetAt) return { level: 'unknown', pct, budgetPct: null, daysLeft: null };
+  const WEEK = 7 * 24 * 3600 * 1000;
+  const daysLeft = (resetAt - Date.now()) / 86400000;
+  const elapsed = Math.min(1, Math.max(0, 1 - (resetAt - Date.now()) / WEEK));
+  const budgetPct = daysLeft > 2 ? Math.round(Math.min(80, (elapsed / (5 / 7)) * 80)) : 100;
+  let level = 'ok';
+  if (daysLeft > 2 && pct >= 80) level = 'block';
+  else if (daysLeft > 2 && (pct >= 70 || pct > budgetPct)) level = 'warn';
+  return { level, pct, budgetPct, daysLeft: Number(daysLeft.toFixed(1)) };
+}
+
 const CONFIG_PATH = path.resolve(__dirname, '..', 'config.json');
 const PUBLIC_DIR = path.resolve(__dirname, 'public');
 // APK fuera de la raíz estática: se sirve solo por /api/apk (autenticado)
@@ -972,10 +1002,21 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
             agyBurnPerHour: aq.burnRatePerHour ?? null,
             agyEstimated: Boolean(aq.estimated),
             agyStatus: aq.providerStatus || null,
+            agyPoolTokens: aq.pool ? aq.pool.tokens : null,
+            agyPoolLimit: aq.pool ? aq.pool.limit : null,
+            agyResetAt: aq.nextWeeklyResetAt || null,
+            claude7dResetAt: pq.nextWeeklyResetAt || null,
+            claudeGuard: claudeWeeklyGuard(pq),
             codex5hPct: cq.fiveHourPct ?? null,
             codex7dPct: cq.sevenDayPct ?? null,
             codexUpdatedAt: cq.updatedAt || null,
             codexStale: cq.stale || false,
+            codex7dResetAt: cq.nextWeeklyResetAt || null,
+            pace: {
+              claude: weeklyPace(pq.stale ? null : pq.sevenDayPct, pq.nextWeeklyResetAt),
+              codex: weeklyPace(cq.stale ? null : cq.sevenDayPct, cq.nextWeeklyResetAt),
+              agy: weeklyPace(aq.sevenDayPct, aq.nextWeeklyResetAt)
+            },
             claudeResetId: (pq.lastReset && pq.lastReset.id) || '',
             claudeResetMsg:
               pq.lastReset && pq.lastReset.isBonus

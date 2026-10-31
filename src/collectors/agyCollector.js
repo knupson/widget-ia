@@ -14,6 +14,13 @@ let brainScanCache = { mtimeMs: 0, checkedAt: 0, recentIds: [] };
 let agyResultCache = { key: '', data: null };
 const DEFAULT_FIVE_HOUR_LIMIT_M = 25;
 const DEFAULT_SEVEN_DAY_LIMIT_M = 100;
+// Pool semanal real de AGY (Enterprise), calibrado con el agotamiento del 2026-10-31 14:34:
+// la semana 22/10->29/10 cerró con ~300M tokens sin corte; la semana 29/10->05/11 se agotó con ~334M.
+// El % oficial de Google (fetchQuotaStatus) marcaba 0,02% con el pool agotado: NO sirve.
+const DEFAULT_AGY_POOL_LIMIT_M = 330;
+const AGY_POOL_WEEK_MS = 7 * 24 * 3600 * 1000;
+// Ancla del ciclo semanal (reset informado por el 429: 2026-11-05 22:29:06 -03:00)
+const AGY_POOL_ANCHOR_MS = Date.parse('2026-11-05T22:29:06-03:00');
 const lockedPresencePolls = new Map();
 const quotaSamples = new Map();
 let summariesSourceError = false;
@@ -769,11 +776,23 @@ function buildAgyQuota(slotAgg, settings, config = {}, providerStatus = null) {
   let nextFiveHourResetAt = null;
   let nextWeeklyResetAt = null;
 
-  if (officialWeekly) {
-    sevenDayPct = officialWeekly.usedPctRounded;
-    sevenDayPctExact = officialWeekly.usedPctExact;
-    nextWeeklyResetAt = officialWeekly.resetAt || null;
+  // Semana del pool: ciclo fijo de 7 días anclado en el último reset informado por AGY (429)
+  const poolLimit = (Number(config.agyPoolLimitM) || DEFAULT_AGY_POOL_LIMIT_M) * 1_000_000;
+  const anchor =
+    providerStatus && providerStatus.window === '7d' && Number(providerStatus.resetAt) > 0
+      ? Number(providerStatus.resetAt)
+      : AGY_POOL_ANCHOR_MS;
+  const poolStart = anchor + Math.floor((now - anchor) / AGY_POOL_WEEK_MS) * AGY_POOL_WEEK_MS;
+  const poolEnd = poolStart + AGY_POOL_WEEK_MS;
+  let poolTokens = 0;
+  for (const [slotStr, b] of Object.entries(slotAgg)) {
+    const t = Number(slotStr) * SLOT_MS;
+    if (t + SLOT_MS > poolStart && t <= now) poolTokens += b.total;
   }
+  const poolPctExact = (poolTokens / Math.max(1, poolLimit)) * 100;
+  sevenDayPctExact = Number(poolPctExact.toFixed(1));
+  sevenDayPct = Math.min(100, Math.round(poolPctExact));
+  nextWeeklyResetAt = poolEnd;
 
   if (officialFiveHour) {
     fiveHourPct = officialFiveHour.usedPctRounded;
@@ -840,7 +859,7 @@ function buildAgyQuota(slotAgg, settings, config = {}, providerStatus = null) {
         : hasOfficialQuota
         ? 'google-api'
         : 'provider-logs',
-    estimated: !hasOfficialQuota || Boolean(providerStatus && providerStatus.exhausted),
+    estimated: true, // % = tokens locales de la semana del pool / techo calibrado
     model: settings.model,
     gcpProject: (officialApi && officialApi.projectId) || settings.gcpProject,
     gcpLocation: (officialApi && officialApi.region) || settings.gcpLocation,
@@ -858,6 +877,7 @@ function buildAgyQuota(slotAgg, settings, config = {}, providerStatus = null) {
     oneHour,
     burnRatePerHour,
     cacheHitPct,
+    pool: { tokens: poolTokens, limit: poolLimit, startAt: poolStart, resetAt: poolEnd },
     limit5hM: Number((limit5hEff / 1_000_000).toFixed(1)),
     configuredLimit5hM: Math.round(configuredLimit5hEff / 1_000_000),
     limit7dM: Math.round(limit7dEff / 1_000_000),

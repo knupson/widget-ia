@@ -207,11 +207,10 @@
   }
 
   function agyUsageNote(quota) {
-    const free = quota.sevenDayPctExact == null
-      ? '--'
-      : `${Number(Math.max(0, Math.min(100, 100 - quota.sevenDayPctExact)).toFixed(4))}%`;
+    const pool = quota.pool;
+    const used = pool ? `${fmtNumber(pool.tokens)}/${fmtNumber(pool.limit)} (${quota.sevenDayPct ?? '--'}%)` : '--';
     const burn = quota.burnRatePerHour == null ? '--' : fmtNumber(quota.burnRatePerHour);
-    return `cupo empresa: ${free} libre · ${burn} tok/h`;
+    return `pool semanal: ${used} · ${burn} tok/h`;
   }
 
   function renderAgyUsage(quota, mode) {
@@ -222,16 +221,16 @@
       const barId = mode === 'pill' ? `pill-agy-${key}` : `kpi-agy-${key}-bar`;
       const value = document.getElementById(valueId);
       if (value) {
-        value.textContent = exhausted ? '100%' : usage?.total == null ? '--' : fmtNumber(usage.total);
+        const poolPct = key === 'sd' && quota.sevenDayPct != null ? `${quota.sevenDayPct}%` : null;
+        value.textContent = exhausted ? '100%' : poolPct || (usage?.total == null ? '--' : fmtNumber(usage.total));
         value.classList.toggle('quota-exhausted', Boolean(exhausted));
-        value.title = exhausted ? 'Cupo agotado' : 'Tokens consumidos';
+        value.title = exhausted ? 'Cupo agotado' : key === 'sd' ? 'Pool semanal (tokens locales / techo calibrado)' : 'Tokens consumidos';
       }
       const indicator = document.getElementById(barId);
       if (indicator) {
-        const danger = key === 'sd'
-          ? quota.officialWeekly?.usedPctExact >= 90
-          : exhausted;
-        indicator.style.width = exhausted || danger || usage?.total > 0 ? '100%' : '0%';
+        const danger = key === 'sd' ? exhausted || quota.sevenDayPct >= 80 : exhausted;
+        const width = key === 'sd' && quota.sevenDayPct != null ? Math.min(100, quota.sevenDayPct) : (exhausted || usage?.total > 0 ? 100 : 0);
+        indicator.style.width = `${exhausted ? 100 : width}%`;
         indicator.classList.toggle('fill-danger', Boolean(danger));
       }
     }
@@ -622,7 +621,7 @@
       agyQuota.fiveHourPct,
       agyQuota.sevenDayPct,
       agyQuota.sevenDayPctExact,
-      agyQuota.officialWeekly?.usedPctExact,
+      agyQuota.pool?.tokens,
       agyQuota.fiveHour?.total,
       agyQuota.sevenDay?.total,
       agyQuota.burnRatePerHour,
@@ -821,7 +820,7 @@
       agyQuota.fiveHourPct,
       agyQuota.sevenDayPct,
       agyQuota.sevenDayPctExact,
-      agyQuota.officialWeekly?.usedPctExact,
+      agyQuota.pool?.tokens,
       agyQuota.fiveHour?.total,
       agyQuota.sevenDay?.total,
       agyQuota.burnRatePerHour,
@@ -1298,7 +1297,7 @@
     const agySdBar = document.getElementById('agy-sd-bar');
     if (agySdBar) {
       agySdBar.style.width = `${Math.min(100, agySd)}%`;
-      agySdBar.classList.toggle('fill-danger', agyQuota.officialWeekly?.usedPctExact >= 90);
+      agySdBar.classList.toggle('fill-danger', agySd >= 80);
     }
 
     const agyMetaBadge = document.getElementById('agy-meta-badge');
@@ -2127,9 +2126,10 @@
     const offWeekly = agy.officialWeekly || (status.officialApi && status.officialApi.weekly) || null;
     const offFiveHour = agy.officialFiveHour || (status.officialApi && status.officialApi.fiveHour) || null;
 
-    let message = offWeekly
-      ? `✅ Cuota Semanal Oficial Google (${agy.gcpProject || 'GCP'}): ${offWeekly.usedPctExact}% usado (${offWeekly.remainingPctExact}% libre) · Reset: ${fmtDateTimeShort(offWeekly.resetAt)}. ${offFiveHour ? 'Ventana de 5h informada por la API.' : 'Google no informa una ventana de 5h para este plan en la API; el dato de 5h sólo aparece si hay un 429.'}`
-      : 'Consultando cuota semanal oficial en businessaicode.googleapis.com...';
+    const pool = agy.pool;
+    let message = pool
+      ? `${agy.sevenDayPct >= 80 ? '⚠️' : '✅'} Pool semanal AGY: ${fmtNumber(pool.tokens)} de ~${fmtNumber(pool.limit)} tokens (${agy.sevenDayPct}%) · Reset: ${fmtDateTimeShort(pool.resetAt)}. Medido con tokens locales; el % oficial de Google (${offWeekly ? offWeekly.usedPctExact + '%' : '--'}) no refleja el pool real.`
+      : 'Calculando pool semanal de AGY...';
     if (isExhausted) {
       message = `🚫 Pool de cuota AGY (${status.window === '7d' ? '7d' : '5h'}) agotado (HTTP 429). ${
         status.resetAt
@@ -2139,7 +2139,7 @@
     } else if (isRecentRecovery) {
       message = `✅ Cuota 5h de AGY restablecida a las ${fmtTimeShort(resetRefTs)} (hace ${fmtRelativeTime(resetRefTs)}) tras agotamiento previo.${
         status.verifiedAfterReset ? ' Disponibilidad verificada con respuestas activas.' : ''
-      }${offWeekly ? ` · Semanal oficial: ${offWeekly.usedPctExact}% usado (reset ${fmtDateTimeShort(offWeekly.resetAt)}).` : ''}`;
+      }${pool ? ` · Pool semanal: ${agy.sevenDayPct}% (reset ${fmtDateTimeShort(pool.resetAt)}).` : ''}`;
     } else if (status.state === 'unverified') {
       message = `AGY informó agotamiento el ${fmtDateTimeShort(status.observedAt)}. El plazo anunciado venció; disponibilidad sin verificar.`;
     }
@@ -2168,7 +2168,7 @@
         if (barEl) {
           const pctNum = isKeyExhausted ? 100 : value != null ? Math.min(100, Math.max(0, Number(value) || 0)) : 0;
           barEl.style.width = `${pctNum}%`;
-          barEl.classList.toggle('fill-danger', key === 'sd' ? offWeekly?.usedPctExact >= 90 : pctNum >= 90 || isKeyExhausted);
+          barEl.classList.toggle('fill-danger', key === 'sd' ? pctNum >= 80 || isKeyExhausted : pctNum >= 90 || isKeyExhausted);
         }
       }
     }
@@ -2184,8 +2184,8 @@
 
     const agySdDetail = document.getElementById('agy-sd-detail');
     if (agySdDetail && agy.sevenDay) {
-      const exactTag = offWeekly ? `Oficial: ${offWeekly.usedPctExact}% usado · ` : '';
-      agySdDetail.textContent = `${exactTag}${fmtNumber(agy.sevenDay.total)} tok (${fmtNumber(agy.sevenDay.effective)} ef.) · ${agy.sevenDay.turns} turnos`;
+      const poolTag = agy.pool ? `Pool: ${fmtNumber(agy.pool.tokens)}/${fmtNumber(agy.pool.limit)} · ` : '';
+      agySdDetail.textContent = `${poolTag}7d móvil: ${fmtNumber(agy.sevenDay.total)} tok · ${agy.sevenDay.turns} turnos`;
     }
 
     const primaryOfficialReset = agy.nextFiveHourResetAt || agy.nextWeeklyResetAt;

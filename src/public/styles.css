@@ -704,7 +704,7 @@ body.mode-web .panel-container {
   transition: width 0.35s ease;
 }
 
-/* AGY muestra actividad local; estos puntos no representan un porcentaje. */
+/* AGY 5h: sin límite conocido, el punto sólo marca actividad. El 7d sí es barra: % del pool semanal calibrado. */
 .pq-bar.agy-activity,
 .dmb-track.agy-activity {
   flex: 0 0 4px;
@@ -713,7 +713,7 @@ body.mode-web .panel-container {
   height: 4px;
 }
 
-#pill-agy-box .pq-val {
+#pill-agy-box .pq-line:first-child .pq-val {
   flex: 1;
 }
 
