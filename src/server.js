@@ -12,6 +12,7 @@ const { getSessionMessages } = require('./services/conversationReader');
 const { sendSessionReply } = require('./services/remoteResponder');
 const { TunnelManager } = require('./services/tunnelManager');
 const processCounter = require('./services/processCounter');
+const { createQuotaThresholdNotifier } = require('./services/quotaThresholds');
 
 const CONFIG_PATH = path.resolve(__dirname, '..', 'config.json');
 const PUBLIC_DIR = path.resolve(__dirname, 'public');
@@ -420,12 +421,18 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
     };
   }
 
+  const notifyQuotaThresholds = createQuotaThresholdNotifier((alertObj) => {
+    if (typeof onAlert === 'function') onAlert(alertObj, config);
+  });
+
   function refreshSnapshot(forceBroadcast = false) {
     const now = Date.now();
     lastPollAt = now;
     const agyData = collectAgyData(config);
     const claudeData = collectClaudeData(hookOverrides);
     const codexData = collectCodexData();
+    notifyQuotaThresholds('claude', claudeData.planQuota, now);
+    notifyQuotaThresholds('codex', codexData.codexQuota, now);
     const remoteSessions = remoteManager.getActiveRemoteSessions();
 
     // Detectar automáticamente nuevos reseteos de cuota semanal Claude (Gratis / Bonus o Programados)

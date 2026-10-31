@@ -615,7 +615,8 @@ function readClaudeUtilizationMeta() {
   const emptyMeta = {
     nextWeeklyResetAt: null,
     nextFiveHourResetAt: null,
-    activePromo: null
+    activePromo: null,
+    modelWeeklyLimits: []
   };
   if (!fs.existsSync(claudeJsonPath)) return emptyMeta;
   try {
@@ -643,6 +644,17 @@ function readClaudeUtilizationMeta() {
     if (util.five_hour?.resets_at) {
       const ts = parseResetAt(util.five_hour.resets_at);
       if (Number.isFinite(ts)) meta.nextFiveHourResetAt = ts;
+    }
+
+    for (const [key, bucket] of Object.entries(util)) {
+      if (!key.startsWith('seven_day_') || !Number.isFinite(bucket?.utilization)) continue;
+      const resetsAt = parseResetAt(bucket.resets_at);
+      if (!Number.isFinite(resetsAt) || resetsAt <= Date.now()) continue;
+      meta.modelWeeklyLimits.push({
+        model: key.slice('seven_day_'.length).replace(/_/g, ' '),
+        usedPct: Math.max(0, bucket.utilization),
+        resetsAt
+      });
     }
 
     const promoKeys = [
@@ -1070,6 +1082,7 @@ function parseClaudeJsonl(filePath) {
   let outputTokens = 0;
   let turns = 0;
   let lastModel = '';
+  let lastContext = null;
   let cwd = '';
   let gitBranch = '';
   let customTitle = '';
@@ -1087,7 +1100,7 @@ function parseClaudeJsonl(filePath) {
   let seenRequestIds = new Set();
 
   let lineCount = 0;
-  if (append.resume) ({ inputTokens, cacheWriteTokens, cacheReadTokens, outputTokens, turns, lastModel, cwd, gitBranch, customTitle, lastUserText, lastAssistantText, lastToolUse, lastStopReason, lastEventType, lastUserIsToolResult, activeBgCommand, lastTimestampMs, dailyTokens, modelTokens, seenRequestIds, lineCount } = cached.state);
+  if (append.resume) ({ inputTokens, cacheWriteTokens, cacheReadTokens, outputTokens, turns, lastModel, lastContext, cwd, gitBranch, customTitle, lastUserText, lastAssistantText, lastToolUse, lastStopReason, lastEventType, lastUserIsToolResult, activeBgCommand, lastTimestampMs, dailyTokens, modelTokens, seenRequestIds, lineCount } = cached.state);
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
@@ -1138,6 +1151,15 @@ function parseClaudeJsonl(filePath) {
     if (entry.type === 'assistant' && entry.message) {
       const msg = entry.message;
       if (msg.model) lastModel = msg.model;
+      lastContext = null;
+      if (msg.usage && Number.isFinite(msg.usage.input_tokens)) {
+        const counts = [msg.usage.input_tokens, msg.usage.cache_creation_input_tokens ?? 0, msg.usage.cache_read_input_tokens ?? 0];
+        if (counts.every((n) => Number.isFinite(n) && n >= 0)) {
+          const used = counts.reduce((sum, n) => sum + n, 0);
+          const limit = lastModel.includes('[1m]') || used > 200000 ? 1000000 : 200000;
+          lastContext = { used, limit, usedPct: Math.round(used / limit * 100) };
+        }
+      }
       if (msg.stop_reason) lastStopReason = msg.stop_reason;
 
       const txt = extractMessageText(msg.content);
@@ -1233,7 +1255,7 @@ function parseClaudeJsonl(filePath) {
   }
 
   lineCount += lines.length;
-  const state = { inputTokens, cacheWriteTokens, cacheReadTokens, outputTokens, turns, lastModel, cwd, gitBranch, customTitle, lastUserText, lastAssistantText, lastToolUse, lastStopReason, lastEventType, lastUserIsToolResult, activeBgCommand, lastTimestampMs, dailyTokens, modelTokens, seenRequestIds, lineCount };
+  const state = { inputTokens, cacheWriteTokens, cacheReadTokens, outputTokens, turns, lastModel, lastContext, cwd, gitBranch, customTitle, lastUserText, lastAssistantText, lastToolUse, lastStopReason, lastEventType, lastUserIsToolResult, activeBgCommand, lastTimestampMs, dailyTokens, modelTokens, seenRequestIds, lineCount };
 
   const totalTokens = inputTokens + cacheWriteTokens + cacheReadTokens + outputTokens;
   const effectiveTokens = Math.round(
@@ -1246,6 +1268,7 @@ function parseClaudeJsonl(filePath) {
     gitBranch,
     customTitle,
     lastModel,
+    context: lastContext,
     inputTokens,
     cacheWriteTokens,
     cacheReadTokens,
@@ -1275,7 +1298,10 @@ function parseClaudeJsonl(filePath) {
 function collectClaudeData(hookStateOverrides = new Map()) {
   const claudeDir = getClaudeDir();
   const activeSessionsMap = readActiveSessionFiles(claudeDir);
-  const planQuota = readPlanQuotaUsage();
+  const planQuota = {
+    ...readPlanQuotaUsage(),
+    modelWeeklyLimits: readClaudeUtilizationMeta().modelWeeklyLimits.filter((b) => b.resetsAt > Date.now())
+  };
 
   const projectsDir = path.join(claudeDir, 'projects');
   const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
@@ -1499,6 +1525,7 @@ function collectClaudeData(hookStateOverrides = new Map()) {
           activeMeta && activeMeta.entrypoint === 'app' ? 'Claude App' : 'Claude',
         surface: (activeMeta && activeMeta.entrypoint) || 'cli',
         model: (parsed && parsed.lastModel) || 'claude',
+        context: isOpen && parsed ? parsed.context : null,
         gitBranch: (parsed && parsed.gitBranch) || '',
         isOpen,
         isSubagent: false,

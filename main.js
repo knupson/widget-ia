@@ -7,6 +7,7 @@ const {
   screen,
   nativeImage,
   Notification,
+  globalShortcut,
   shell,
   clipboard
 } = require('electron');
@@ -282,13 +283,14 @@ function setWindowMode(mode) {
 function showDesktopNotification(alertObj) {
   if (!Notification.isSupported()) return;
   const isReset = alertObj.alertType === 'quota_reset';
+  const isQuota = alertObj.alertType === 'quota_threshold';
   const isApproval = alertObj.alertType === 'waiting_approval';
-  const title = isReset
+  const title = isQuota ? `⚠️ ${alertObj.title}` : isReset
     ? `🎁 ${alertObj.projectName || 'Reseteo de Cuota Claude'}`
     : isApproval
     ? `⚠️ Permiso requerido · ${alertObj.projectName}`
     : `✅ Terminó y espera respuesta · ${alertObj.projectName}`;
-  const body = `${alertObj.providerLabel}: ${alertObj.title}\n${alertObj.message || ''}`;
+  const body = isQuota ? alertObj.message : `${alertObj.providerLabel}: ${alertObj.title}\n${alertObj.message || ''}`;
 
   const iconPath = path.join(__dirname, 'assets', 'icon.ico');
   const notif = new Notification({
@@ -304,7 +306,7 @@ function showDesktopNotification(alertObj) {
       setWindowMode('expanded');
       mainWindow.focus();
     }
-    if (!isReset) {
+    if (!isReset && !isQuota) {
       focusSessionWindow({
         id: alertObj.sessionId,
         provider: alertObj.provider,
@@ -641,6 +643,25 @@ async function initApp() {
 
   mainWindow.loadURL(`${localOrigin}/`);
   setupTray(port);
+  try {
+    const registered = globalShortcut.register('Alt+Shift+U', () => {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      manualGamingHide = mainWindow.isVisible();
+      if (manualGamingHide) {
+        mainWindow.hide();
+      } else {
+        hiddenByFullscreen = false;
+        mainWindow.show();
+        enforceAlwaysOnTop(true);
+        mainWindow.focus();
+        widgetServer.forceBroadcast();
+      }
+      if (updateTrayMenuFn) updateTrayMenuFn();
+    });
+    if (!registered) console.warn('No se pudo registrar el atajo Alt+Shift+U.');
+  } catch (err) {
+    console.warn('No se pudo registrar el atajo Alt+Shift+U:', err.message);
+  }
 
   fullscreenWatcher = startFullscreenWatcher({
     onForegroundWindow: (fgInfo) => {
@@ -698,6 +719,7 @@ async function initApp() {
 app.whenReady().then(initApp);
 
 app.on('before-quit', () => {
+  globalShortcut.unregisterAll();
   persistWindowPosition(true);
   if (fullscreenWatcher) fullscreenWatcher.stop();
   if (widgetServer) widgetServer.stop();
