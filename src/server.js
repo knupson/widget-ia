@@ -1006,6 +1006,8 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
             agyPoolLimit: aq.pool ? aq.pool.limit : null,
             agyResetAt: aq.nextWeeklyResetAt || null,
             claude7dResetAt: pq.nextWeeklyResetAt || null,
+            claude5hResetAt: pq.nextFiveHourResetAt || null,
+            codex5hResetAt: cq.nextFiveHourResetAt || null,
             claudeGuard: claudeWeeklyGuard(pq),
             codex5hPct: cq.fiveHourPct ?? null,
             codex7dPct: cq.sevenDayPct ?? null,
