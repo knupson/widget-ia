@@ -496,13 +496,17 @@ function createWidgetServer({ onAlert, onConfigChange, onWindowControl, isRender
     });
 
     const openSessions = allSessions.filter((s) => s.isOpen);
+    // Listas/permiso/activas cuentan sólo conversaciones principales: los agentes van aparte.
+    const agentSessions = openSessions.filter((s) => s.isHeadless || s.isSubagent);
+    const mainSessions = openSessions.filter((s) => !(s.isHeadless || s.isSubagent));
     const summary = {
       totalOpen: openSessions.length,
-      agentsOpen: openSessions.filter((s) => s.isHeadless || s.isSubagent).length,
-      mainOpen: openSessions.filter((s) => !(s.isHeadless || s.isSubagent)).length,
-      waitingInput: openSessions.filter((s) => s.state === 'waiting_input').length,
-      waitingApproval: openSessions.filter((s) => s.state === 'waiting_approval').length,
-      running: openSessions.filter((s) => s.state === 'running').length,
+      agentsOpen: agentSessions.length,
+      agentsRunning: agentSessions.filter((s) => s.state === 'running').length,
+      mainOpen: mainSessions.length,
+      waitingInput: mainSessions.filter((s) => s.state === 'waiting_input').length,
+      waitingApproval: mainSessions.filter((s) => s.state === 'waiting_approval').length,
+      running: mainSessions.filter((s) => s.state === 'running').length,
       remoteOpen: openSessions.filter((s) => s.isRemote).length,
       unreadAlertsCount: unreadAlerts.size,
       activeSessionTokens: openSessions.reduce((acc, s) => acc + ((s.tokens && s.tokens.total) || 0), 0)

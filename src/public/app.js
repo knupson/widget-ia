@@ -785,7 +785,7 @@
     // Subtítulo y chip de velocidad en el header
     const liveStatus = document.getElementById('header-live-status');
     if (liveStatus) {
-      liveStatus.textContent = `${openBreakdownText(sum)} · ${waitingTotal} listas · ${sum.running || 0} activas`;
+      liveStatus.textContent = `${openBreakdownText(sum)} · ${waitingTotal} listas · ${sum.running || 0} activas${sum.agentsRunning ? ` (+${sum.agentsRunning} agentes)` : ''}`;
     }
 
     const burnChip = document.getElementById('header-burn-chip');
