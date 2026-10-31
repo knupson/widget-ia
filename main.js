@@ -13,6 +13,7 @@ const {
 } = require('electron');
 const fs = require('fs');
 const path = require('path');
+const { execFile } = require('child_process');
 const { createWidgetServer } = require('./src/server');
 const { focusSessionWindow } = require('./src/services/windowFocuser');
 const { startFullscreenWatcher } = require('./src/services/fullscreenWatcher');
@@ -70,9 +71,32 @@ function persistWindowPosition(immediate = false) {
   }
 }
 
+// Si existe la tarea programada que arranca el widget elevado (misma elevación que
+// Windows Terminal, necesaria para enfocar pestañas), ella maneja el inicio: la entrada
+// de HKCU\...\Run lo arrancaría sin elevar y, por la instancia única, ganaría esa.
+const ELEVATED_STARTUP_TASK = 'AI Pulse Widget (elevado)';
+
 function applyLoginItemSetting(enabled) {
+  if (process.platform !== 'win32') {
+    applyRunEntry(enabled !== false);
+    return;
+  }
+  execFile('schtasks', ['/Query', '/TN', ELEVATED_STARTUP_TASK], { windowsHide: true }, (err) => {
+    const hasTask = !err;
+    if (hasTask) {
+      execFile(
+        'schtasks',
+        ['/Change', '/TN', ELEVATED_STARTUP_TASK, enabled !== false ? '/ENABLE' : '/DISABLE'],
+        { windowsHide: true },
+        () => {}
+      );
+    }
+    applyRunEntry(hasTask ? false : enabled !== false);
+  });
+}
+
+function applyRunEntry(openAtLogin) {
   try {
-    const openAtLogin = enabled !== false;
     const packedExe = path.join(__dirname, 'dist', 'win-unpacked', 'AI Pulse Widget.exe');
     if (fs.existsSync(packedExe)) {
       app.setLoginItemSettings({
@@ -439,13 +463,12 @@ function setupTray(port) {
       mainWindow.focus();
       if (widgetServer) widgetServer.forceBroadcast();
       updateMenu();
-    } else if (currentMode === 'pill') {
-      // Traer al frente ANTES de agrandar: si estaba tapada, el redimensionado no se pinta
+    } else {
+      // Traer al frente respetando el modo actual (contraída o expandida), sin alternarlo.
       mainWindow.moveTop();
       mainWindow.focus();
-      setWindowMode('expanded');
-    } else {
-      setWindowMode('pill');
+      enforceAlwaysOnTop();
+      mainWindow.webContents.invalidate();
     }
   });
 }
