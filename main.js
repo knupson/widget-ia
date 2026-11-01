@@ -13,7 +13,7 @@ const {
 } = require('electron');
 const fs = require('fs');
 const path = require('path');
-const { execFile } = require('child_process');
+const { execFile, execFileSync } = require('child_process');
 const { createWidgetServer } = require('./src/server');
 const { focusSessionWindow } = require('./src/services/windowFocuser');
 const { startFullscreenWatcher } = require('./src/services/fullscreenWatcher');
@@ -75,6 +75,27 @@ function persistWindowPosition(immediate = false) {
 // Windows Terminal, necesaria para enfocar pestañas), ella maneja el inicio: la entrada
 // de HKCU\...\Run lo arrancaría sin elevar y, por la instancia única, ganaría esa.
 const ELEVATED_STARTUP_TASK = 'AI Pulse Widget (elevado)';
+
+function runQuiet(cmd, args) {
+  try {
+    execFileSync(cmd, args, { stdio: 'ignore', windowsHide: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Si se abre a mano (menú Inicio, acceso directo, exe) arranca sin elevar y no puede
+// responder ni enfocar consolas elevadas. Si existe la tarea elevada, se relanza por ella
+// (no pide UAC) y esta instancia se cierra. Devuelve true si delegó el arranque.
+function relaunchViaElevatedTask() {
+  if (process.platform !== 'win32' || process.env.AIPULSE_NO_ELEVATE === '1') return false;
+  if (runQuiet('net', ['session'])) return false; // ya está elevado
+  if (!runQuiet('schtasks', ['/Query', '/TN', ELEVATED_STARTUP_TASK])) return false;
+  app.releaseSingleInstanceLock();
+  if (runQuiet('schtasks', ['/Run', '/TN', ELEVATED_STARTUP_TASK])) return true;
+  return !app.requestSingleInstanceLock();
+}
 
 function applyLoginItemSetting(enabled) {
   if (process.platform !== 'win32') {
@@ -477,6 +498,10 @@ async function initApp() {
   const gotLock = app.requestSingleInstanceLock();
   if (!gotLock) {
     app.quit();
+    return;
+  }
+  if (relaunchViaElevatedTask()) {
+    app.exit(0);
     return;
   }
 
