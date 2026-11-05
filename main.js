@@ -757,8 +757,9 @@ async function initApp() {
     return false;
   });
 
-  ipcMain.handle('widget:copyText', (_e, text) => {
-    clipboard.writeText(String(text || ''));
+  // Electron 44+: clipboard.writeText devuelve Promise (API alineada con W3C Clipboard).
+  ipcMain.handle('widget:copyText', async (_e, text) => {
+    await clipboard.writeText(String(text || ''));
     return true;
   });
 

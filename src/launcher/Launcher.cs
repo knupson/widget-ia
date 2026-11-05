@@ -36,7 +36,7 @@ namespace AIPulseLauncher
             if (!File.Exists(electronExe))
             {
                 MessageBox.Show(
-                    "No se encontró el motor Electron en:\n" + electronExe + "\n\nEjecutá 'npm install' en la carpeta del proyecto.",
+                    "No se encontró el motor Electron en:\n" + electronExe + "\n\nEjecutá 'npm install' y luego 'npx install-electron --no' (o 'npm start' una vez) en la carpeta del proyecto.",
                     "AI Pulse Widget",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error

@@ -2,7 +2,7 @@
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-e09f3e.svg)
 ![Platform: Windows](https://img.shields.io/badge/Platform-Windows%2010%2F11-f59e0b.svg)
-![Electron](https://img.shields.io/badge/Electron-35+-14100c.svg)
+![Electron](https://img.shields.io/badge/Electron-45+-14100c.svg)
 ![Security: Local-First](https://img.shields.io/badge/Security-127.0.0.1%20Loopback-10b981.svg)
 
 **AI Pulse Widget** es un HUD flotante *Always-on-Top* y centro de telemetría en tiempo real para Windows, diseñado con estética **Obsidian, Ochre & Amber** para desarrolladores que trabajan en simultáneo con **Claude (Code CLI & Desktop App)**, **Google Antigravity (`AGY` CLI & IDE)**, **OpenAI Codex (CLI)** y agentes en **servidores remotos (SSH / Webhooks / ntfy.sh)**.
@@ -70,6 +70,8 @@
 git clone https://github.com/knupson/widget-ia.git
 cd widget-ia
 npm install
+# Electron 42+ ya no baja su binario en el postinstall: bajarlo una vez para el lanzador .exe
+npx install-electron --no
 ```
 
 ### 2. Iniciar el Widget
